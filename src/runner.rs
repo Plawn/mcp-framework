@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::auth::{AuthProvider, StoredToken, TokenStore};
+use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
@@ -65,6 +68,11 @@ pub struct McpApp<F> {
     pub stdio_token_env: Option<&'static str>,
     /// Manual settings. When `Some`, CLI args and env vars are bypassed.
     pub settings: Option<Settings>,
+    /// Optional dynamic capability registry for adding/removing tools, prompts,
+    /// and resources at runtime.
+    pub capability_registry: Option<CapabilityRegistry>,
+    /// Optional filter to control which capabilities are visible per session.
+    pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
 }
 
 #[derive(Parser, Debug)]
@@ -158,6 +166,8 @@ where
         auth: app.auth,
         server_factory: app.server_factory,
         app_name: app.name.to_string(),
+        capability_registry: app.capability_registry,
+        capability_filter: app.capability_filter,
     })
     .await
 }
@@ -190,8 +200,16 @@ where
         }
     }
 
-    let server = (app.server_factory)(token_store);
-    run_stdio(server).await
+    let server = (app.server_factory)(token_store.clone());
+
+    match app.capability_registry {
+        Some(registry) => {
+            let handler =
+                DynamicHandler::new(server, registry, app.capability_filter, token_store);
+            run_stdio(handler).await
+        }
+        None => run_stdio(server).await,
+    }
 }
 
 /// Run an MCP application.
