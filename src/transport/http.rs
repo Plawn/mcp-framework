@@ -61,6 +61,12 @@ where
             scopes: oauth_config.scopes.clone(),
         });
 
+        let well_known_state_mcp = Arc::new(WellKnownState {
+            resource_url: format!("{}/mcp", config.public_url),
+            authorization_server: config.public_url.clone(),
+            scopes: oauth_config.scopes.clone(),
+        });
+
         let mcp_oauth_state = McpOAuthState {
             public_url: config.public_url.clone(),
             keycloak_realm_url: oauth_config.issuer_url.clone(),
@@ -83,7 +89,7 @@ where
             )
             .route(
                 "/.well-known/oauth-protected-resource/mcp",
-                get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
+                get(protected_resource_metadata_handler).with_state(well_known_state_mcp),
             )
             .route(
                 "/.well-known/oauth-authorization-server",

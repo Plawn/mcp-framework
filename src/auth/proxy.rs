@@ -28,6 +28,8 @@ pub struct AuthorizeRequest {
     pub state: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
+    /// RFC 8707 resource indicator
+    pub resource: Option<String>,
 }
 
 /// Handler for `/oauth/authorize` - redirects to Keycloak.
@@ -64,6 +66,11 @@ pub async fn authorize_handler(
             "&code_challenge_method={}",
             urlencoding::encode(code_challenge_method)
         ));
+    }
+
+    // Forward RFC 8707 resource indicator if present
+    if let Some(resource) = &request.resource {
+        keycloak_auth_url.push_str(&format!("&resource={}", urlencoding::encode(resource)));
     }
 
     tracing::info!("Redirecting to Keycloak: {}", keycloak_auth_url);

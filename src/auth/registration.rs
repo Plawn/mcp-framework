@@ -51,7 +51,7 @@ fn build_fallback_registration(request: &ClientRegistrationRequest) -> ClientReg
         client_secret: None,
         client_name: request.client_name.clone(),
         redirect_uris: request.redirect_uris.clone(),
-        grant_types: vec!["authorization_code".to_string()],
+        grant_types: vec!["authorization_code".to_string(), "refresh_token".to_string()],
         response_types: vec!["code".to_string()],
         token_endpoint_auth_method: "none".to_string(),
     }
