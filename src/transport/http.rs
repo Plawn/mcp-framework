@@ -152,7 +152,35 @@ where
         .expose_headers(tower_http::cors::Any)
         .allow_credentials(false);
 
-    app.layer(cors)
+    // Add request/response tracing to log every HTTP request
+    let trace_layer = tower_http::trace::TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::http::Request<_>| {
+            tracing::info_span!(
+                "http_request",
+                method = %request.method(),
+                uri = %request.uri(),
+            )
+        })
+        .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
+            tracing::info!(
+                method = %request.method(),
+                uri = %request.uri(),
+                ">> incoming request"
+            );
+        })
+        .on_response(
+            |response: &axum::http::Response<_>,
+             latency: std::time::Duration,
+             _span: &tracing::Span| {
+                tracing::info!(
+                    status = %response.status(),
+                    latency_ms = latency.as_millis(),
+                    "<< response"
+                );
+            },
+        );
+
+    app.layer(cors).layer(trace_layer)
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
