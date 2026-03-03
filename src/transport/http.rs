@@ -11,6 +11,7 @@ use crate::auth::{
     AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthState, RefreshConfig, TokenStore,
     WellKnownState,
 };
+use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
 
 /// Configuration for building the HTTP app
 pub struct HttpAppConfig<F> {
@@ -19,6 +20,10 @@ pub struct HttpAppConfig<F> {
     pub auth: AuthProvider,
     pub server_factory: F,
     pub app_name: String,
+    /// Optional dynamic capability registry.
+    pub capability_registry: Option<CapabilityRegistry>,
+    /// Optional capability filter for per-session visibility.
+    pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
 }
 
 /// Build the axum router with all routes configured.
@@ -97,11 +102,21 @@ where
             );
     }
 
-    // Create MCP service
+    // Create MCP service, wrapping with DynamicHandler for dynamic capabilities
     let factory = config.server_factory;
+    let registry = config.capability_registry.unwrap_or_default();
+    let filter = config.capability_filter;
     let token_store_clone = token_store.clone();
     let mcp_service = StreamableHttpService::new(
-        move || Ok(factory(token_store_clone.clone())),
+        move || {
+            let server = factory(token_store_clone.clone());
+            Ok(DynamicHandler::new(
+                server,
+                registry.clone(),
+                filter.clone(),
+                token_store_clone.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         Default::default(),
     );
@@ -138,7 +153,9 @@ where
         }
     };
 
-    let app = app.nest("/mcp", mcp_router);
+    // Use fallback_service so the MCP handler responds at ANY path (/, /mcp, etc.).
+    // Specific routes (/.well-known/*, /oauth/*) take priority over the fallback.
+    let app = app.fallback_service(mcp_router);
 
     // Add CORS for browser access
     let cors = tower_http::cors::CorsLayer::new()
@@ -215,7 +232,7 @@ where
     }
 
     tracing::info!("MCP server listening on http://{}", bind_addr);
-    tracing::info!("MCP endpoint: http://{}/mcp", bind_addr);
+    tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
 
     let app = build_app(config);
 
