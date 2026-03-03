@@ -98,11 +98,66 @@ pub async fn token_handler(
         }
     };
 
-    // Parse the form body and replace client_id with our configured one
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let mut params: Vec<(String, String)> = form_urlencoded::parse(body_str.as_bytes())
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+
+    tracing::info!(
+        "Token request received: content-type={}, body_len={}, body={}",
+        content_type,
+        body_bytes.len(),
+        body_str
+    );
+
+    // Always try form-urlencoded first (OAuth 2.1 spec requires it).
+    // Some clients send Content-Type: application/json but still use form-urlencoded body.
+    let mut params: Vec<(String, String)> = {
+        let p: Vec<(String, String)> = form_urlencoded::parse(body_str.as_bytes())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        // If form parsing got params with a grant_type, use them
+        if p.iter().any(|(k, _)| k == "grant_type") {
+            tracing::info!("Parsed {} params from form body", p.len());
+            p
+        } else if content_type.contains("application/json") {
+            // Fallback: try JSON parsing
+            match serde_json::from_str::<serde_json::Value>(&body_str) {
+                Ok(json) => {
+                    let mut jp = Vec::new();
+                    if let Some(obj) = json.as_object() {
+                        for (k, v) in obj {
+                            let val = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            jp.push((k.clone(), val));
+                        }
+                    }
+                    tracing::info!("Parsed {} params from JSON body", jp.len());
+                    jp
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse token request body: {}", e);
+                    return Err(HttpError::invalid_request("Invalid request body"));
+                }
+            }
+        } else {
+            tracing::info!("Parsed {} params from form body (no grant_type found)", p.len());
+            p
+        }
+    };
+
+    // Log parsed params (redact sensitive values)
+    for (k, v) in &params {
+        let display_val = match k.as_str() {
+            "client_secret" | "code" | "code_verifier" | "refresh_token" => "***".to_string(),
+            _ => v.clone(),
+        };
+        tracing::info!("  token param: {}={}", k, display_val);
+    }
 
     // Replace client_id with our Keycloak client_id
     for (key, value) in params.iter_mut() {
@@ -124,14 +179,13 @@ pub async fn token_handler(
         .finish();
 
     tracing::debug!("Token request to Keycloak: {}", keycloak_token_url);
+    tracing::debug!("Forwarded body: {}", new_body);
 
-    // Forward to Keycloak
-    let mut keycloak_request = state.http_client.post(&keycloak_token_url);
-
-    // Copy relevant headers (but not authorization - we're using form-based auth)
-    if let Some(content_type) = headers.get("content-type") {
-        keycloak_request = keycloak_request.header("content-type", content_type);
-    }
+    // Forward to Keycloak - always use form-urlencoded content type
+    let keycloak_request = state
+        .http_client
+        .post(&keycloak_token_url)
+        .header("content-type", "application/x-www-form-urlencoded");
 
     let result = keycloak_request.body(new_body).send().await;
 
