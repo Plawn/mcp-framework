@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get current version
+        id: version
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        run: gh release create "v${{ steps.version.outputs.version }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Bump patch version
+        run: |
+          CURRENT="${{ steps.version.outputs.version }}"
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+          NEXT="$major.$minor.$((patch + 1))"
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to $NEXT [skip ci]"
+          git push
