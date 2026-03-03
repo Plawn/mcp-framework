@@ -1,0 +1,170 @@
+# mcp-framework
+
+> Rust framework for building MCP (Model Context Protocol) servers. Wraps `rmcp` to handle transport, auth, CLI, and tracing.
+
+## Dependency
+
+```toml
+[dependencies]
+mcp-framework = { git = "https://github.com/Plawn/mcp-framework" }
+rmcp = { version = "0.5", features = ["server"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+```
+
+Requires Rust nightly.
+
+## Core API
+
+The entire public API:
+
+```rust
+// Re-exports from lib.rs
+pub use auth::{AuthProvider, BasicAuthConfig};
+pub use runner::{run, LogLevel, McpApp, Settings, TransportMode};
+// Also available via mcp_framework::auth::
+pub use auth::OAuthConfig;
+pub use auth::TokenStore;
+```
+
+## Minimal example
+
+```rust
+use mcp_framework::{run, McpApp, AuthProvider};
+use rmcp::ServerHandler;
+
+struct MyServer;
+
+// Implement rmcp::ServerHandler for your server.
+// See rmcp docs for #[tool], #[prompt], #[resource] macros.
+impl ServerHandler for MyServer {
+    fn name(&self) -> String { "my-server".to_string() }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(McpApp {
+        name: "my-server",
+        auth: AuthProvider::None,
+        server_factory: |_token_store| MyServer,
+        stdio_token_env: None,
+        settings: None,
+    }).await
+}
+```
+
+## McpApp fields
+
+```rust
+pub struct McpApp<F> {
+    pub name: &'static str,           // App name, used in OAuth templates and logs
+    pub auth: AuthProvider,            // Auth mode for HTTP transport
+    pub server_factory: F,             // Fn(TokenStore) -> impl ServerHandler
+    pub stdio_token_env: Option<&'static str>, // Env var name for stdio token (e.g. "MY_TOKEN")
+    pub settings: Option<Settings>,    // None = CLI + env vars, Some = manual config
+}
+```
+
+## Settings (programmatic config)
+
+When `settings` is `Some(...)`, no CLI parsing happens and `.env` is not loaded.
+
+```rust
+use mcp_framework::{Settings, TransportMode, LogLevel};
+
+Settings {
+    transport: TransportMode::Http,     // Http or Stdio
+    log_level: LogLevel::Info,          // Error, Info, Debug, Trace
+    bind_addr: "0.0.0.0:4000".into(),  // HTTP listen address
+    public_url: None,                   // None derives from bind_addr
+}
+```
+
+`Settings` implements `Default` (Http, Info, 0.0.0.0:4000, None).
+
+When `settings` is `None`, the framework parses CLI args (`--transport`, `--debug`, `--trace`) and reads `BIND_ADDR`/`PUBLIC_URL` env vars.
+
+## Authentication
+
+### No auth
+
+```rust
+auth: AuthProvider::None,
+```
+
+### HTTP Basic
+
+```rust
+use mcp_framework::BasicAuthConfig;
+
+// From struct:
+auth: AuthProvider::Basic(BasicAuthConfig {
+    username: "admin".into(),
+    password: "secret".into(),
+}),
+
+// From env (BASIC_AUTH_USERNAME, BASIC_AUTH_PASSWORD):
+auth: AuthProvider::Basic(BasicAuthConfig::from_env().unwrap()),
+```
+
+### OAuth 2.0 (Keycloak OIDC)
+
+```rust
+use mcp_framework::auth::OAuthConfig;
+
+// From struct:
+auth: AuthProvider::OAuth(OAuthConfig {
+    client_id: "my-client".into(),
+    client_secret: "secret".into(),
+    issuer_url: "https://keycloak.example.com/realms/myrealm".into(),
+    redirect_url: "http://localhost:4000/oauth/callback".into(),
+    scopes: vec!["openid".into(), "profile".into(), "email".into()],
+}),
+
+// From env (OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_ISSUER_URL, OAUTH_REDIRECT_URL, OAUTH_SCOPES):
+auth: AuthProvider::OAuth(OAuthConfig::from_env().unwrap()),
+```
+
+## TokenStore
+
+The `server_factory` closure receives a `TokenStore`. Use it to access the authenticated user's token inside your server handler:
+
+```rust
+use mcp_framework::auth::TokenStore;
+
+struct MyServer {
+    token_store: TokenStore,
+}
+
+// In McpApp:
+server_factory: |token_store| MyServer { token_store },
+```
+
+Key methods:
+- `token_store.get_token(session_id).await -> Option<StoredToken>` — get stored token
+- `token_store.has_valid_token(session_id).await -> bool` — check if non-expired token exists
+- `stored_token.access_token` — the access token string
+
+## HTTP endpoints
+
+In HTTP mode, the MCP protocol endpoint is at `/mcp`.
+
+With OAuth auth, additional endpoints are registered:
+- `/.well-known/oauth-protected-resource`
+- `/.well-known/oauth-authorization-server`
+- `/oauth/register`, `/oauth/authorize`, `/oauth/token`
+- `/oauth/login`, `/oauth/callback`, `/oauth/status`
+
+## Environment variables (CLI mode only)
+
+| Variable | Default |
+|---|---|
+| `BIND_ADDR` | `0.0.0.0:4000` |
+| `PUBLIC_URL` | `http://{BIND_ADDR}` |
+| `BASIC_AUTH_USERNAME` | — |
+| `BASIC_AUTH_PASSWORD` | — |
+| `OAUTH_CLIENT_ID` | — |
+| `OAUTH_CLIENT_SECRET` | — |
+| `OAUTH_ISSUER_URL` | — |
+| `OAUTH_REDIRECT_URL` | — |
+| `OAUTH_SCOPES` | `openid,profile,email` |

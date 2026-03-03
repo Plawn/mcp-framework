@@ -1,0 +1,133 @@
+# mcp-framework
+
+An opinionated Rust framework for building [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) servers. Built on top of [`rmcp`](https://crates.io/crates/rmcp).
+
+Handles transport selection, authentication, CLI parsing, and tracing so you only need to implement `rmcp::ServerHandler`.
+
+## Features
+
+- **Dual transport** — HTTP (Streamable HTTP) for remote connections, stdio for local Claude Desktop integration
+- **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE, dynamic client registration)
+- **CLI or programmatic config** — use built-in CLI args + env vars, or pass a `Settings` struct directly
+
+## Usage
+
+Add the dependency:
+
+```toml
+[dependencies]
+mcp-framework = { git = "https://github.com/Plawn/mcp-framework" }
+```
+
+Implement your server and call `run`:
+
+```rust
+use mcp_framework::{run, McpApp, AuthProvider};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(McpApp {
+        name: "my-mcp-server",
+        auth: AuthProvider::None,
+        server_factory: |_token_store| MyServer::new(),
+        stdio_token_env: None,
+        settings: None, // use CLI args + env vars
+    }).await
+}
+```
+
+### Manual settings
+
+Pass a `Settings` struct to bypass CLI parsing and env vars entirely:
+
+```rust
+use mcp_framework::{run, McpApp, AuthProvider, Settings, TransportMode};
+
+run(McpApp {
+    name: "my-mcp-server",
+    auth: AuthProvider::None,
+    server_factory: |_token_store| MyServer::new(),
+    stdio_token_env: None,
+    settings: Some(Settings {
+        transport: TransportMode::Http,
+        bind_addr: "127.0.0.1:8080".to_string(),
+        public_url: Some("https://my-app.example.com".to_string()),
+        ..Default::default()
+    }),
+}).await
+```
+
+### CLI mode (when `settings: None`)
+
+```
+my-server --transport http      # default, starts HTTP server
+my-server --transport stdio     # stdio for Claude Desktop
+my-server --debug               # debug logging
+my-server --trace               # trace-level logging
+```
+
+## Authentication
+
+### None
+
+```rust
+auth: AuthProvider::None,
+```
+
+### HTTP Basic
+
+```rust
+use mcp_framework::BasicAuthConfig;
+
+auth: AuthProvider::Basic(BasicAuthConfig {
+    username: "admin".to_string(),
+    password: "secret".to_string(),
+}),
+// or from BASIC_AUTH_USERNAME / BASIC_AUTH_PASSWORD env vars:
+auth: AuthProvider::Basic(BasicAuthConfig::from_env().unwrap()),
+```
+
+### OAuth 2.0 (Keycloak)
+
+```rust
+use mcp_framework::auth::OAuthConfig;
+
+auth: AuthProvider::OAuth(OAuthConfig {
+    client_id: "my-client".to_string(),
+    client_secret: "secret".to_string(),
+    issuer_url: "https://keycloak.example.com/realms/myrealm".to_string(),
+    redirect_url: "http://localhost:4000/oauth/callback".to_string(),
+    scopes: vec!["openid".into(), "profile".into()],
+}),
+// or from OAUTH_* env vars:
+auth: AuthProvider::OAuth(OAuthConfig::from_env().unwrap()),
+```
+
+OAuth mode exposes:
+- `/.well-known/oauth-protected-resource` (RFC 9728)
+- `/.well-known/oauth-authorization-server` (RFC 8414)
+- `/oauth/register` (RFC 7591 dynamic client registration)
+- `/oauth/authorize`, `/oauth/token` (Keycloak proxy)
+- `/oauth/login`, `/oauth/callback`, `/oauth/status` (browser flow)
+
+## Environment variables
+
+When using CLI mode (`settings: None`):
+
+| Variable | Description | Default |
+|---|---|---|
+| `BIND_ADDR` | HTTP listen address | `0.0.0.0:4000` |
+| `PUBLIC_URL` | Public URL for OAuth callbacks | `http://{BIND_ADDR}` |
+| `BASIC_AUTH_USERNAME` | Basic auth username | — |
+| `BASIC_AUTH_PASSWORD` | Basic auth password | — |
+| `OAUTH_CLIENT_ID` | OAuth client ID | — |
+| `OAUTH_CLIENT_SECRET` | OAuth client secret | — |
+| `OAUTH_ISSUER_URL` | Keycloak realm URL | — |
+| `OAUTH_REDIRECT_URL` | OAuth redirect URL | — |
+| `OAUTH_SCOPES` | Comma-separated scopes | `openid,profile,email` |
+
+A `.env` file is loaded automatically in CLI mode.
+
+## License
+
+MIT
