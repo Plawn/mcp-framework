@@ -55,13 +55,8 @@ where
             .build()
             .expect("Failed to build HTTP client");
 
+        // Both well-known endpoints describe the same protected resource: the MCP endpoint at /mcp
         let well_known_state = Arc::new(WellKnownState {
-            resource_url: config.public_url.clone(),
-            authorization_server: config.public_url.clone(),
-            scopes: oauth_config.scopes.clone(),
-        });
-
-        let well_known_state_mcp = Arc::new(WellKnownState {
             resource_url: format!("{}/mcp", config.public_url),
             authorization_server: config.public_url.clone(),
             scopes: oauth_config.scopes.clone(),
@@ -89,7 +84,7 @@ where
             )
             .route(
                 "/.well-known/oauth-protected-resource/mcp",
-                get(protected_resource_metadata_handler).with_state(well_known_state_mcp),
+                get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
             )
             .route(
                 "/.well-known/oauth-authorization-server",

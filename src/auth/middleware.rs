@@ -40,32 +40,32 @@ pub async fn bearer_auth_middleware(
     // Extract Authorization header
     let auth_header = request.headers().get("authorization");
 
-    tracing::debug!("Auth middleware: checking request to {}", request.uri());
+    tracing::info!("Auth middleware: checking request {} {}", request.method(), request.uri());
 
     let token = match auth_header {
         Some(header) => {
             let header_str = match header.to_str() {
                 Ok(s) => s,
                 Err(_) => {
-                    tracing::debug!("Auth middleware: invalid authorization header encoding");
+                    tracing::warn!("Auth middleware: invalid authorization header encoding");
                     return unauthorized_response(&state.resource_metadata_url);
                 }
             };
 
             if let Some(token) = header_str.strip_prefix("Bearer ") {
-                tracing::debug!("Auth middleware: found Bearer token");
+                tracing::info!("Auth middleware: found Bearer token (len={})", token.len());
                 token.to_string()
             } else if let Some(token) = header_str.strip_prefix("bearer ") {
-                tracing::debug!("Auth middleware: found bearer token (lowercase)");
+                tracing::info!("Auth middleware: found bearer token lowercase (len={})", token.len());
                 token.to_string()
             } else {
-                tracing::debug!("Auth middleware: authorization header not Bearer type: {}", header_str);
+                tracing::warn!("Auth middleware: authorization header not Bearer type: {}", &header_str[..header_str.len().min(20)]);
                 return unauthorized_response(&state.resource_metadata_url);
             }
         }
         None => {
             // No auth header - return 401 with discovery info
-            tracing::debug!("Auth middleware: no authorization header present");
+            tracing::info!("Auth middleware: no authorization header, returning 401");
             return unauthorized_response(&state.resource_metadata_url);
         }
     };
