@@ -130,7 +130,8 @@ where
         }
         AuthProvider::OAuth(_) => {
             let auth_middleware_state = Arc::new(AuthMiddlewareState {
-                resource_url: config.public_url.clone(),
+                resource_url: format!("{}/mcp", config.public_url),
+                resource_metadata_url: format!("{}/.well-known/oauth-protected-resource/mcp", config.public_url),
                 token_store: token_store.clone(),
             });
             Router::new()

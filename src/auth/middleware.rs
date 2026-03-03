@@ -19,6 +19,7 @@ use super::{TokenStore, StoredToken, BasicAuthConfig};
 #[derive(Clone)]
 pub struct AuthMiddlewareState {
     pub resource_url: String,
+    pub resource_metadata_url: String,
     pub token_store: TokenStore,
 }
 
@@ -47,7 +48,7 @@ pub async fn bearer_auth_middleware(
                 Ok(s) => s,
                 Err(_) => {
                     tracing::debug!("Auth middleware: invalid authorization header encoding");
-                    return unauthorized_response(&state.resource_url);
+                    return unauthorized_response(&state.resource_metadata_url);
                 }
             };
 
@@ -59,13 +60,13 @@ pub async fn bearer_auth_middleware(
                 token.to_string()
             } else {
                 tracing::debug!("Auth middleware: authorization header not Bearer type: {}", header_str);
-                return unauthorized_response(&state.resource_url);
+                return unauthorized_response(&state.resource_metadata_url);
             }
         }
         None => {
             // No auth header - return 401 with discovery info
             tracing::debug!("Auth middleware: no authorization header present");
-            return unauthorized_response(&state.resource_url);
+            return unauthorized_response(&state.resource_metadata_url);
         }
     };
 
@@ -100,14 +101,12 @@ pub async fn bearer_auth_middleware(
 }
 
 /// Returns a 401 response with WWW-Authenticate header for OAuth discovery
-fn unauthorized_response(resource_url: &str) -> Response {
-    let metadata_url = format!("{}/.well-known/oauth-protected-resource", resource_url);
-
+fn unauthorized_response(resource_metadata_url: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(
             "WWW-Authenticate",
-            format!("Bearer resource_metadata=\"{}\"", metadata_url),
+            format!("Bearer resource_metadata=\"{}\"", resource_metadata_url),
         )],
         "Unauthorized: Bearer token required",
     )
