@@ -175,6 +175,16 @@ When using CLI mode (`settings: None`):
 
 A `.env` file is loaded automatically in CLI mode.
 
-## License
+## Use locally
 
-MIT
+```json
+    "mcpServers": {
+      "gitdoc": {
+        "command": "<path to bin>",
+         "args": ["-t", "stdio"],
+        "env": {
+          "URL": "http://127.0.0.1:3000"
+        }
+      }
+    },
+```
