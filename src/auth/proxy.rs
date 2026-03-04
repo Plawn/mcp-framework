@@ -14,8 +14,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 use url::form_urlencoded;
 
-use super::McpOAuthState;
+use super::{McpOAuthState, StoredToken};
 use crate::http_util::HttpError;
+use std::time::{Duration, Instant};
 
 /// Authorization request query parameters
 #[derive(Debug, Deserialize)]
@@ -159,6 +160,13 @@ pub async fn token_handler(
         tracing::info!("  token param: {}={}", k, display_val);
     }
 
+    // Capture grant_type before params are consumed
+    let grant_type = params
+        .iter()
+        .find(|(k, _)| k == "grant_type")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
     // Replace client_id with our Keycloak client_id
     for (key, value) in params.iter_mut() {
         if key == "client_id" {
@@ -201,6 +209,24 @@ pub async fn token_handler(
                     if status.is_success() {
                         tracing::info!("Token exchange successful, status: {}", status);
                         tracing::debug!("Token response: {}", body_str);
+
+                        // Store token in the token store for auto-refresh support
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                            if let Some(access_token) = json["access_token"].as_str() {
+                                let stored = StoredToken {
+                                    access_token: access_token.to_string(),
+                                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
+                                };
+                                let session_key = if grant_type == "refresh_token" {
+                                    "default"
+                                } else {
+                                    "default"
+                                };
+                                state.token_store.store_token(session_key.to_string(), stored).await;
+                                tracing::debug!("Stored token for session '{}'", session_key);
+                            }
+                        }
                     } else {
                         tracing::error!(
                             "Token exchange failed, status: {}, body: {}",
