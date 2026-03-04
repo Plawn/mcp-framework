@@ -15,11 +15,12 @@
 //!     run(McpApp {
 //!         name: "my-server",
 //!         auth: AuthProvider::None,
-//!         server_factory: |_token_store| MyServer::new(),
+//!         server_factory: |_token_store, _session_store| MyServer::new(),
 //!         stdio_token_env: None,
 //!         settings: None,
 //!         capability_registry: None,
 //!         capability_filter: None,
+//!         session_store: None,
 //!     }).await
 //! }
 //! ```
@@ -37,8 +38,10 @@ pub mod auth;
 pub mod capability;
 pub mod http_util;
 pub mod runner;
+pub mod session;
 pub mod transport;
 
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{CapabilityFilter, CapabilityRegistry};
 pub use runner::{run, LogLevel, McpApp, Settings, TransportMode};
+pub use session::{resolve_session_id, SessionStore};

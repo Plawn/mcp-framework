@@ -23,6 +23,7 @@ The entire public API:
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{CapabilityFilter, CapabilityRegistry};
 pub use runner::{run, LogLevel, McpApp, Settings, TransportMode};
+pub use session::{resolve_session_id, SessionStore};
 ```
 
 ## Minimal example
@@ -44,11 +45,12 @@ async fn main() -> anyhow::Result<()> {
     run(McpApp {
         name: "my-server",
         auth: AuthProvider::None,
-        server_factory: |_token_store| MyServer,
+        server_factory: |_token_store, _session_store| MyServer,
         stdio_token_env: None,
         settings: None,
         capability_registry: None,
         capability_filter: None,
+        session_store: None,
     }).await
 }
 ```
@@ -56,14 +58,15 @@ async fn main() -> anyhow::Result<()> {
 ## McpApp fields
 
 ```rust
-pub struct McpApp<F> {
+pub struct McpApp<F, T = ()> {
     pub name: &'static str,           // App name, used in OAuth templates and logs
     pub auth: AuthProvider,            // Auth mode for HTTP transport
-    pub server_factory: F,             // Fn(TokenStore) -> impl ServerHandler
+    pub server_factory: F,             // Fn(TokenStore, SessionStore<T>) -> impl ServerHandler
     pub stdio_token_env: Option<&'static str>, // Env var name for stdio token (e.g. "MY_TOKEN")
     pub settings: Option<Settings>,    // None = CLI + env vars, Some = manual config
     pub capability_registry: Option<CapabilityRegistry>, // Dynamic tools/prompts/resources
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>, // Per-session capability filtering
+    pub session_store: Option<SessionStore<T>>, // Typed per-session storage (default: 30min TTL)
 }
 ```
 
@@ -79,6 +82,7 @@ Settings {
     log_level: LogLevel::Info,          // Error, Info, Debug, Trace
     bind_addr: "0.0.0.0:4000".into(),  // HTTP listen address
     public_url: None,                   // None derives from bind_addr
+    session_ttl: None,                  // None defaults to 30 minutes
 }
 ```
 
@@ -147,13 +151,37 @@ struct MyServer {
 }
 
 // In McpApp:
-server_factory: |token_store| MyServer { token_store },
+server_factory: |token_store, _session_store| MyServer { token_store },
 ```
 
 Key methods:
 - `token_store.get_token(session_id).await -> Option<StoredToken>` — get stored token (auto-refreshes if expired)
 - `token_store.has_valid_token(session_id).await -> bool` — check if non-expired token exists
 - `stored_token.access_token` — the access token string
+
+## SessionStore
+
+`SessionStore<T>` provides typed, per-session data with TTL and automatic cleanup. `T` defaults to `()` for backward compatibility.
+
+```rust
+use mcp_framework::{SessionStore, resolve_session_id};
+
+#[derive(Default, Clone)]
+struct MySession {
+    request_count: u32,
+}
+
+// In McpApp:
+server_factory: |_token_store, session_store: SessionStore<MySession>| MyServer { session_store },
+session_store: None, // default 30min TTL
+```
+
+Key methods:
+- `session_store.get_or_create(session_id).await -> T` — get or create with `T::default()`
+- `session_store.get(session_id).await -> Option<T>` — get if exists
+- `session_store.update(session_id, |s| { ... }).await -> T` — mutate in place
+- `session_store.remove(session_id).await -> Option<T>` — delete session
+- `resolve_session_id(&extensions) -> &str` — extract session ID from request context
 
 ## Capability system
 
