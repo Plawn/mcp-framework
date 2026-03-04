@@ -89,8 +89,8 @@ impl TokenStore {
     /// Attempt to refresh an expired token
     /// Returns Ok(new_token) if refresh succeeded, Err if refresh not possible
     pub async fn refresh_token(&self, session_id: &str) -> Result<StoredToken, String> {
-        // Get current token to extract refresh_token
-        let stored = self.get_token(session_id).await
+        // Get current token to extract refresh_token (raw to avoid recursion)
+        let stored = self.get_token_raw(session_id).await
             .ok_or_else(|| "No token found for session".to_string())?;
 
         let refresh_token = stored.refresh_token
@@ -181,10 +181,30 @@ impl TokenStore {
         tokens.insert(session_id, token);
     }
 
-    /// Get a token for a session
-    pub async fn get_token(&self, session_id: &str) -> Option<StoredToken> {
+    /// Get a token for a session (raw, no auto-refresh)
+    async fn get_token_raw(&self, session_id: &str) -> Option<StoredToken> {
         let tokens = self.tokens.read().await;
         tokens.get(session_id).cloned()
+    }
+
+    /// Get a token for a session, automatically refreshing if expired.
+    pub async fn get_token(&self, session_id: &str) -> Option<StoredToken> {
+        let token = self.get_token_raw(session_id).await?;
+
+        // If token is expired, has a refresh_token, and refresh config exists, try refresh
+        if token.is_expired() {
+            if token.refresh_token.is_some() && self.refresh_config.read().await.is_some() {
+                match self.refresh_token(session_id).await {
+                    Ok(new_token) => return Some(new_token),
+                    Err(e) => {
+                        tracing::warn!("Auto-refresh failed for session {}: {}", session_id, e);
+                        // Fall through and return the stale token
+                    }
+                }
+            }
+        }
+
+        Some(token)
     }
 
     /// Remove a token for a session
@@ -194,9 +214,9 @@ impl TokenStore {
         tokens.remove(session_id);
     }
 
-    /// Check if a session has a valid (non-expired) token
+    /// Check if a session has a valid (non-expired) token (no side-effects)
     pub async fn has_valid_token(&self, session_id: &str) -> bool {
-        match self.get_token(session_id).await {
+        match self.get_token_raw(session_id).await {
             Some(token) => !token.is_expired(),
             None => false,
         }

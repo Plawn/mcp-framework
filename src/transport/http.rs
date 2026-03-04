@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use axum::{routing::get, Router};
 use rmcp::transport::streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager};
+use rmcp::transport::sse_server::{SseServer, SseServerConfig};
 use rmcp::ServerHandler;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
@@ -12,6 +14,7 @@ use crate::auth::{
     WellKnownState,
 };
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
+use crate::runner::TransportMode;
 
 /// Configuration for building the HTTP app
 pub struct HttpAppConfig<F> {
@@ -24,6 +27,44 @@ pub struct HttpAppConfig<F> {
     pub capability_registry: Option<CapabilityRegistry>,
     /// Optional capability filter for per-session visibility.
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
+    /// Transport mode (Http or Sse).
+    pub transport: TransportMode,
+}
+
+/// Wrap a router with the appropriate auth middleware based on the auth provider.
+fn wrap_auth_middleware(
+    router: Router,
+    auth: &AuthProvider,
+    public_url: &str,
+    token_store: &TokenStore,
+) -> Router {
+    match auth {
+        AuthProvider::None => router,
+        AuthProvider::Basic(basic_config) => {
+            let basic_state = Arc::new(BasicAuthMiddlewareState {
+                config: basic_config.clone(),
+                token_store: token_store.clone(),
+            });
+            router.layer(axum::middleware::from_fn_with_state(
+                basic_state,
+                basic_auth_middleware,
+            ))
+        }
+        AuthProvider::OAuth(_) => {
+            let auth_middleware_state = Arc::new(AuthMiddlewareState {
+                resource_url: format!("{}/mcp", public_url),
+                resource_metadata_url: format!(
+                    "{}/.well-known/oauth-protected-resource/mcp",
+                    public_url
+                ),
+                token_store: token_store.clone(),
+            });
+            router.layer(axum::middleware::from_fn_with_state(
+                auth_middleware_state,
+                bearer_auth_middleware,
+            ))
+        }
+    }
 }
 
 /// Build the axum router with all routes configured.
@@ -73,6 +114,7 @@ where
             keycloak_client_id: oauth_config.client_id.clone(),
             keycloak_client_secret: Some(oauth_config.client_secret.clone()),
             http_client: http_client.clone(),
+            token_store: token_store.clone(),
         };
 
         let oauth_state = OAuthState {
@@ -102,55 +144,54 @@ where
             );
     }
 
-    // Create MCP service, wrapping with DynamicHandler for dynamic capabilities
+    // Create MCP service / router based on transport mode
     let factory = config.server_factory;
     let registry = config.capability_registry.unwrap_or_default();
     let filter = config.capability_filter;
     let token_store_clone = token_store.clone();
-    let mcp_service = StreamableHttpService::new(
-        move || {
+
+    let mcp_router = if config.transport == TransportMode::Sse {
+        // SSE transport: create SseServer and spawn handler loop
+        let (sse_server, sse_router) = SseServer::new(SseServerConfig {
+            bind: "0.0.0.0:0".parse().unwrap(), // unused — we merge the router into our own Axum app
+            sse_path: "/sse".to_string(),
+            post_path: "/message".to_string(),
+            ct: CancellationToken::new(),
+            sse_keep_alive: None,
+        });
+
+        // Spawn the handler loop — each new SSE connection gets a DynamicHandler
+        let _ct = sse_server.with_service(move || {
             let server = factory(token_store_clone.clone());
-            Ok(DynamicHandler::new(
+            DynamicHandler::new(
                 server,
                 registry.clone(),
                 filter.clone(),
                 token_store_clone.clone(),
-            ))
-        },
-        LocalSessionManager::default().into(),
-        Default::default(),
-    );
+            )
+        });
 
-    // Build MCP router with appropriate auth middleware
-    let mcp_router = match &config.auth {
-        AuthProvider::None => {
-            Router::new().fallback_service(mcp_service)
-        }
-        AuthProvider::Basic(basic_config) => {
-            let basic_state = Arc::new(BasicAuthMiddlewareState {
-                config: basic_config.clone(),
-                token_store: token_store.clone(),
-            });
-            Router::new()
-                .fallback_service(mcp_service)
-                .layer(axum::middleware::from_fn_with_state(
-                    basic_state,
-                    basic_auth_middleware,
+        // Wrap SSE router with auth middleware
+        wrap_auth_middleware(sse_router, &config.auth, &config.public_url, &token_store)
+    } else {
+        // Streamable HTTP transport (default)
+        let mcp_service = StreamableHttpService::new(
+            move || {
+                let server = factory(token_store_clone.clone());
+                Ok(DynamicHandler::new(
+                    server,
+                    registry.clone(),
+                    filter.clone(),
+                    token_store_clone.clone(),
                 ))
-        }
-        AuthProvider::OAuth(_) => {
-            let auth_middleware_state = Arc::new(AuthMiddlewareState {
-                resource_url: format!("{}/mcp", config.public_url),
-                resource_metadata_url: format!("{}/.well-known/oauth-protected-resource/mcp", config.public_url),
-                token_store: token_store.clone(),
-            });
-            Router::new()
-                .fallback_service(mcp_service)
-                .layer(axum::middleware::from_fn_with_state(
-                    auth_middleware_state,
-                    bearer_auth_middleware,
-                ))
-        }
+            },
+            LocalSessionManager::default().into(),
+            Default::default(),
+        );
+
+        // Wrap with auth middleware
+        let base = Router::new().fallback_service(mcp_service);
+        wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
     };
 
     // Use fallback_service so the MCP handler responds at ANY path (/, /mcp, etc.).
@@ -232,7 +273,12 @@ where
     }
 
     tracing::info!("MCP server listening on http://{}", bind_addr);
-    tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
+    if config.transport == TransportMode::Sse {
+        tracing::info!("SSE endpoint: http://{}/sse", bind_addr);
+        tracing::info!("Message endpoint: http://{}/message", bind_addr);
+    } else {
+        tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
+    }
 
     let app = build_app(config);
 
