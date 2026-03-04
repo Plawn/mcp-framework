@@ -15,9 +15,10 @@ use crate::auth::{
 };
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
 use crate::runner::TransportMode;
+use crate::session::SessionStore;
 
 /// Configuration for building the HTTP app
-pub struct HttpAppConfig<F> {
+pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub public_url: String,
     pub bind_addr: String,
     pub auth: AuthProvider,
@@ -29,6 +30,8 @@ pub struct HttpAppConfig<F> {
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
     /// Transport mode (Http or Sse).
     pub transport: TransportMode,
+    /// Session store for typed per-session data.
+    pub session_store: SessionStore<T>,
 }
 
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
@@ -69,10 +72,11 @@ fn wrap_auth_middleware(
 
 /// Build the axum router with all routes configured.
 /// This is extracted for testability - tests can spawn this app on a test server.
-pub fn build_app<F, S>(config: HttpAppConfig<F>) -> Router
+pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> Router
 where
-    F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
+    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
+    T: Send + Sync + Default + Clone + 'static,
 {
     // Create token store based on auth mode
     let token_store = match &config.auth {
@@ -149,6 +153,7 @@ where
     let registry = config.capability_registry.unwrap_or_default();
     let filter = config.capability_filter;
     let token_store_clone = token_store.clone();
+    let session_store = config.session_store;
 
     let mcp_router = if config.transport == TransportMode::Sse {
         // SSE transport: create SseServer and spawn handler loop
@@ -162,7 +167,7 @@ where
 
         // Spawn the handler loop — each new SSE connection gets a DynamicHandler
         let _ct = sse_server.with_service(move || {
-            let server = factory(token_store_clone.clone());
+            let server = factory(token_store_clone.clone(), session_store.clone());
             DynamicHandler::new(
                 server,
                 registry.clone(),
@@ -177,7 +182,7 @@ where
         // Streamable HTTP transport (default)
         let mcp_service = StreamableHttpService::new(
             move || {
-                let server = factory(token_store_clone.clone());
+                let server = factory(token_store_clone.clone(), session_store.clone());
                 Ok(DynamicHandler::new(
                     server,
                     registry.clone(),
@@ -238,10 +243,11 @@ where
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
-pub async fn run_http<F, S>(config: HttpAppConfig<F>) -> anyhow::Result<()>
+pub async fn run_http<F, S, T>(config: HttpAppConfig<F, T>) -> anyhow::Result<()>
 where
-    F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
+    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
+    T: Send + Sync + Default + Clone + 'static,
 {
     let bind_addr: std::net::SocketAddr = config.bind_addr.parse()?;
 
@@ -280,14 +286,20 @@ where
         tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
     }
 
+    // Start session cleanup task
+    let cleanup_handle = config.session_store.start_cleanup_task();
+
     let app = build_app(config);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     // Graceful shutdown with timeout
-    let shutdown_signal = async {
+    let shutdown_signal = async move {
         tokio::signal::ctrl_c().await.unwrap();
         tracing::info!("Shutdown signal received, stopping server...");
+
+        // Stop the session cleanup task
+        cleanup_handle.abort();
 
         // Give connections 5 seconds to close gracefully, then force exit
         tokio::spawn(async {

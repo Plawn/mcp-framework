@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
@@ -6,6 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::auth::{AuthProvider, StoredToken, TokenStore};
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
+use crate::session::{SessionStore, DEFAULT_SESSION_TTL};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
@@ -45,6 +47,8 @@ pub struct Settings {
     pub bind_addr: String,
     /// Public URL for OAuth callbacks. If `None`, derived as `http://{bind_addr}`.
     pub public_url: Option<String>,
+    /// Session TTL for the `SessionStore`. If `None`, defaults to 30 minutes.
+    pub session_ttl: Option<Duration>,
 }
 
 impl Default for Settings {
@@ -54,17 +58,25 @@ impl Default for Settings {
             log_level: LogLevel::Info,
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             public_url: None,
+            session_ttl: None,
         }
     }
 }
 
 /// High-level configuration for an MCP application.
-pub struct McpApp<F> {
+///
+/// The generic parameter `T` is the session data type stored per MCP session.
+/// It defaults to `()` for backward compatibility — consumers that don't need
+/// per-session state can omit it entirely.
+pub struct McpApp<F, T = ()>
+where
+    T: Send + Sync + Default + Clone + 'static,
+{
     /// Application name (used in OAuth templates and logs)
     pub name: &'static str,
     /// Authentication provider to use in HTTP mode
     pub auth: AuthProvider,
-    /// Factory that creates a `ServerHandler` from a `TokenStore`
+    /// Factory that creates a `ServerHandler` from a `TokenStore` and `SessionStore<T>`
     pub server_factory: F,
     /// Env var name holding the token for stdio mode (e.g. `"MY_APP_TOKEN"`)
     pub stdio_token_env: Option<&'static str>,
@@ -75,6 +87,8 @@ pub struct McpApp<F> {
     pub capability_registry: Option<CapabilityRegistry>,
     /// Optional filter to control which capabilities are visible per session.
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
+    /// Optional session store. When `None`, a default store is created automatically.
+    pub session_store: Option<SessionStore<T>>,
 }
 
 #[derive(Parser, Debug)]
@@ -155,12 +169,28 @@ fn resolve_http_addrs(settings: Option<&Settings>) -> (String, String) {
     }
 }
 
-async fn run_http_mode<F, S>(app: McpApp<F>, transport: TransportMode) -> anyhow::Result<()>
+fn resolve_session_store<T: Send + Sync + Default + Clone + 'static>(
+    session_store: &Option<SessionStore<T>>,
+    settings: &Option<Settings>,
+) -> SessionStore<T> {
+    if let Some(store) = session_store {
+        return store.clone();
+    }
+    let ttl = settings
+        .as_ref()
+        .and_then(|s| s.session_ttl)
+        .unwrap_or(DEFAULT_SESSION_TTL);
+    SessionStore::new(ttl)
+}
+
+async fn run_http_mode<F, S, T>(app: McpApp<F, T>, transport: TransportMode) -> anyhow::Result<()>
 where
-    F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
+    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
+    T: Send + Sync + Default + Clone + 'static,
 {
     let (bind_addr, public_url) = resolve_http_addrs(app.settings.as_ref());
+    let session_store = resolve_session_store(&app.session_store, &app.settings);
 
     run_http(HttpAppConfig {
         public_url,
@@ -171,16 +201,19 @@ where
         capability_registry: app.capability_registry,
         capability_filter: app.capability_filter,
         transport,
+        session_store,
     })
     .await
 }
 
-async fn run_stdio_mode<F, S>(app: McpApp<F>) -> anyhow::Result<()>
+async fn run_stdio_mode<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
-    F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
+    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
+    T: Send + Sync + Default + Clone + 'static,
 {
     let token_store = TokenStore::new();
+    let session_store = resolve_session_store(&app.session_store, &app.settings);
 
     if let Some(env_var) = app.stdio_token_env {
         if let Ok(t) = std::env::var(env_var) {
@@ -203,7 +236,7 @@ where
         }
     }
 
-    let server = (app.server_factory)(token_store.clone());
+    let server = (app.server_factory)(token_store.clone(), session_store);
 
     match app.capability_registry {
         Some(registry) => {
@@ -222,10 +255,11 @@ where
 ///
 /// When `app.settings` is `None`, `.env` is loaded, CLI args are parsed,
 /// and `BIND_ADDR`/`PUBLIC_URL` env vars are read (original behavior).
-pub async fn run<F, S>(app: McpApp<F>) -> anyhow::Result<()>
+pub async fn run<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
-    F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
+    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
+    T: Send + Sync + Default + Clone + 'static,
 {
     if let Some(ref settings) = app.settings {
         let transport = settings.transport.clone();

@@ -10,6 +10,7 @@ Handles transport selection, authentication, CLI parsing, and tracing so you onl
 - **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE, dynamic client registration)
 - **Automatic token refresh** — expired OAuth tokens are refreshed lazily on access
 - **Dynamic capabilities** — add/remove tools, prompts, and resources at runtime
+- **Typed session storage** — generic `SessionStore<T>` for per-session data with TTL and automatic cleanup
 - **CLI or programmatic config** — use built-in CLI args + env vars, or pass a `Settings` struct directly
 
 ## Usage
@@ -31,11 +32,12 @@ async fn main() -> anyhow::Result<()> {
     run(McpApp {
         name: "my-mcp-server",
         auth: AuthProvider::None,
-        server_factory: |_token_store| MyServer::new(),
+        server_factory: |_token_store, _session_store| MyServer::new(),
         stdio_token_env: None,
         settings: None, // use CLI args + env vars
         capability_registry: None,
         capability_filter: None,
+        session_store: None,
     }).await
 }
 ```
@@ -50,7 +52,7 @@ use mcp_framework::{run, McpApp, AuthProvider, Settings, TransportMode};
 run(McpApp {
     name: "my-mcp-server",
     auth: AuthProvider::None,
-    server_factory: |_token_store| MyServer::new(),
+    server_factory: |_token_store, _session_store| MyServer::new(),
     stdio_token_env: None,
     settings: Some(Settings {
         transport: TransportMode::Http,
@@ -60,6 +62,7 @@ run(McpApp {
     }),
     capability_registry: None,
     capability_filter: None,
+    session_store: None,
 }).await
 ```
 
@@ -117,6 +120,66 @@ OAuth mode exposes:
 - `/oauth/authorize`, `/oauth/token` (Keycloak proxy)
 - `/oauth/login`, `/oauth/callback`, `/oauth/status` (browser flow)
 
+## Session storage
+
+`SessionStore<T>` provides typed, per-session data with automatic TTL expiration. The generic `T` defaults to `()` — consumers that don't need sessions can ignore it entirely.
+
+```rust
+use mcp_framework::{run, McpApp, AuthProvider, SessionStore, resolve_session_id};
+use std::time::Duration;
+
+#[derive(Default, Clone)]
+struct MySession {
+    user_name: Option<String>,
+    request_count: u32,
+}
+
+struct MyServer {
+    session_store: SessionStore<MySession>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(McpApp {
+        name: "my-server",
+        auth: AuthProvider::None,
+        server_factory: |_token_store, session_store| MyServer { session_store },
+        stdio_token_env: None,
+        settings: None,
+        capability_registry: None,
+        capability_filter: None,
+        session_store: None, // default: 30 min TTL
+    }).await
+}
+```
+
+Inside your server handler, use `resolve_session_id` to get the current session ID from request extensions, then access the store:
+
+```rust
+let session_id = resolve_session_id(&request.extensions);
+let session = self.session_store.get_or_create(session_id).await;
+
+// Update session data
+self.session_store.update(session_id, |s| {
+    s.request_count += 1;
+}).await;
+```
+
+To customize the TTL, either provide a `SessionStore` directly or set `session_ttl` in `Settings`:
+
+```rust
+// Option 1: provide a pre-built store
+session_store: Some(SessionStore::new(Duration::from_secs(3600))),
+
+// Option 2: set TTL in settings
+settings: Some(Settings {
+    session_ttl: Some(Duration::from_secs(3600)),
+    ..Default::default()
+}),
+```
+
+In HTTP mode, a background cleanup task automatically purges expired sessions.
+
 ## Dynamic capabilities
 
 Add or remove tools, prompts, and resources at runtime with `CapabilityRegistry`:
@@ -137,6 +200,7 @@ run(McpApp {
     // ...
     capability_registry: Some(registry),
     capability_filter: None,
+    session_store: None,
 }).await
 ```
 
@@ -153,6 +217,7 @@ let filter: Arc<dyn CapabilityFilter> = Arc::new(|tools, token| {
 run(McpApp {
     // ...
     capability_filter: Some(filter),
+    session_store: None,
     // ...
 }).await
 ```
@@ -175,6 +240,16 @@ When using CLI mode (`settings: None`):
 
 A `.env` file is loaded automatically in CLI mode.
 
-## License
+## Use locally
 
-MIT
+```json
+    "mcpServers": {
+      "gitdoc": {
+        "command": "<path to bin>",
+         "args": ["-t", "stdio"],
+        "env": {
+          "URL": "http://127.0.0.1:3000"
+        }
+      }
+    },
+```
