@@ -26,8 +26,10 @@ Consumers create a `McpApp` with a name, auth provider, and server factory closu
 mcp_framework::run(McpApp {
     name: "my-server",
     auth: AuthProvider::Basic(BasicAuthConfig::from_env().unwrap()),
-    server_factory: |token_store| MyServer::new(token_store),
+    server_factory: |token_store, session_store| MyServer::new(token_store, session_store),
     stdio_token_env: Some("MY_TOKEN"),
+    session_store: None,
+    ..
 }).await
 ```
 
@@ -47,6 +49,12 @@ Two modes selected via `--transport` CLI flag:
 - **OAuth**: Full OAuth2/OIDC proxy for Keycloak — includes RFC 8414/9728 metadata endpoints, RFC 7591 dynamic client registration, PKCE authorization flow, and token proxying. All OAuth routes live under `/oauth/`.
 
 Key type: `TokenStore` — thread-safe token storage shared between auth middleware and the server handler via the factory closure. Supports automatic token refresh for OAuth mode.
+
+### Session layer (`src/session/`)
+
+`SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
+
+Helper function `resolve_session_id(extensions)` extracts the `mcp-session-id` header from MCP request context extensions, falling back to `"default"` for stdio mode.
 
 ### HTTP utilities (`src/http_util/`)
 
