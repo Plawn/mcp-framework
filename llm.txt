@@ -20,11 +20,9 @@ The entire public API:
 
 ```rust
 // Re-exports from lib.rs
-pub use auth::{AuthProvider, BasicAuthConfig};
+pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
+pub use capability::{CapabilityFilter, CapabilityRegistry};
 pub use runner::{run, LogLevel, McpApp, Settings, TransportMode};
-// Also available via mcp_framework::auth::
-pub use auth::OAuthConfig;
-pub use auth::TokenStore;
 ```
 
 ## Minimal example
@@ -49,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
         server_factory: |_token_store| MyServer,
         stdio_token_env: None,
         settings: None,
+        capability_registry: None,
+        capability_filter: None,
     }).await
 }
 ```
@@ -62,6 +62,8 @@ pub struct McpApp<F> {
     pub server_factory: F,             // Fn(TokenStore) -> impl ServerHandler
     pub stdio_token_env: Option<&'static str>, // Env var name for stdio token (e.g. "MY_TOKEN")
     pub settings: Option<Settings>,    // None = CLI + env vars, Some = manual config
+    pub capability_registry: Option<CapabilityRegistry>, // Dynamic tools/prompts/resources
+    pub capability_filter: Option<Arc<dyn CapabilityFilter>>, // Per-session capability filtering
 }
 ```
 
@@ -73,7 +75,7 @@ When `settings` is `Some(...)`, no CLI parsing happens and `.env` is not loaded.
 use mcp_framework::{Settings, TransportMode, LogLevel};
 
 Settings {
-    transport: TransportMode::Http,     // Http or Stdio
+    transport: TransportMode::Http,     // Http, Sse, or Stdio
     log_level: LogLevel::Info,          // Error, Info, Debug, Trace
     bind_addr: "0.0.0.0:4000".into(),  // HTTP listen address
     public_url: None,                   // None derives from bind_addr
@@ -83,6 +85,12 @@ Settings {
 `Settings` implements `Default` (Http, Info, 0.0.0.0:4000, None).
 
 When `settings` is `None`, the framework parses CLI args (`--transport`, `--debug`, `--trace`) and reads `BIND_ADDR`/`PUBLIC_URL` env vars.
+
+## Transport modes
+
+- **Http** — Streamable HTTP transport (default). MCP endpoint at `/mcp` and fallback `/`.
+- **Sse** — Server-Sent Events transport (legacy MCP). SSE endpoint at `/sse`, messages at `/message`.
+- **Stdio** — stdin/stdout for local Claude Desktop integration.
 
 ## Authentication
 
@@ -110,7 +118,7 @@ auth: AuthProvider::Basic(BasicAuthConfig::from_env().unwrap()),
 ### OAuth 2.0 (Keycloak OIDC)
 
 ```rust
-use mcp_framework::auth::OAuthConfig;
+use mcp_framework::OAuthConfig;
 
 // From struct:
 auth: AuthProvider::OAuth(OAuthConfig {
@@ -125,12 +133,14 @@ auth: AuthProvider::OAuth(OAuthConfig {
 auth: AuthProvider::OAuth(OAuthConfig::from_env().unwrap()),
 ```
 
+OAuth tokens are automatically refreshed when expired (if a refresh token and config are available).
+
 ## TokenStore
 
 The `server_factory` closure receives a `TokenStore`. Use it to access the authenticated user's token inside your server handler:
 
 ```rust
-use mcp_framework::auth::TokenStore;
+use mcp_framework::TokenStore;
 
 struct MyServer {
     token_store: TokenStore,
@@ -141,13 +151,34 @@ server_factory: |token_store| MyServer { token_store },
 ```
 
 Key methods:
-- `token_store.get_token(session_id).await -> Option<StoredToken>` — get stored token
+- `token_store.get_token(session_id).await -> Option<StoredToken>` — get stored token (auto-refreshes if expired)
 - `token_store.has_valid_token(session_id).await -> bool` — check if non-expired token exists
 - `stored_token.access_token` — the access token string
+
+## Capability system
+
+Use `CapabilityRegistry` to dynamically add/remove tools, prompts, and resources at runtime:
+
+```rust
+use mcp_framework::CapabilityRegistry;
+
+let registry = CapabilityRegistry::default();
+registry.add_tool(tool_info, handler).await;
+registry.remove_tool("name").await;
+```
+
+Use `CapabilityFilter` to control per-session visibility based on the user's token:
+
+```rust
+use mcp_framework::CapabilityFilter;
+
+// Implement the trait or use a closure to filter capabilities per session
+```
 
 ## HTTP endpoints
 
 In HTTP mode, the MCP protocol endpoint is at `/mcp`.
+In SSE mode, the SSE endpoint is at `/sse` and messages are posted to `/message`.
 
 With OAuth auth, additional endpoints are registered:
 - `/.well-known/oauth-protected-resource`

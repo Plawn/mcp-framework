@@ -32,6 +32,7 @@ pub struct McpOAuthState {
     pub keycloak_client_id: String,
     pub keycloak_client_secret: Option<String>,
     pub http_client: reqwest::Client,
+    pub token_store: TokenStore,
 }
 
 /// Create the MCP OAuth router with register, authorize, and token endpoints.

@@ -11,10 +11,12 @@ use crate::transport::{run_http, run_stdio, HttpAppConfig};
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
 
 /// Transport mode for the MCP server.
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
 pub enum TransportMode {
     /// HTTP transport (Streamable HTTP) - for remote connections
     Http,
+    /// SSE transport (Server-Sent Events) - legacy MCP transport
+    Sse,
     /// Stdio transport - for local Claude Desktop integration
     Stdio,
 }
@@ -109,7 +111,7 @@ fn setup_tracing_from_cli(args: &CliArgs) {
     } else {
         match args.transport {
             TransportMode::Stdio => "error",
-            TransportMode::Http => "info",
+            TransportMode::Http | TransportMode::Sse => "info",
         }
     };
 
@@ -153,7 +155,7 @@ fn resolve_http_addrs(settings: Option<&Settings>) -> (String, String) {
     }
 }
 
-async fn run_http_mode<F, S>(app: McpApp<F>) -> anyhow::Result<()>
+async fn run_http_mode<F, S>(app: McpApp<F>, transport: TransportMode) -> anyhow::Result<()>
 where
     F: Fn(TokenStore) -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
@@ -168,6 +170,7 @@ where
         app_name: app.name.to_string(),
         capability_registry: app.capability_registry,
         capability_filter: app.capability_filter,
+        transport,
     })
     .await
 }
@@ -225,9 +228,12 @@ where
     S: ServerHandler + Send + 'static,
 {
     if let Some(ref settings) = app.settings {
+        let transport = settings.transport.clone();
         setup_tracing_from_settings(settings);
-        match settings.transport {
-            TransportMode::Http => run_http_mode(app).await,
+        match transport {
+            TransportMode::Http | TransportMode::Sse => {
+                run_http_mode(app, transport).await
+            }
             TransportMode::Stdio => run_stdio_mode(app).await,
         }
     } else {
@@ -235,7 +241,9 @@ where
         let args = CliArgs::parse();
         setup_tracing_from_cli(&args);
         match args.transport {
-            TransportMode::Http => run_http_mode(app).await,
+            TransportMode::Http | TransportMode::Sse => {
+                run_http_mode(app, args.transport).await
+            }
             TransportMode::Stdio => run_stdio_mode(app).await,
         }
     }
