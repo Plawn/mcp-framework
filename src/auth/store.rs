@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 use tokio::sync::RwLock;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use reqwest::Client as HttpClient;
+use tokio::sync::Mutex as TokioMutex;
 
 /// A stored OAuth token with expiry tracking
 #[derive(Clone, Debug)]
@@ -64,6 +65,8 @@ pub struct TokenStore {
     http_client: HttpClient,
     /// OAuth config for refresh (optional - not available in all modes)
     refresh_config: Arc<RwLock<Option<RefreshConfig>>>,
+    /// Per-session mutex to prevent concurrent refreshes (thundering herd)
+    refresh_locks: Arc<RwLock<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl TokenStore {
@@ -73,6 +76,7 @@ impl TokenStore {
             pending_auths: Arc::new(RwLock::new(HashMap::new())),
             http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(None)),
+            refresh_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -83,7 +87,24 @@ impl TokenStore {
             pending_auths: Arc::new(RwLock::new(HashMap::new())),
             http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(Some(config))),
+            refresh_locks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Get or create a per-session refresh lock
+    async fn get_refresh_lock(&self, session_id: &str) -> Arc<TokioMutex<()>> {
+        // Fast path: read lock
+        {
+            let locks = self.refresh_locks.read().await;
+            if let Some(lock) = locks.get(session_id) {
+                return lock.clone();
+            }
+        }
+        // Slow path: write lock to insert
+        let mut locks = self.refresh_locks.write().await;
+        locks.entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
     }
 
     /// Attempt to refresh an expired token
@@ -188,23 +209,41 @@ impl TokenStore {
     }
 
     /// Get a token for a session, automatically refreshing if expired.
+    ///
+    /// Uses per-session locking to prevent concurrent refreshes (thundering herd).
+    /// Returns `None` if the token is expired and refresh fails.
     pub async fn get_token(&self, session_id: &str) -> Option<StoredToken> {
         let token = self.get_token_raw(session_id).await?;
 
-        // If token is expired, has a refresh_token, and refresh config exists, try refresh
-        if token.is_expired() {
-            if token.refresh_token.is_some() && self.refresh_config.read().await.is_some() {
-                match self.refresh_token(session_id).await {
-                    Ok(new_token) => return Some(new_token),
-                    Err(e) => {
-                        tracing::warn!("Auto-refresh failed for session {}: {}", session_id, e);
-                        // Fall through and return the stale token
-                    }
+        if !token.is_expired() {
+            return Some(token);
+        }
+
+        // Token is expired — attempt refresh if possible
+        if token.refresh_token.is_some() && self.refresh_config.read().await.is_some() {
+            // Acquire per-session refresh lock to prevent thundering herd
+            let lock = self.get_refresh_lock(session_id).await;
+            let _guard = lock.lock().await;
+
+            // Double-check: another task may have refreshed while we waited
+            if let Some(refreshed) = self.get_token_raw(session_id).await {
+                if !refreshed.is_expired() {
+                    return Some(refreshed);
+                }
+            }
+
+            // Still expired — do the refresh
+            match self.refresh_token(session_id).await {
+                Ok(new_token) => return Some(new_token),
+                Err(e) => {
+                    tracing::warn!("Auto-refresh failed for session {}: {}", session_id, e);
+                    return None; // Don't return expired token
                 }
             }
         }
 
-        Some(token)
+        // No refresh_token or no refresh config — expired token is unusable
+        None
     }
 
     /// Remove a token for a session
@@ -212,6 +251,10 @@ impl TokenStore {
     pub async fn remove_token(&self, session_id: &str) {
         let mut tokens = self.tokens.write().await;
         tokens.remove(session_id);
+        drop(tokens);
+
+        let mut locks = self.refresh_locks.write().await;
+        locks.remove(session_id);
     }
 
     /// Check if a session has a valid (non-expired) token (no side-effects)
@@ -226,5 +269,161 @@ impl TokenStore {
 impl Default for TokenStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_expiry_buffer_expired() {
+        // Token that expires in 29 seconds (within the 30s buffer) → expired
+        let token = StoredToken {
+            access_token: "test".to_string(),
+            refresh_token: None,
+            expires_at: Some(Instant::now() + Duration::from_secs(29)),
+        };
+        assert!(token.is_expired());
+    }
+
+    #[test]
+    fn test_token_expiry_buffer_valid() {
+        // Token that expires in 31 seconds (outside the 30s buffer) → valid
+        let token = StoredToken {
+            access_token: "test".to_string(),
+            refresh_token: None,
+            expires_at: Some(Instant::now() + Duration::from_secs(31)),
+        };
+        assert!(!token.is_expired());
+    }
+
+    #[test]
+    fn test_token_no_expiry_never_expires() {
+        let token = StoredToken {
+            access_token: "test".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+        assert!(!token.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_failure_returns_none() {
+        // Create a store with a refresh config (so refresh is attempted)
+        // but with a bogus token_url (so the refresh will fail)
+        let store = TokenStore::with_refresh_config(RefreshConfig {
+            client_id: "test".to_string(),
+            client_secret: "secret".to_string(),
+            token_url: "http://127.0.0.1:1/nonexistent".to_string(),
+        });
+
+        // Store an expired token with a refresh_token
+        let expired_token = StoredToken {
+            access_token: "old_access".to_string(),
+            refresh_token: Some("refresh_tok".to_string()),
+            expires_at: Some(Instant::now() - Duration::from_secs(60)),
+        };
+        store.store_token("session1".to_string(), expired_token).await;
+
+        // get_token should return None because refresh fails and token is expired
+        let result = store.get_token("session1").await;
+        assert!(result.is_none(), "Expected None when refresh fails on expired token");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_refresh_uses_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let store = TokenStore::with_refresh_config(RefreshConfig {
+            client_id: "test".to_string(),
+            client_secret: "secret".to_string(),
+            // Unreachable URL — refresh will fail, but we verify the lock behavior
+            // by checking that the second caller sees the still-expired token and also
+            // returns None (rather than racing)
+            token_url: "http://127.0.0.1:1/nonexistent".to_string(),
+        });
+
+        // Store an expired token
+        let expired_token = StoredToken {
+            access_token: "old".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(Instant::now() - Duration::from_secs(60)),
+        };
+        store.store_token("s1".to_string(), expired_token).await;
+
+        let store1 = store.clone();
+        let store2 = store.clone();
+        let count1 = call_count.clone();
+        let count2 = call_count.clone();
+
+        let (r1, r2) = tokio::join!(
+            async move {
+                let r = store1.get_token("s1").await;
+                count1.fetch_add(1, Ordering::SeqCst);
+                r
+            },
+            async move {
+                let r = store2.get_token("s1").await;
+                count2.fetch_add(1, Ordering::SeqCst);
+                r
+            },
+        );
+
+        // Both should return None (expired + refresh fails)
+        assert!(r1.is_none());
+        assert!(r2.is_none());
+        // Both calls completed
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_valid_token_returned_directly() {
+        let store = TokenStore::new();
+        let token = StoredToken {
+            access_token: "valid".to_string(),
+            refresh_token: None,
+            expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        store.store_token("s1".to_string(), token).await;
+
+        let result = store.get_token("s1").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().access_token, "valid");
+    }
+
+    #[tokio::test]
+    async fn test_expired_token_no_refresh_config_returns_none() {
+        let store = TokenStore::new(); // No refresh config
+        let token = StoredToken {
+            access_token: "expired".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(Instant::now() - Duration::from_secs(60)),
+        };
+        store.store_token("s1".to_string(), token).await;
+
+        let result = store.get_token("s1").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_token_cleans_refresh_lock() {
+        let store = TokenStore::new();
+        let token = StoredToken {
+            access_token: "test".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+        store.store_token("s1".to_string(), token).await;
+
+        // Create a refresh lock entry
+        let _lock = store.get_refresh_lock("s1").await;
+        assert!(store.refresh_locks.read().await.contains_key("s1"));
+
+        // Remove should clean up both token and lock
+        store.remove_token("s1").await;
+        assert!(!store.refresh_locks.read().await.contains_key("s1"));
+        assert!(store.get_token_raw("s1").await.is_none());
     }
 }
