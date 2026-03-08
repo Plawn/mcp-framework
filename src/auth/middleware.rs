@@ -80,18 +80,14 @@ pub async fn bearer_auth_middleware(
 
     tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
 
-    // Store the token in the token store so tools can access it
-    // We store with BOTH the session ID AND a "default" key
-    // The session ID key allows session-specific lookups
-    // The "default" key is a fallback for tools that can't access the session ID
+    // Store the token in the token store so tools can access it via session ID
     let stored_token = StoredToken {
         access_token: token.clone(),
         refresh_token: None,
         expires_at: None, // We don't know expiry from the bearer token alone
     };
 
-    state.token_store.store_token(session_id, stored_token.clone()).await;
-    state.token_store.store_token("default".to_string(), stored_token).await;
+    state.token_store.store_token(session_id, stored_token).await;
 
     // Also store in request extensions for direct access
     request.extensions_mut().insert(BearerToken(token));
@@ -203,8 +199,7 @@ pub async fn basic_auth_middleware(
         expires_at: None,
     };
 
-    state.token_store.store_token(session_id, stored_token.clone()).await;
-    state.token_store.store_token("default".to_string(), stored_token).await;
+    state.token_store.store_token(session_id, stored_token).await;
 
     request.extensions_mut().insert(BearerToken(password));
 
