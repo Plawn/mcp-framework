@@ -5,7 +5,21 @@
 //! authentication, CLI argument parsing, and tracing so you only need to implement
 //! `rmcp::ServerHandler`.
 //!
-//! ## Quick start
+//! ## Quick start (builder API)
+//!
+//! ```rust,ignore
+//! use mcp_framework::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     McpAppBuilder::new("my-server")
+//!         .server(|| MyServer::new())
+//!         .run()
+//!         .await
+//! }
+//! ```
+//!
+//! ## Quick start (struct API)
 //!
 //! ```rust,ignore
 //! use mcp_framework::{run, McpApp, AuthProvider};
@@ -13,9 +27,9 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     run(McpApp {
-//!         name: "my-server",
+//!         name: "my-server".into(),
 //!         auth: AuthProvider::None,
-//!         server_factory: |_token_store, _session_store| MyServer::new(),
+//!         server_factory: || MyServer::new(),
 //!         stdio_token_env: None,
 //!         settings: None,
 //!         capability_registry: None,
@@ -37,11 +51,12 @@
 pub mod auth;
 pub mod capability;
 pub mod http_util;
+pub mod prelude;
 pub mod runner;
 pub mod session;
 pub mod transport;
 
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
-pub use capability::{CapabilityFilter, CapabilityRegistry};
-pub use runner::{run, LogLevel, McpApp, Settings, TransportMode};
-pub use session::{resolve_session_id, SessionStore};
+pub use capability::{CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter};
+pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
+pub use session::{resolve_session_id, RequestContextExt, Session, SessionStore};

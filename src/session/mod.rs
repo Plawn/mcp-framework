@@ -24,8 +24,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::model::Extensions;
+use rmcp::service::{RequestContext, RoleServer};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+
+use crate::auth::TokenStore;
 
 /// Internal entry wrapping session data with a last-access timestamp.
 struct SessionEntry<T> {
@@ -170,6 +173,99 @@ pub fn resolve_session_id(extensions: &Extensions) -> &str {
         .unwrap_or("default")
 }
 
+/// A scoped handle to a specific session within a [`SessionStore`].
+///
+/// Created via [`RequestContextExt::session`]. Delegates all operations to the
+/// underlying store using the resolved session ID.
+pub struct Session<'a, T: Send + Sync + Default + Clone + 'static> {
+    store: &'a SessionStore<T>,
+    session_id: &'a str,
+}
+
+impl<'a, T: Send + Sync + Default + Clone + 'static> Session<'a, T> {
+    /// Return the session ID.
+    pub fn id(&self) -> &str {
+        self.session_id
+    }
+
+    /// Get the session data if it exists.
+    pub async fn get(&self) -> Option<T> {
+        self.store.get(self.session_id).await
+    }
+
+    /// Get the session data, creating it with `T::default()` if absent.
+    pub async fn get_or_create(&self) -> T {
+        self.store.get_or_create(self.session_id).await
+    }
+
+    /// Update the session data using a closure. Creates with `T::default()` if absent.
+    pub async fn update<F>(&self, f: F) -> T
+    where
+        F: FnOnce(&mut T),
+    {
+        self.store.update(self.session_id, f).await
+    }
+
+    /// Remove the session, returning the data if it existed.
+    pub async fn remove(&self) -> Option<T> {
+        self.store.remove(self.session_id).await
+    }
+}
+
+/// Extension trait for accessing sessions and tokens from a request context.
+///
+/// This trait is automatically available on `RequestContext<RoleServer>` when
+/// the stores have been injected into `context.extensions` by [`DynamicHandler`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use mcp_framework::prelude::*;
+///
+/// let session = context.session::<MySession>();
+/// let data = session.update(|s| s.call_count += 1).await;
+/// ```
+pub trait RequestContextExt {
+    /// Get a [`Session`] handle for the current MCP session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `SessionStore<T>` was not injected into the context.
+    /// This happens when `with_sessions::<T>()` was not called on the builder.
+    fn session<T: Send + Sync + Default + Clone + 'static>(&self) -> Session<'_, T>;
+
+    /// Get the MCP session ID (falls back to `"default"` in stdio mode).
+    fn session_id(&self) -> &str;
+
+    /// Get a reference to the [`TokenStore`] from the context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `TokenStore` was not injected into the context.
+    fn token_store(&self) -> &TokenStore;
+}
+
+impl RequestContextExt for RequestContext<RoleServer> {
+    fn session<T: Send + Sync + Default + Clone + 'static>(&self) -> Session<'_, T> {
+        let store = self
+            .extensions
+            .get::<SessionStore<T>>()
+            .expect("SessionStore<T> not in context. Call .with_sessions::<T>() on the builder.");
+        let session_id = resolve_session_id(&self.extensions);
+        Session { store, session_id }
+    }
+
+    fn session_id(&self) -> &str {
+        resolve_session_id(&self.extensions)
+    }
+
+    fn token_store(&self) -> &TokenStore {
+        self.extensions
+            .get::<TokenStore>()
+            .expect("TokenStore not in context")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,4 +393,49 @@ mod tests {
         let store = SessionStore::<TestSession>::default();
         assert_eq!(store.ttl, DEFAULT_SESSION_TTL);
     }
+
+    // ── Session handle tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_handle_get_or_create() {
+        let store = SessionStore::<TestSession>::new(Duration::from_secs(60));
+        let session = Session {
+            store: &store,
+            session_id: "s1",
+        };
+
+        let data = session.get_or_create().await;
+        assert_eq!(data, TestSession::default());
+    }
+
+    #[tokio::test]
+    async fn session_handle_update() {
+        let store = SessionStore::<TestSession>::new(Duration::from_secs(60));
+        let session = Session {
+            store: &store,
+            session_id: "s1",
+        };
+
+        let data = session.update(|s| s.counter = 42).await;
+        assert_eq!(data.counter, 42);
+        assert_eq!(session.id(), "s1");
+
+        let fetched = session.get().await.unwrap();
+        assert_eq!(fetched.counter, 42);
+    }
+
+    #[tokio::test]
+    async fn session_handle_remove() {
+        let store = SessionStore::<TestSession>::new(Duration::from_secs(60));
+        let session = Session {
+            store: &store,
+            session_id: "s1",
+        };
+
+        session.update(|s| s.counter = 10).await;
+        let removed = session.remove().await;
+        assert_eq!(removed.unwrap().counter, 10);
+        assert!(session.get().await.is_none());
+    }
+
 }

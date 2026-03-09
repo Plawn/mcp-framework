@@ -71,10 +71,12 @@ fn wrap_auth_middleware(
 }
 
 /// Build the axum router with all routes configured.
-/// This is extracted for testability - tests can spawn this app on a test server.
-pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> Router
+///
+/// Returns `(Router, TokenStore)` so the caller can start a cleanup task on
+/// the token store and abort it on shutdown.
+pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore)
 where
-    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
+    F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
     T: Send + Sync + Default + Clone + 'static,
 {
@@ -167,12 +169,13 @@ where
 
         // Spawn the handler loop — each new SSE connection gets a DynamicHandler
         let _ct = sse_server.with_service(move || {
-            let server = factory(token_store_clone.clone(), session_store.clone());
+            let server = factory();
             DynamicHandler::new(
                 server,
                 registry.clone(),
                 filter.clone(),
                 token_store_clone.clone(),
+                session_store.clone(),
             )
         });
 
@@ -182,12 +185,13 @@ where
         // Streamable HTTP transport (default)
         let mcp_service = StreamableHttpService::new(
             move || {
-                let server = factory(token_store_clone.clone(), session_store.clone());
+                let server = factory();
                 Ok(DynamicHandler::new(
                     server,
                     registry.clone(),
                     filter.clone(),
                     token_store_clone.clone(),
+                    session_store.clone(),
                 ))
             },
             LocalSessionManager::default().into(),
@@ -239,13 +243,13 @@ where
             },
         );
 
-    app.layer(cors).layer(trace_layer)
+    (app.layer(cors).layer(trace_layer), token_store)
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
 pub async fn run_http<F, S, T>(config: HttpAppConfig<F, T>) -> anyhow::Result<()>
 where
-    F: Fn(TokenStore, SessionStore<T>) -> S + Clone + Send + Sync + 'static,
+    F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
     T: Send + Sync + Default + Clone + 'static,
 {
@@ -287,9 +291,12 @@ where
     }
 
     // Start session cleanup task
-    let cleanup_handle = config.session_store.start_cleanup_task();
+    let session_cleanup = config.session_store.start_cleanup_task();
 
-    let app = build_app(config);
+    let (app, token_store) = build_app(config);
+
+    // Start token cleanup task (purge expired tokens every 5 minutes)
+    let token_cleanup = token_store.start_cleanup_task(Duration::from_secs(300));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
@@ -298,8 +305,9 @@ where
         tokio::signal::ctrl_c().await.unwrap();
         tracing::info!("Shutdown signal received, stopping server...");
 
-        // Stop the session cleanup task
-        cleanup_handle.abort();
+        // Stop cleanup tasks
+        session_cleanup.abort();
+        token_cleanup.abort();
 
         // Give connections 5 seconds to close gracefully, then force exit
         tokio::spawn(async {

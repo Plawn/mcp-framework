@@ -22,7 +22,51 @@ Add the dependency:
 mcp-framework = { git = "https://github.com/Plawn/mcp-framework" }
 ```
 
-Implement your server and call `run`:
+### Builder API (recommended)
+
+```rust
+use mcp_framework::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    McpAppBuilder::new("my-mcp-server")
+        .server(|| MyServer::new())
+        .run()
+        .await
+}
+```
+
+Full configuration:
+
+```rust
+use mcp_framework::prelude::*;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    McpAppBuilder::new("my-mcp-server")
+        .auth(AuthProvider::OAuth(OAuthConfig::from_env()?))
+        .server(|| MyServer::new())
+        .settings(Settings {
+            transport: TransportMode::Http,
+            bind_addr: "127.0.0.1:8080".to_string(),
+            public_url: Some("https://my-app.example.com".to_string()),
+            ..Default::default()
+        })
+        .stdio_token_env("MY_APP_TOKEN")
+        .capability_filter(Arc::new(ToolFilter(|tools, _token| {
+            tools.into_iter().filter(|t| !t.name.starts_with("admin_")).collect()
+        })))
+        .run()
+        .await
+}
+```
+
+Tokens and sessions are accessible via `RequestContextExt` on the request context — no need to pass stores to the server factory.
+
+### Struct API
+
+The original struct-based API is still supported:
 
 ```rust
 use mcp_framework::{run, McpApp, AuthProvider};
@@ -30,11 +74,11 @@ use mcp_framework::{run, McpApp, AuthProvider};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     run(McpApp {
-        name: "my-mcp-server",
+        name: "my-mcp-server".into(),
         auth: AuthProvider::None,
-        server_factory: |_token_store, _session_store| MyServer::new(),
+        server_factory: || MyServer::new(),
         stdio_token_env: None,
-        settings: None, // use CLI args + env vars
+        settings: None,
         capability_registry: None,
         capability_filter: None,
         session_store: None,
@@ -50,9 +94,9 @@ Pass a `Settings` struct to bypass CLI parsing and env vars entirely:
 use mcp_framework::{run, McpApp, AuthProvider, Settings, TransportMode};
 
 run(McpApp {
-    name: "my-mcp-server",
+    name: "my-mcp-server".into(),
     auth: AuthProvider::None,
-    server_factory: |_token_store, _session_store| MyServer::new(),
+    server_factory: || MyServer::new(),
     stdio_token_env: None,
     settings: Some(Settings {
         transport: TransportMode::Http,
@@ -125,8 +169,7 @@ OAuth mode exposes:
 `SessionStore<T>` provides typed, per-session data with automatic TTL expiration. The generic `T` defaults to `()` — consumers that don't need sessions can ignore it entirely.
 
 ```rust
-use mcp_framework::{run, McpApp, AuthProvider, SessionStore, resolve_session_id};
-use std::time::Duration;
+use mcp_framework::prelude::*;
 
 #[derive(Default, Clone)]
 struct MySession {
@@ -134,51 +177,46 @@ struct MySession {
     request_count: u32,
 }
 
-struct MyServer {
-    session_store: SessionStore<MySession>,
-}
+struct MyServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run(McpApp {
-        name: "my-server",
-        auth: AuthProvider::None,
-        server_factory: |_token_store, session_store| MyServer { session_store },
-        stdio_token_env: None,
-        settings: None,
-        capability_registry: None,
-        capability_filter: None,
-        session_store: None, // default: 30 min TTL
-    }).await
+    McpAppBuilder::new("my-server")
+        .with_sessions::<MySession>()
+        .server(|| MyServer)
+        .run()
+        .await
 }
 ```
 
-Inside your server handler, use `resolve_session_id` to get the current session ID from request extensions, then access the store:
+Inside your server handler, use `RequestContextExt` to access the session directly from the request context:
 
 ```rust
-let session_id = resolve_session_id(&request.extensions);
-let session = self.session_store.get_or_create(session_id).await;
+let session = context.session::<MySession>();
 
 // Update session data
-self.session_store.update(session_id, |s| {
+let data = session.update(|s| {
     s.request_count += 1;
 }).await;
+
+// Access session ID
+let id = session.id();
 ```
 
 To customize the TTL, either provide a `SessionStore` directly or set `session_ttl` in `Settings`:
 
 ```rust
 // Option 1: provide a pre-built store
-session_store: Some(SessionStore::new(Duration::from_secs(3600))),
+.session_store(SessionStore::new(Duration::from_secs(3600)))
 
 // Option 2: set TTL in settings
-settings: Some(Settings {
+.settings(Settings {
     session_ttl: Some(Duration::from_secs(3600)),
     ..Default::default()
-}),
+})
 ```
 
-In HTTP mode, a background cleanup task automatically purges expired sessions.
+In HTTP mode, background cleanup tasks automatically purge expired sessions and tokens.
 
 ## Dynamic capabilities
 
@@ -195,31 +233,28 @@ registry.add_tool(my_tool_info, |params| async { /* ... */ }).await;
 // Remove a tool
 registry.remove_tool("tool-name").await;
 
-// Pass to McpApp
-run(McpApp {
-    // ...
-    capability_registry: Some(registry),
-    capability_filter: None,
-    session_store: None,
-}).await
+// Pass to builder
+McpAppBuilder::new("my-server")
+    .server(|| MyServer::new())
+    .capability_registry(registry)
+    .run()
+    .await
 ```
 
-Use `CapabilityFilter` to control which capabilities are visible per session (e.g., based on the authenticated user's token):
+### Capability filtering
+
+Use `ToolFilter`, `PromptFilter`, or `ResourceFilter` to control which capabilities are visible per session. Each wrapper filters one capability type and passes the others through unfiltered:
 
 ```rust
-use mcp_framework::CapabilityFilter;
+use mcp_framework::{ToolFilter, PromptFilter};
+use std::sync::Arc;
 
-let filter: Arc<dyn CapabilityFilter> = Arc::new(|tools, token| {
-    // Filter tools based on user's access token
-    tools.retain(|t| user_has_access(&token, &t.name));
-});
+// Filter tools based on the user's access token
+let filter = Arc::new(ToolFilter(|tools, token| {
+    tools.into_iter().filter(|t| user_has_access(&token, &t.name)).collect()
+}));
 
-run(McpApp {
-    // ...
-    capability_filter: Some(filter),
-    session_store: None,
-    // ...
-}).await
+// Or implement CapabilityFilter directly for full control over all three types
 ```
 
 ## Environment variables
