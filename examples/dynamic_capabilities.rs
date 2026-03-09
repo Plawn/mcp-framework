@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use mcp_framework::auth::StoredToken;
 use mcp_framework::prelude::*;
-use rmcp::model::{Content, ServerCapabilities, ServerInfo};
 
 // ── Server ───────────────────────────────────────────────────────────
 
@@ -21,11 +20,8 @@ struct DynServer;
 
 impl ServerHandler for DynServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Server with dynamic tools and filtering.".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Server with dynamic tools and filtering.")
     }
 }
 
@@ -39,13 +35,7 @@ async fn main() -> anyhow::Result<()> {
     // A public tool available to everyone
     registry
         .add_tool(
-            Tool {
-                name: "ping".into(),
-                description: Some("Returns pong".into()),
-                input_schema: Default::default(),
-                output_schema: None,
-                annotations: None,
-            },
+            Tool::new("ping", "Returns pong", serde_json::Map::new()),
             |_args| async { Ok(CallToolResult::success(vec![Content::text("pong")])) },
         )
         .await;
@@ -53,13 +43,7 @@ async fn main() -> anyhow::Result<()> {
     // An admin tool that will be filtered out for unauthenticated sessions
     registry
         .add_tool(
-            Tool {
-                name: "admin_reset".into(),
-                description: Some("Reset the server (admin only)".into()),
-                input_schema: Default::default(),
-                output_schema: None,
-                annotations: None,
-            },
+            Tool::new("admin_reset", "Reset the server (admin only)", serde_json::Map::new()),
             |_args| async {
                 Ok(CallToolResult::success(vec![Content::text(
                     "Server reset!",

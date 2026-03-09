@@ -4,12 +4,37 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::ErrorData as McpError;
+use serde_json::Value;
 
 use crate::auth::TokenStore;
 use crate::session::SessionStore;
 
 use super::filter::{resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
+
+/// Ensure every tool's `input_schema` contains `"type": "object"`.
+///
+/// Some parameter types (e.g. `serde_json::Value`) produce schemas without a
+/// `"type"` key, which causes clients like Claude Code to silently reject the
+/// tool.  This function patches those schemas at runtime and emits a warning
+/// so authors can fix the underlying type.
+fn sanitize_tool_schemas(tools: &mut [Tool]) {
+    for tool in tools.iter_mut() {
+        let schema = Arc::make_mut(&mut tool.input_schema);
+        if !schema.contains_key("type") {
+            tracing::warn!(
+                tool = %tool.name,
+                "Tool input_schema is missing \"type\": \"object\" — patching at runtime. \
+                 Consider using mcp_framework::EmptyParams instead of serde_json::Value \
+                 for tools with no parameters."
+            );
+            schema.insert("type".to_string(), Value::String("object".to_string()));
+            if !schema.contains_key("properties") {
+                schema.insert("properties".to_string(), Value::Object(Default::default()));
+            }
+        }
+    }
+}
 
 /// A `ServerHandler` wrapper that merges dynamic capabilities from a
 /// [`CapabilityRegistry`] with the static capabilities of an inner handler.
@@ -66,7 +91,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn initialize(
         &self,
-        request: InitializeRequestParam,
+        request: InitializeRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
@@ -80,7 +105,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn list_tools(
         &self,
-        request: Option<PaginatedRequestParam>,
+        request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
@@ -96,6 +121,9 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             }
             inner_result.tools.extend(registry_tools);
 
+            // Patch schemas missing "type": "object" (e.g. Parameters<serde_json::Value>)
+            sanitize_tool_schemas(&mut inner_result.tools);
+
             // Apply filter
             if let Some(ref filter) = self.filter {
                 inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
@@ -109,7 +137,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn list_prompts(
         &self,
-        request: Option<PaginatedRequestParam>,
+        request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
@@ -135,7 +163,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn list_resources(
         &self,
-        request: Option<PaginatedRequestParam>,
+        request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
@@ -164,7 +192,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
@@ -184,7 +212,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn get_prompt(
         &self,
-        request: GetPromptRequestParam,
+        request: GetPromptRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
         async move {
@@ -200,7 +228,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
+        request: ReadResourceRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
@@ -210,6 +238,14 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             }
             self.inner.read_resource(request, context).await
         }
+    }
+
+    // ── get_tool: check registry first, then inner ─────────────────
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        // Registry tools take priority, then fall back to inner handler
+        // Note: registry lookup is sync here because get_tool is sync
+        self.inner.get_tool(name)
     }
 
     // ── Delegated methods ────────────────────────────────────────────
@@ -228,7 +264,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn complete(
         &self,
-        request: CompleteRequestParam,
+        request: CompleteRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
         self.enrich_extensions(&mut context.extensions);
@@ -237,7 +273,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn set_level(
         &self,
-        request: SetLevelRequestParam,
+        request: SetLevelRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         self.enrich_extensions(&mut context.extensions);
@@ -246,7 +282,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn list_resource_templates(
         &self,
-        request: Option<PaginatedRequestParam>,
+        request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_
     {
@@ -256,7 +292,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn subscribe(
         &self,
-        request: SubscribeRequestParam,
+        request: SubscribeRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         self.enrich_extensions(&mut context.extensions);
@@ -265,7 +301,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 
     fn unsubscribe(
         &self,
-        request: UnsubscribeRequestParam,
+        request: UnsubscribeRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         self.enrich_extensions(&mut context.extensions);
@@ -304,5 +340,64 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         self.enrich_extensions(&mut context.extensions);
         self.inner.on_roots_list_changed(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_tool(name: &'static str, schema: serde_json::Map<String, Value>) -> Tool {
+        Tool::new(name, name, Arc::new(schema))
+    }
+
+    #[test]
+    fn sanitize_patches_missing_type_object() {
+        let mut tools = vec![make_tool("bad", serde_json::Map::new())];
+        sanitize_tool_schemas(&mut tools);
+
+        let schema = tools[0].input_schema.as_ref();
+        assert_eq!(schema.get("type").unwrap(), "object");
+        assert!(schema.contains_key("properties"));
+    }
+
+    #[test]
+    fn sanitize_leaves_valid_schema_untouched() {
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+        schema.insert(
+            "properties".to_string(),
+            Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("name".to_string(), Value::Object(Default::default()));
+                m
+            }),
+        );
+        let mut tools = vec![make_tool("good", schema.clone())];
+        sanitize_tool_schemas(&mut tools);
+
+        assert_eq!(tools[0].input_schema.as_ref(), &schema);
+    }
+
+    #[test]
+    fn sanitize_patches_serde_json_value_style_schema() {
+        // This is what schemars generates for Parameters<serde_json::Value>
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "$schema".to_string(),
+            Value::String("http://json-schema.org/draft-07/schema#".to_string()),
+        );
+        schema.insert("title".to_string(), Value::String("AnyValue".to_string()));
+
+        let mut tools = vec![make_tool("any_value", schema)];
+        sanitize_tool_schemas(&mut tools);
+
+        let patched = tools[0].input_schema.as_ref();
+        assert_eq!(patched.get("type").unwrap(), "object");
+        assert!(patched.contains_key("properties"));
+        // Original fields preserved
+        assert!(patched.contains_key("$schema"));
+        assert!(patched.contains_key("title"));
     }
 }

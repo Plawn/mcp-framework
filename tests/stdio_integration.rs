@@ -3,7 +3,7 @@
 //! Each test builds an example binary, spawns it as a child process with
 //! `--transport stdio`, and communicates over stdin/stdout using an rmcp client.
 
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 
@@ -56,21 +56,17 @@ async fn call_greet_tool() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let result = client
-        .call_tool(CallToolRequestParam {
-            name: "greet".into(),
-            arguments: Some(
-                serde_json::json!({ "name": "World" })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        })
+        .call_tool(CallToolRequestParams::new("greet").with_arguments(
+            serde_json::json!({ "name": "World" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
         .await?;
 
     let text = result
         .content
-        .as_ref()
-        .and_then(|c| c.first())
+        .first()
         .and_then(|c| c.raw.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
@@ -90,21 +86,17 @@ async fn call_add_tool() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let result = client
-        .call_tool(CallToolRequestParam {
-            name: "add".into(),
-            arguments: Some(
-                serde_json::json!({ "a": 2.5, "b": 3.5 })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        })
+        .call_tool(CallToolRequestParams::new("add").with_arguments(
+            serde_json::json!({ "a": 2.5, "b": 3.5 })
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
         .await?;
 
     let text = result
         .content
-        .as_ref()
-        .and_then(|c| c.first())
+        .first()
         .and_then(|c| c.raw.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
@@ -159,16 +151,12 @@ async fn call_dynamic_ping_tool() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let result = client
-        .call_tool(CallToolRequestParam {
-            name: "ping".into(),
-            arguments: None,
-        })
+        .call_tool(CallToolRequestParams::new("ping"))
         .await?;
 
     let text = result
         .content
-        .as_ref()
-        .and_then(|c| c.first())
+        .first()
         .and_then(|c| c.raw.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");

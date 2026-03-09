@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolResult, GetPromptRequestParam, GetPromptResult, JsonObject, Prompt,
-    ReadResourceRequestParam, ReadResourceResult, Resource, Tool,
+    CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
+    ReadResourceRequestParams, ReadResourceResult, Resource, Tool,
 };
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use tokio::sync::RwLock;
@@ -24,7 +24,7 @@ pub type ToolHandler = Arc<
 /// Type-erased async handler for a dynamic prompt.
 pub type PromptHandler = Arc<
     dyn Fn(
-            GetPromptRequestParam,
+            GetPromptRequestParams,
         ) -> Pin<Box<dyn Future<Output = Result<GetPromptResult, McpError>> + Send>>
         + Send
         + Sync,
@@ -33,7 +33,7 @@ pub type PromptHandler = Arc<
 /// Type-erased async handler for a dynamic resource.
 pub type ResourceHandler = Arc<
     dyn Fn(
-            ReadResourceRequestParam,
+            ReadResourceRequestParams,
         ) -> Pin<Box<dyn Future<Output = Result<ReadResourceResult, McpError>> + Send>>
         + Send
         + Sync,
@@ -107,7 +107,7 @@ impl CapabilityRegistry {
     /// Register a dynamic prompt with its execution handler.
     pub async fn add_prompt<H, Fut>(&self, prompt: Prompt, handler: H)
     where
-        H: Fn(GetPromptRequestParam) -> Fut + Send + Sync + 'static,
+        H: Fn(GetPromptRequestParams) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<GetPromptResult, McpError>> + Send + 'static,
     {
         let name = prompt.name.clone();
@@ -140,7 +140,7 @@ impl CapabilityRegistry {
     /// Register a dynamic resource with its execution handler.
     pub async fn add_resource<H, Fut>(&self, resource: Resource, handler: H)
     where
-        H: Fn(ReadResourceRequestParam) -> Fut + Send + Sync + 'static,
+        H: Fn(ReadResourceRequestParams) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult, McpError>> + Send + 'static,
     {
         let uri = resource.raw.uri.clone();
@@ -196,7 +196,7 @@ impl CapabilityRegistry {
     /// Try to dispatch a prompt request to the registry.
     pub(crate) async fn get_prompt(
         &self,
-        params: &GetPromptRequestParam,
+        params: &GetPromptRequestParams,
     ) -> Option<Result<GetPromptResult, McpError>> {
         let guard = self.prompts.read().await;
         let (_, handler) = guard.get(&params.name)?;
@@ -208,7 +208,7 @@ impl CapabilityRegistry {
     /// Try to dispatch a resource read to the registry.
     pub(crate) async fn read_resource(
         &self,
-        params: &ReadResourceRequestParam,
+        params: &ReadResourceRequestParams,
     ) -> Option<Result<ReadResourceResult, McpError>> {
         let guard = self.resources.read().await;
         let (_, handler) = guard.get(&params.uri)?;
@@ -287,32 +287,16 @@ mod tests {
     use rmcp::model::{Annotated, Content, GetPromptResult, RawResource, ReadResourceResult};
 
     fn make_tool(name: &str) -> Tool {
-        Tool {
-            name: name.to_string().into(),
-            description: Some(format!("Tool {name}").into()),
-            input_schema: Default::default(),
-            output_schema: None,
-            annotations: None,
-        }
+        Tool::new(name.to_string(), format!("Tool {name}"), serde_json::Map::new())
     }
 
     fn make_prompt(name: &str) -> Prompt {
-        Prompt {
-            name: name.to_string(),
-            description: Some(format!("Prompt {name}")),
-            arguments: None,
-        }
+        Prompt::new(name, Some(format!("Prompt {name}")), None)
     }
 
     fn make_resource(uri: &str) -> Resource {
         Annotated {
-            raw: RawResource {
-                uri: uri.to_string(),
-                name: uri.to_string(),
-                description: None,
-                mime_type: None,
-                size: None,
-            },
+            raw: RawResource::new(uri, uri),
             annotations: None,
         }
     }
@@ -358,7 +342,7 @@ mod tests {
         let result = reg.call_tool("echo", None).await;
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
-        assert!(result.content.is_some());
+        assert!(!result.content.is_empty());
     }
 
     #[tokio::test]
@@ -373,10 +357,7 @@ mod tests {
     async fn add_and_list_prompts() {
         let reg = CapabilityRegistry::new();
         reg.add_prompt(make_prompt("greeting"), |_params| async {
-            Ok(GetPromptResult {
-                description: Some("Hello".to_string()),
-                messages: vec![],
-            })
+            Ok(GetPromptResult::new(vec![]).with_description("Hello"))
         })
         .await;
 
@@ -389,10 +370,7 @@ mod tests {
     async fn remove_prompt() {
         let reg = CapabilityRegistry::new();
         reg.add_prompt(make_prompt("p"), |_| async {
-            Ok(GetPromptResult {
-                description: None,
-                messages: vec![],
-            })
+            Ok(GetPromptResult::new(vec![]))
         })
         .await;
 
@@ -404,18 +382,12 @@ mod tests {
     async fn get_prompt_dispatches() {
         let reg = CapabilityRegistry::new();
         reg.add_prompt(make_prompt("test"), |_| async {
-            Ok(GetPromptResult {
-                description: Some("dispatched".to_string()),
-                messages: vec![],
-            })
+            Ok(GetPromptResult::new(vec![]).with_description("dispatched"))
         })
         .await;
 
         let result = reg
-            .get_prompt(&GetPromptRequestParam {
-                name: "test".to_string(),
-                arguments: None,
-            })
+            .get_prompt(&GetPromptRequestParams::new("test"))
             .await;
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
@@ -428,7 +400,7 @@ mod tests {
     async fn add_and_list_resources() {
         let reg = CapabilityRegistry::new();
         reg.add_resource(make_resource("file:///a.txt"), |_| async {
-            Ok(ReadResourceResult { contents: vec![] })
+            Ok(ReadResourceResult::new(vec![]))
         })
         .await;
 
@@ -441,7 +413,7 @@ mod tests {
     async fn remove_resource() {
         let reg = CapabilityRegistry::new();
         reg.add_resource(make_resource("file:///b"), |_| async {
-            Ok(ReadResourceResult { contents: vec![] })
+            Ok(ReadResourceResult::new(vec![]))
         })
         .await;
 
@@ -453,14 +425,12 @@ mod tests {
     async fn read_resource_dispatches() {
         let reg = CapabilityRegistry::new();
         reg.add_resource(make_resource("file:///c"), |_| async {
-            Ok(ReadResourceResult { contents: vec![] })
+            Ok(ReadResourceResult::new(vec![]))
         })
         .await;
 
         let result = reg
-            .read_resource(&ReadResourceRequestParam {
-                uri: "file:///c".to_string(),
-            })
+            .read_resource(&ReadResourceRequestParams::new("file:///c"))
             .await;
         assert!(result.is_some());
         assert!(result.unwrap().is_ok());
@@ -470,9 +440,7 @@ mod tests {
     async fn read_resource_returns_none_for_unknown() {
         let reg = CapabilityRegistry::new();
         assert!(reg
-            .read_resource(&ReadResourceRequestParam {
-                uri: "nope".to_string(),
-            })
+            .read_resource(&ReadResourceRequestParams::new("nope"))
             .await
             .is_none());
     }

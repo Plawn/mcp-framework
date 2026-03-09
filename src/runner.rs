@@ -17,8 +17,6 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
 pub enum TransportMode {
     /// HTTP transport (Streamable HTTP) - for remote connections
     Http,
-    /// SSE transport (Server-Sent Events) - legacy MCP transport
-    Sse,
     /// Stdio transport - for local Claude Desktop integration
     Stdio,
 }
@@ -400,7 +398,7 @@ fn setup_tracing_from_cli(args: &CliArgs) {
     } else {
         match args.transport {
             TransportMode::Stdio => "error",
-            TransportMode::Http | TransportMode::Sse => "info",
+            TransportMode::Http => "info",
         }
     };
 
@@ -458,7 +456,7 @@ fn resolve_session_store<T: Send + Sync + Default + Clone + 'static>(
     SessionStore::new(ttl)
 }
 
-async fn run_http_mode<F, S, T>(app: McpApp<F, T>, transport: TransportMode) -> anyhow::Result<()>
+async fn run_http_mode<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
@@ -475,7 +473,6 @@ where
         app_name: app.name.clone(),
         capability_registry: app.capability_registry,
         capability_filter: app.capability_filter,
-        transport,
         session_store,
     })
     .await
@@ -540,8 +537,8 @@ where
         let transport = settings.transport.clone();
         setup_tracing_from_settings(settings);
         match transport {
-            TransportMode::Http | TransportMode::Sse => {
-                run_http_mode(app, transport).await
+            TransportMode::Http => {
+                run_http_mode(app).await
             }
             TransportMode::Stdio => run_stdio_mode(app).await,
         }
@@ -550,8 +547,8 @@ where
         let args = CliArgs::parse();
         setup_tracing_from_cli(&args);
         match args.transport {
-            TransportMode::Http | TransportMode::Sse => {
-                run_http_mode(app, args.transport).await
+            TransportMode::Http => {
+                run_http_mode(app).await
             }
             TransportMode::Stdio => run_stdio_mode(app).await,
         }

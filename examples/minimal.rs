@@ -9,17 +9,13 @@
 //! ```
 
 use mcp_framework::prelude::*;
-use rmcp::model::{ServerCapabilities, ServerInfo};
 
 struct MinimalServer;
 
 impl ServerHandler for MinimalServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("A minimal MCP server that does nothing useful.".into()),
-            capabilities: ServerCapabilities::builder().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().build())
+            .with_instructions("A minimal MCP server that does nothing useful.")
     }
 }
 

@@ -13,43 +13,32 @@
 //! ```
 
 use mcp_framework::prelude::*;
-use rmcp::model::{ServerCapabilities, ServerInfo};
 
 struct AuthServer;
 
 impl ServerHandler for AuthServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("An MCP server protected by HTTP Basic auth.".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("An MCP server protected by HTTP Basic auth.")
     }
 
     fn list_tools(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParam>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, McpError>> + Send + '_
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_
     {
         async move {
-            Ok(rmcp::model::ListToolsResult {
-                tools: vec![Tool {
-                    name: "whoami".into(),
-                    description: Some("Returns info about the current authenticated session".into()),
-                    input_schema: Default::default(),
-                    output_schema: None,
-                    annotations: None,
-                }],
-                next_cursor: None,
-            })
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new("whoami", "Returns info about the current authenticated session", serde_json::Map::new()),
+            ]))
         }
     }
 
     fn call_tool(
         &self,
-        request: rmcp::model::CallToolRequestParam,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             if request.name.as_ref() == "whoami" {
@@ -60,9 +49,7 @@ impl ServerHandler for AuthServer {
                     "Session: {}\nAuthenticated: {}",
                     session_id, has_token
                 );
-                Ok(CallToolResult::success(vec![
-                    rmcp::model::Content::text(msg),
-                ]))
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
             } else {
                 Err(McpError::invalid_params("unknown tool", None))
             }

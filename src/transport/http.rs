@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use axum::{routing::get, Router};
 use rmcp::transport::streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager};
-use rmcp::transport::sse_server::{SseServer, SseServerConfig};
 use rmcp::ServerHandler;
-use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
@@ -14,7 +12,6 @@ use crate::auth::{
     WellKnownState,
 };
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
-use crate::runner::TransportMode;
 use crate::session::SessionStore;
 
 /// Configuration for building the HTTP app
@@ -28,8 +25,6 @@ pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub capability_registry: Option<CapabilityRegistry>,
     /// Optional capability filter for per-session visibility.
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
-    /// Transport mode (Http or Sse).
-    pub transport: TransportMode,
     /// Session store for typed per-session data.
     pub session_store: SessionStore<T>,
 }
@@ -150,55 +145,29 @@ where
             );
     }
 
-    // Create MCP service / router based on transport mode
+    // Create MCP service / router with Streamable HTTP transport
     let factory = config.server_factory;
     let registry = config.capability_registry.unwrap_or_default();
     let filter = config.capability_filter;
     let token_store_clone = token_store.clone();
     let session_store = config.session_store;
 
-    let mcp_router = if config.transport == TransportMode::Sse {
-        // SSE transport: create SseServer and spawn handler loop
-        let (sse_server, sse_router) = SseServer::new(SseServerConfig {
-            bind: "0.0.0.0:0".parse().unwrap(), // unused — we merge the router into our own Axum app
-            sse_path: "/sse".to_string(),
-            post_path: "/message".to_string(),
-            ct: CancellationToken::new(),
-            sse_keep_alive: None,
-        });
-
-        // Spawn the handler loop — each new SSE connection gets a DynamicHandler
-        let _ct = sse_server.with_service(move || {
+    let mcp_service = StreamableHttpService::new(
+        move || {
             let server = factory();
-            DynamicHandler::new(
+            Ok(DynamicHandler::new(
                 server,
                 registry.clone(),
                 filter.clone(),
                 token_store_clone.clone(),
                 session_store.clone(),
-            )
-        });
+            ))
+        },
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
 
-        // Wrap SSE router with auth middleware
-        wrap_auth_middleware(sse_router, &config.auth, &config.public_url, &token_store)
-    } else {
-        // Streamable HTTP transport (default)
-        let mcp_service = StreamableHttpService::new(
-            move || {
-                let server = factory();
-                Ok(DynamicHandler::new(
-                    server,
-                    registry.clone(),
-                    filter.clone(),
-                    token_store_clone.clone(),
-                    session_store.clone(),
-                ))
-            },
-            LocalSessionManager::default().into(),
-            Default::default(),
-        );
-
-        // Wrap with auth middleware
+    let mcp_router = {
         let base = Router::new().fallback_service(mcp_service);
         wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
     };
@@ -283,12 +252,7 @@ where
     }
 
     tracing::info!("MCP server listening on http://{}", bind_addr);
-    if config.transport == TransportMode::Sse {
-        tracing::info!("SSE endpoint: http://{}/sse", bind_addr);
-        tracing::info!("Message endpoint: http://{}/message", bind_addr);
-    } else {
-        tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
-    }
+    tracing::info!("MCP endpoint: http://{} (also accepts /mcp)", bind_addr);
 
     // Start session cleanup task
     let session_cleanup = config.session_store.start_cleanup_task();

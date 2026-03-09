@@ -111,13 +111,7 @@ mod tests {
     use super::{PromptFilter, ResourceFilter, ToolFilter};
 
     fn make_tool(name: &str) -> Tool {
-        Tool {
-            name: name.to_string().into(),
-            description: None,
-            input_schema: Default::default(),
-            output_schema: None,
-            annotations: None,
-        }
+        Tool::new(name.to_string(), name.to_string(), serde_json::Map::new())
     }
 
     #[test]
@@ -142,11 +136,7 @@ mod tests {
                 Vec::new()
             });
 
-        let prompts = vec![Prompt {
-            name: "test".to_string(),
-            description: None,
-            arguments: None,
-        }];
+        let prompts = vec![Prompt::new::<_, &str>("test", None, None)];
         // ToolFilter only filters tools; prompts pass through
         let result = filter.filter_prompts(prompts.clone(), None);
         assert_eq!(result.len(), 1);
@@ -163,16 +153,8 @@ mod tests {
             });
 
         let prompts = vec![
-            Prompt {
-                name: "public".to_string(),
-                description: None,
-                arguments: None,
-            },
-            Prompt {
-                name: "secret".to_string(),
-                description: None,
-                arguments: None,
-            },
+            Prompt::new::<_, &str>("public", None, None),
+            Prompt::new::<_, &str>("secret", None, None),
         ];
         let filtered = filter.filter_prompts(prompts, None);
         assert_eq!(filtered.len(), 1);
@@ -198,23 +180,11 @@ mod tests {
 
         let resources = vec![
             Annotated {
-                raw: RawResource {
-                    uri: "public://a".to_string(),
-                    name: "public".to_string(),
-                    description: None,
-                    mime_type: None,
-                    size: None,
-                },
+                raw: RawResource::new("public://a", "public"),
                 annotations: None,
             },
             Annotated {
-                raw: RawResource {
-                    uri: "secret://x".to_string(),
-                    name: "secret".to_string(),
-                    description: None,
-                    mime_type: None,
-                    size: None,
-                },
+                raw: RawResource::new("secret://x", "secret"),
                 annotations: None,
             },
         ];

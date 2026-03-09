@@ -9,10 +9,7 @@
 //! ```
 
 use mcp_framework::prelude::*;
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{schemars, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router};
 
 // ── Tool parameter types ─────────────────────────────────────────────
 
@@ -62,11 +59,8 @@ impl ToolServer {
 #[tool_handler]
 impl ServerHandler for ToolServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("A simple MCP server with greet and add tools.".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("A simple MCP server with greet and add tools.")
     }
 }
 

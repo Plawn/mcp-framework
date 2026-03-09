@@ -56,6 +56,25 @@ pub mod runner;
 pub mod session;
 pub mod transport;
 
+/// Empty parameter type for MCP tools that take no arguments.
+///
+/// Use this instead of `serde_json::Value` to ensure the generated JSON Schema
+/// contains `"type": "object"`, which is required by MCP clients like Claude Code.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use mcp_framework::EmptyParams;
+/// use rmcp::handler::server::tool::Parameters;
+///
+/// #[tool(description = "Returns pong")]
+/// fn ping(&self, Parameters(_): Parameters<EmptyParams>) -> String {
+///     "pong".to_string()
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct EmptyParams {}
+
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter};
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};

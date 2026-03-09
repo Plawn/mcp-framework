@@ -9,12 +9,6 @@
 //! ```
 
 use mcp_framework::prelude::*;
-use rmcp::model::{
-    CallToolRequestParam, Content, ListToolsResult, PaginatedRequestParam, ServerCapabilities,
-    ServerInfo,
-};
-use rmcp::service::RequestContext;
-use rmcp::RoleServer;
 
 // ── Session data ─────────────────────────────────────────────────────
 
@@ -29,35 +23,25 @@ struct SessionServer;
 
 impl ServerHandler for SessionServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Tracks per-session call counts.".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Tracks per-session call counts.")
     }
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            Ok(ListToolsResult {
-                tools: vec![Tool {
-                    name: "stats".into(),
-                    description: Some("Show how many times you've called tools in this session".into()),
-                    input_schema: Default::default(),
-                    output_schema: None,
-                    annotations: None,
-                }],
-                next_cursor: None,
-            })
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new("stats", "Show how many times you've called tools in this session", serde_json::Map::new()),
+            ]))
         }
     }
 
     fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
