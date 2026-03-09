@@ -6,6 +6,7 @@ use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::ErrorData as McpError;
 
 use crate::auth::TokenStore;
+use crate::session::SessionStore;
 
 use super::filter::{resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
@@ -21,38 +22,55 @@ use super::registry::CapabilityRegistry;
 ///   first; if the name/uri is not found there, the call falls through to
 ///   the inner handler.
 /// - All other methods are delegated directly to the inner handler.
-pub(crate) struct DynamicHandler<S> {
+///
+/// Additionally, `TokenStore` and `SessionStore<T>` are injected into
+/// `context.extensions` before every call, so handlers can access them
+/// via [`RequestContextExt`](crate::session::RequestContextExt).
+pub(crate) struct DynamicHandler<S, T: Send + Sync + Default + Clone + 'static> {
     inner: S,
     registry: CapabilityRegistry,
     filter: Option<Arc<dyn CapabilityFilter>>,
     token_store: TokenStore,
+    session_store: SessionStore<T>,
 }
 
-impl<S> DynamicHandler<S> {
+impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
     pub fn new(
         inner: S,
         registry: CapabilityRegistry,
         filter: Option<Arc<dyn CapabilityFilter>>,
         token_store: TokenStore,
+        session_store: SessionStore<T>,
     ) -> Self {
         Self {
             inner,
             registry,
             filter,
             token_store,
+            session_store,
         }
+    }
+
+    /// Insert `TokenStore` and `SessionStore<T>` into the extensions so
+    /// handlers can retrieve them via `RequestContextExt`.
+    fn enrich_extensions(&self, extensions: &mut Extensions) {
+        extensions.insert(self.token_store.clone());
+        extensions.insert(self.session_store.clone());
     }
 }
 
-impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
+impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
+    for DynamicHandler<S, T>
+{
     // ── initialize: capture the peer ─────────────────────────────────
 
     fn initialize(
         &self,
         request: InitializeRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             self.registry.register_peer(context.peer.clone()).await;
             self.inner.initialize(request, context).await
         }
@@ -63,9 +81,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn list_tools(
         &self,
         request: Option<PaginatedRequestParam>,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             let token = resolve_token(&context.extensions, &self.token_store).await;
             let mut inner_result = self.inner.list_tools(request, context).await?;
 
@@ -91,9 +110,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn list_prompts(
         &self,
         request: Option<PaginatedRequestParam>,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             let token = resolve_token(&context.extensions, &self.token_store).await;
             let mut inner_result = self.inner.list_prompts(request, context).await?;
 
@@ -116,9 +136,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn list_resources(
         &self,
         request: Option<PaginatedRequestParam>,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             let token = resolve_token(&context.extensions, &self.token_store).await;
             let mut inner_result = self.inner.list_resources(request, context).await?;
 
@@ -144,9 +165,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn call_tool(
         &self,
         request: CallToolRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             if let Some(result) = self
                 .registry
                 .call_tool(&request.name, request.arguments.clone())
@@ -163,9 +185,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn get_prompt(
         &self,
         request: GetPromptRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             if let Some(result) = self.registry.get_prompt(&request).await {
                 return result;
             }
@@ -178,9 +201,10 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
     fn read_resource(
         &self,
         request: ReadResourceRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
+            self.enrich_extensions(&mut context.extensions);
             if let Some(result) = self.registry.read_resource(&request).await {
                 return result;
             }
@@ -196,79 +220,89 @@ impl<S: ServerHandler> ServerHandler for DynamicHandler<S> {
 
     fn ping(
         &self,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.ping(context)
     }
 
     fn complete(
         &self,
         request: CompleteRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.complete(request, context)
     }
 
     fn set_level(
         &self,
         request: SetLevelRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.set_level(request, context)
     }
 
     fn list_resource_templates(
         &self,
         request: Option<PaginatedRequestParam>,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_
     {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.list_resource_templates(request, context)
     }
 
     fn subscribe(
         &self,
         request: SubscribeRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.subscribe(request, context)
     }
 
     fn unsubscribe(
         &self,
         request: UnsubscribeRequestParam,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.unsubscribe(request, context)
     }
 
     fn on_cancelled(
         &self,
         notification: CancelledNotificationParam,
-        context: NotificationContext<RoleServer>,
+        mut context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.on_cancelled(notification, context)
     }
 
     fn on_progress(
         &self,
         notification: ProgressNotificationParam,
-        context: NotificationContext<RoleServer>,
+        mut context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.on_progress(notification, context)
     }
 
     fn on_initialized(
         &self,
-        context: NotificationContext<RoleServer>,
+        mut context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.on_initialized(context)
     }
 
     fn on_roots_list_changed(
         &self,
-        context: NotificationContext<RoleServer>,
+        mut context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
         self.inner.on_roots_list_changed(context)
     }
 }

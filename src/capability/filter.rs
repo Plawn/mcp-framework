@@ -7,6 +7,9 @@ use crate::auth::{StoredToken, TokenStore};
 /// Implement this trait to control which tools, prompts, and resources are
 /// visible to each connected client. The default implementations pass
 /// everything through unfiltered.
+///
+/// For convenience, use [`ToolFilter`], [`PromptFilter`], or [`ResourceFilter`]
+/// to wrap a closure that filters only one capability type.
 pub trait CapabilityFilter: Send + Sync + 'static {
     /// Filter the list of tools visible to a given session.
     fn filter_tools(&self, tools: Vec<Tool>, token: Option<&StoredToken>) -> Vec<Tool> {
@@ -31,14 +34,53 @@ pub trait CapabilityFilter: Send + Sync + 'static {
     }
 }
 
-/// Blanket implementation: a closure `Fn(Vec<Tool>, Option<&StoredToken>) -> Vec<Tool>`
-/// can be used as a `CapabilityFilter` that only filters tools.
-impl<F> CapabilityFilter for F
+/// Filters only tools. Prompts and resources pass through unfiltered.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use mcp_framework::capability::ToolFilter;
+///
+/// let filter = Arc::new(ToolFilter(|tools: Vec<Tool>, _token| {
+///     tools.into_iter().filter(|t| !t.name.starts_with("admin_")).collect()
+/// }));
+/// ```
+pub struct ToolFilter<F>(pub F);
+
+impl<F> CapabilityFilter for ToolFilter<F>
 where
     F: Fn(Vec<Tool>, Option<&StoredToken>) -> Vec<Tool> + Send + Sync + 'static,
 {
     fn filter_tools(&self, tools: Vec<Tool>, token: Option<&StoredToken>) -> Vec<Tool> {
-        (self)(tools, token)
+        (self.0)(tools, token)
+    }
+}
+
+/// Filters only prompts. Tools and resources pass through unfiltered.
+pub struct PromptFilter<F>(pub F);
+
+impl<F> CapabilityFilter for PromptFilter<F>
+where
+    F: Fn(Vec<Prompt>, Option<&StoredToken>) -> Vec<Prompt> + Send + Sync + 'static,
+{
+    fn filter_prompts(&self, prompts: Vec<Prompt>, token: Option<&StoredToken>) -> Vec<Prompt> {
+        (self.0)(prompts, token)
+    }
+}
+
+/// Filters only resources. Tools and prompts pass through unfiltered.
+pub struct ResourceFilter<F>(pub F);
+
+impl<F> CapabilityFilter for ResourceFilter<F>
+where
+    F: Fn(Vec<Resource>, Option<&StoredToken>) -> Vec<Resource> + Send + Sync + 'static,
+{
+    fn filter_resources(
+        &self,
+        resources: Vec<Resource>,
+        token: Option<&StoredToken>,
+    ) -> Vec<Resource> {
+        (self.0)(resources, token)
     }
 }
 
@@ -66,6 +108,7 @@ pub(crate) async fn resolve_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{PromptFilter, ResourceFilter, ToolFilter};
 
     fn make_tool(name: &str) -> Tool {
         Tool {
@@ -78,33 +121,109 @@ mod tests {
     }
 
     #[test]
-    fn closure_filter_tools() {
-        let filter = |tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
+    fn tool_filter_filters_tools() {
+        let filter = ToolFilter(|tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
             tools
                 .into_iter()
                 .filter(|t| !t.name.starts_with("admin_"))
                 .collect()
-        };
+        });
 
         let tools = vec![make_tool("public"), make_tool("admin_delete")];
-        let filtered = CapabilityFilter::filter_tools(&filter, tools, None);
+        let filtered = filter.filter_tools(tools, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name.as_ref(), "public");
     }
 
     #[test]
-    fn closure_filter_passes_prompts_through() {
+    fn tool_filter_passes_prompts_through() {
         let filter =
-            |_tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> { Vec::new() };
+            ToolFilter(|_tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
+                Vec::new()
+            });
 
         let prompts = vec![Prompt {
             name: "test".to_string(),
             description: None,
             arguments: None,
         }];
-        // Closure blanket impl only filters tools; prompts pass through
-        let result = CapabilityFilter::filter_prompts(&filter, prompts.clone(), None);
+        // ToolFilter only filters tools; prompts pass through
+        let result = filter.filter_prompts(prompts.clone(), None);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn prompt_filter_filters_prompts() {
+        let filter =
+            PromptFilter(|prompts: Vec<Prompt>, _token: Option<&StoredToken>| -> Vec<Prompt> {
+                prompts
+                    .into_iter()
+                    .filter(|p| p.name != "secret")
+                    .collect()
+            });
+
+        let prompts = vec![
+            Prompt {
+                name: "public".to_string(),
+                description: None,
+                arguments: None,
+            },
+            Prompt {
+                name: "secret".to_string(),
+                description: None,
+                arguments: None,
+            },
+        ];
+        let filtered = filter.filter_prompts(prompts, None);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "public");
+
+        // Tools pass through unfiltered
+        let tools = vec![make_tool("any")];
+        assert_eq!(filter.filter_tools(tools, None).len(), 1);
+    }
+
+    #[test]
+    fn resource_filter_filters_resources() {
+        use rmcp::model::{Annotated, RawResource};
+
+        let filter = ResourceFilter(
+            |resources: Vec<Resource>, _token: Option<&StoredToken>| -> Vec<Resource> {
+                resources
+                    .into_iter()
+                    .filter(|r| r.raw.uri != "secret://x")
+                    .collect()
+            },
+        );
+
+        let resources = vec![
+            Annotated {
+                raw: RawResource {
+                    uri: "public://a".to_string(),
+                    name: "public".to_string(),
+                    description: None,
+                    mime_type: None,
+                    size: None,
+                },
+                annotations: None,
+            },
+            Annotated {
+                raw: RawResource {
+                    uri: "secret://x".to_string(),
+                    name: "secret".to_string(),
+                    description: None,
+                    mime_type: None,
+                    size: None,
+                },
+                annotations: None,
+            },
+        ];
+        let filtered = filter.filter_resources(resources, None);
+        assert_eq!(filtered.len(), 1);
+
+        // Tools pass through unfiltered
+        let tools = vec![make_tool("any")];
+        assert_eq!(filter.filter_tools(tools, None).len(), 1);
     }
 
     #[tokio::test]

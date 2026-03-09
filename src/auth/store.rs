@@ -257,6 +257,46 @@ impl TokenStore {
         locks.remove(session_id);
     }
 
+    /// Purge all expired tokens and their associated refresh locks.
+    pub async fn purge_expired(&self) {
+        let expired_keys: Vec<String> = {
+            let tokens = self.tokens.read().await;
+            tokens
+                .iter()
+                .filter(|(_, t)| t.is_expired())
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+
+        if expired_keys.is_empty() {
+            return;
+        }
+
+        let mut tokens = self.tokens.write().await;
+        let mut locks = self.refresh_locks.write().await;
+        for key in &expired_keys {
+            tokens.remove(key);
+            locks.remove(key);
+        }
+
+        tracing::debug!("Purged {} expired token(s)", expired_keys.len());
+    }
+
+    /// Spawn a background task that periodically purges expired tokens.
+    ///
+    /// The task runs until the returned [`JoinHandle`] is aborted or the
+    /// runtime shuts down.
+    pub fn start_cleanup_task(&self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                store.purge_expired().await;
+            }
+        })
+    }
+
     /// Check if a session has a valid (non-expired) token (no side-effects)
     pub async fn has_valid_token(&self, session_id: &str) -> bool {
         match self.get_token_raw(session_id).await {
@@ -425,5 +465,54 @@ mod tests {
         store.remove_token("s1").await;
         assert!(!store.refresh_locks.read().await.contains_key("s1"));
         assert!(store.get_token_raw("s1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_expired_removes_expired_tokens() {
+        let store = TokenStore::new();
+
+        // Store an expired token
+        let expired = StoredToken {
+            access_token: "old".to_string(),
+            refresh_token: None,
+            expires_at: Some(Instant::now() - Duration::from_secs(60)),
+        };
+        store.store_token("expired-sess".to_string(), expired).await;
+
+        // Create a refresh lock for it
+        let _lock = store.get_refresh_lock("expired-sess").await;
+
+        // Store a valid token
+        let valid = StoredToken {
+            access_token: "fresh".to_string(),
+            refresh_token: None,
+            expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        store.store_token("valid-sess".to_string(), valid).await;
+
+        store.purge_expired().await;
+
+        // Expired token and its lock should be gone
+        assert!(store.get_token_raw("expired-sess").await.is_none());
+        assert!(!store.refresh_locks.read().await.contains_key("expired-sess"));
+
+        // Valid token should still exist
+        assert!(store.get_token_raw("valid-sess").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_expired_no_expiry_kept() {
+        let store = TokenStore::new();
+
+        // Token with no expiry (never expires) should be kept
+        let token = StoredToken {
+            access_token: "eternal".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+        store.store_token("s1".to_string(), token).await;
+
+        store.purge_expired().await;
+        assert!(store.get_token_raw("s1").await.is_some());
     }
 }
