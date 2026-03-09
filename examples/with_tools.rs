@@ -12,7 +12,7 @@ use mcp_framework::prelude::*;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_handler, tool_router};
 
 // ── Tool parameter types ─────────────────────────────────────────────
 
@@ -59,6 +59,7 @@ impl ToolServer {
     }
 }
 
+#[tool_handler]
 impl ServerHandler for ToolServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
