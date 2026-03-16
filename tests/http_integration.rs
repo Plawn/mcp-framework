@@ -5,6 +5,8 @@
 //! Streamable HTTP + SSE path — the same path that was failing with
 //! "connection closed before message completed" after the rmcp 1.2 upgrade.
 
+use std::time::Duration;
+
 use mcp_framework::auth::AuthProvider;
 use mcp_framework::prelude::*;
 use mcp_framework::session::SessionStore;
@@ -369,4 +371,95 @@ async fn http_multiple_calls_same_session() -> anyhow::Result<()> {
 
     client.cancel().await?;
     Ok(())
+}
+
+// ── Regression: SSE priming events break clients ────────────────────
+
+/// Start a *raw* MCP server using rmcp's default StreamableHttpServerConfig
+/// (which enables SSE priming events). This reproduces the pre-fix behavior.
+async fn start_server_with_sse_priming() -> std::net::SocketAddr {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+
+    let mcp_service = StreamableHttpService::new(
+        || Ok(TestServer::new()),
+        LocalSessionManager::default().into(),
+        Default::default(), // <-- SSE priming enabled (sse_retry: Some(3000))
+    );
+
+    let app = axum::Router::new().fallback_service(mcp_service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    addr
+}
+
+/// With SSE priming enabled (rmcp default), the client may fail to receive
+/// tool results because it interprets the priming event as the end of the
+/// response. This test documents the regression that `sse_retry: None` fixes.
+///
+/// If rmcp fixes priming behavior upstream, this test can be removed.
+#[tokio::test]
+async fn http_sse_priming_causes_client_issues() {
+    init_test_tracing();
+    let addr = start_server_with_sse_priming().await;
+
+    let url = format!("http://{}/mcp", addr);
+    let transport = StreamableHttpClientTransport::from_uri(url);
+
+    // The connect itself may fail or succeed depending on how the client
+    // handles the priming event during initialization.
+    let client_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        ().serve(transport),
+    ).await;
+
+    match client_result {
+        Ok(Ok(client)) => {
+            // Client connected — try a tool call. With priming events,
+            // the tool call may time out or return an error.
+            let tool_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.call_tool(CallToolRequestParams::new("ping")),
+            ).await;
+
+            // Document the behavior: with priming, tool calls may fail.
+            // We don't assert failure (rmcp client may handle it),
+            // but we log the outcome.
+            match tool_result {
+                Ok(Ok(result)) => {
+                    tracing::info!("SSE priming: tool call succeeded (client handled priming)");
+                    let text = result
+                        .content
+                        .first()
+                        .and_then(|c| c.raw.as_text())
+                        .map(|t| t.text.as_str());
+                    assert_eq!(text, Some("pong"));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("SSE priming: tool call failed with error: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("SSE priming: tool call timed out (connection likely broken)");
+                }
+            }
+
+            let _ = client.cancel().await;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("SSE priming: client failed to connect: {e}");
+        }
+        Err(_) => {
+            tracing::warn!("SSE priming: client connection timed out");
+        }
+    }
+
+    // The fixed server (start_server) always works — that's covered by the other tests.
+    // This test just documents the priming behavior.
 }

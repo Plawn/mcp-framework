@@ -11,7 +11,7 @@
 //! ```
 
 use mcp_framework::prelude::*;
-use rmcp::{tool, tool_handler, tool_router};
+use rmcp::{handler::server::tool::schema_for_output, tool, tool_handler, tool_router};
 
 // ── Tool parameter types ─────────────────────────────────────────────
 
@@ -25,6 +25,51 @@ struct GreetParams {
 struct SizeParams {
     #[schemars(description = "Approximate response size in bytes (default: 5000)")]
     size: Option<usize>,
+}
+
+// ── Output schema types ──────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct GreetOutput {
+    #[schemars(description = "The greeting message")]
+    message: String,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct ProjectSource {
+    id: u64,
+    name: String,
+    icon: String,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct ProjectMetadata {
+    language: String,
+    role: String,
+    #[serde(rename = "studyQuestion")]
+    study_question: String,
+    target: String,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct ProjectItem {
+    id: u64,
+    name: String,
+    description: String,
+    metadata: ProjectMetadata,
+    sources: Vec<ProjectSource>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct LargeResponseOutput {
+    #[schemars(description = "List of projects")]
+    projects: Vec<ProjectItem>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PingOutput {
+    #[schemars(description = "The pong response")]
+    message: String,
 }
 
 // ── Server ───────────────────────────────────────────────────────────
@@ -45,15 +90,30 @@ impl DebugServer {
 
 #[tool_router]
 impl DebugServer {
-    /// Small response — should always work.
-    #[tool(description = "Return a short greeting")]
-    fn greet(&self, Parameters(params): Parameters<GreetParams>) -> String {
-        format!("Hello, {}!", params.name)
+    #[tool(
+        description = "Return a short greeting",
+        output_schema = schema_for_output::<GreetOutput>().unwrap()
+    )]
+    async fn greet(
+        &self,
+        Parameters(params): Parameters<GreetParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = GreetOutput {
+            message: format!("hello {}", params.name),
+        };
+        Ok(CallToolResult::structured(serde_json::to_value(&output).unwrap()))
     }
 
-    /// Large response — reproduces the SSE streaming issue.
-    #[tool(description = "Return a large JSON payload to test SSE streaming")]
-    fn large_response(&self, Parameters(params): Parameters<SizeParams>) -> String {
+    #[tool(
+        description = "Return a large JSON payload to test SSE streaming",
+        output_schema = schema_for_output::<LargeResponseOutput>().unwrap()
+    )]
+    async fn large_response(
+        &self,
+        Parameters(params): Parameters<SizeParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let size = params.size.unwrap_or(5000);
         let item = serde_json::json!({
             "id": 42,
@@ -73,29 +133,39 @@ impl DebugServer {
         });
         let item_str = serde_json::to_string_pretty(&item).unwrap();
         let repeat = (size / item_str.len()).max(1);
-        let items: Vec<_> = (0..repeat).map(|i| {
-            let mut v = item.clone();
-            v["id"] = serde_json::json!(i);
-            v
-        }).collect();
-        serde_json::to_string_pretty(&serde_json::json!({ "projects": items })).unwrap()
+        let items: Vec<_> = (0..repeat)
+            .map(|i| {
+                let mut v = item.clone();
+                v["id"] = serde_json::json!(i);
+                v
+            })
+            .collect();
+        Ok(CallToolResult::structured(serde_json::json!({ "projects": items })))
     }
 
-    /// No-params tool to test EmptyParams handling.
-    #[tool(description = "Return pong")]
-    fn ping(&self, Parameters(_): Parameters<EmptyParams>) -> String {
-        "pong".to_string()
+    #[tool(
+        description = "Return pong",
+        output_schema = schema_for_output::<PingOutput>().unwrap()
+    )]
+    async fn ping(
+        &self,
+        Parameters(_): Parameters<EmptyParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = PingOutput {
+            message: "pong".to_string(),
+        };
+        Ok(CallToolResult::structured(serde_json::to_value(&output).unwrap()))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for DebugServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Debug MCP server for testing HTTP/SSE transport. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Debug MCP server for testing HTTP/SSE transport. \
                  Tools: greet (small), large_response (large), ping (empty params).",
-            )
+        )
     }
 }
 

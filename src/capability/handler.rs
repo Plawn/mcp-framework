@@ -12,21 +12,26 @@ use crate::session::SessionStore;
 use super::filter::{resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
 
-/// Sanitize tool input schemas for MCP client compatibility.
+/// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object.
+fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
+    schema.remove("$schema");
+    schema.remove("title");
+}
+
+/// Sanitize tool schemas for MCP client compatibility.
 ///
 /// 1. Strips `$schema` and `title` keys that schemars 1.x injects — many MCP
 ///    clients (including Claude) don't expect meta-schema references in
-///    `inputSchema` and may reject the tool or fail during execution.
-/// 2. Ensures every schema contains `"type": "object"` — some parameter types
-///    (e.g. `serde_json::Value`) produce schemas without a `"type"` key, which
-///    causes clients to silently reject the tool.
+///    `inputSchema` / `outputSchema` and may reject the tool or fail during
+///    execution.
+/// 2. Ensures every input schema contains `"type": "object"` — some parameter
+///    types (e.g. `serde_json::Value`) produce schemas without a `"type"` key,
+///    which causes clients to silently reject the tool.
 fn sanitize_tool_schemas(tools: &mut [Tool]) {
     for tool in tools.iter_mut() {
+        // ── input_schema ───────────────────────────────────────────
         let schema = Arc::make_mut(&mut tool.input_schema);
-
-        // Strip meta-schema fields that confuse MCP clients
-        schema.remove("$schema");
-        schema.remove("title");
+        strip_meta_fields(schema);
 
         if !schema.contains_key("type") {
             tracing::warn!(
@@ -39,6 +44,11 @@ fn sanitize_tool_schemas(tools: &mut [Tool]) {
             if !schema.contains_key("properties") {
                 schema.insert("properties".to_string(), Value::Object(Default::default()));
             }
+        }
+
+        // ── output_schema ──────────────────────────────────────────
+        if let Some(ref mut output_schema) = tool.output_schema {
+            strip_meta_fields(Arc::make_mut(output_schema));
         }
     }
 }
