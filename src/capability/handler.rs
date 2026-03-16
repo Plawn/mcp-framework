@@ -12,15 +12,22 @@ use crate::session::SessionStore;
 use super::filter::{resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
 
-/// Ensure every tool's `input_schema` contains `"type": "object"`.
+/// Sanitize tool input schemas for MCP client compatibility.
 ///
-/// Some parameter types (e.g. `serde_json::Value`) produce schemas without a
-/// `"type"` key, which causes clients like Claude Code to silently reject the
-/// tool.  This function patches those schemas at runtime and emits a warning
-/// so authors can fix the underlying type.
+/// 1. Strips `$schema` and `title` keys that schemars 1.x injects — many MCP
+///    clients (including Claude) don't expect meta-schema references in
+///    `inputSchema` and may reject the tool or fail during execution.
+/// 2. Ensures every schema contains `"type": "object"` — some parameter types
+///    (e.g. `serde_json::Value`) produce schemas without a `"type"` key, which
+///    causes clients to silently reject the tool.
 fn sanitize_tool_schemas(tools: &mut [Tool]) {
     for tool in tools.iter_mut() {
         let schema = Arc::make_mut(&mut tool.input_schema);
+
+        // Strip meta-schema fields that confuse MCP clients
+        schema.remove("$schema");
+        schema.remove("title");
+
         if !schema.contains_key("type") {
             tracing::warn!(
                 tool = %tool.name,
@@ -381,6 +388,29 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_schema_and_title_from_valid_schema() {
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+        schema.insert(
+            "$schema".to_string(),
+            Value::String("https://json-schema.org/draft/2020-12/schema".to_string()),
+        );
+        schema.insert("title".to_string(), Value::String("MyParams".to_string()));
+        schema.insert(
+            "properties".to_string(),
+            Value::Object(serde_json::Map::new()),
+        );
+
+        let mut tools = vec![make_tool("with_meta", schema)];
+        sanitize_tool_schemas(&mut tools);
+
+        let patched = tools[0].input_schema.as_ref();
+        assert_eq!(patched.get("type").unwrap(), "object");
+        assert!(!patched.contains_key("$schema"));
+        assert!(!patched.contains_key("title"));
+    }
+
+    #[test]
     fn sanitize_patches_serde_json_value_style_schema() {
         // This is what schemars generates for Parameters<serde_json::Value>
         let mut schema = serde_json::Map::new();
@@ -396,8 +426,8 @@ mod tests {
         let patched = tools[0].input_schema.as_ref();
         assert_eq!(patched.get("type").unwrap(), "object");
         assert!(patched.contains_key("properties"));
-        // Original fields preserved
-        assert!(patched.contains_key("$schema"));
-        assert!(patched.contains_key("title"));
+        // $schema and title are stripped for MCP client compatibility
+        assert!(!patched.contains_key("$schema"));
+        assert!(!patched.contains_key("title"));
     }
 }

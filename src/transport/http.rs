@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{routing::get, Router};
-use rmcp::transport::streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
+};
 use rmcp::ServerHandler;
 
 use crate::auth::{
@@ -152,6 +155,15 @@ where
     let token_store_clone = token_store.clone();
     let session_store = config.session_store;
 
+    // Disable SSE priming events (sse_retry: None) for broad client compatibility.
+    // rmcp 1.x defaults to sending empty SSE "priming" frames before each response,
+    // which some MCP clients (e.g. Claude) misinterpret, causing the connection to
+    // close before the tool result is delivered.
+    let mcp_config = StreamableHttpServerConfig {
+        sse_retry: None,
+        ..Default::default()
+    };
+
     let mcp_service = StreamableHttpService::new(
         move || {
             let server = factory();
@@ -164,7 +176,7 @@ where
             ))
         },
         LocalSessionManager::default().into(),
-        Default::default(),
+        mcp_config,
     );
 
     let mcp_router = {
