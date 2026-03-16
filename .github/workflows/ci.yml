@@ -1,14 +1,13 @@
-name: Release
+name: CI
 
 on:
   push:
-    tags: ['v*']
-
-permissions:
-  contents: write
+    branches: [master]
+  pull_request:
+    branches: [master]
 
 jobs:
-  release:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,8 +21,3 @@ jobs:
 
       - name: Test
         run: cargo test
-
-      - name: Create GitHub release
-        run: gh release create "${{ github.ref_name }}" --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}
