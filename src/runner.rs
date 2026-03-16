@@ -317,9 +317,6 @@ where
             if oauth.client_id.is_empty() {
                 anyhow::bail!("McpAppBuilder: OAuth client_id must not be empty");
             }
-            if oauth.client_secret.is_empty() {
-                anyhow::bail!("McpAppBuilder: OAuth client_secret must not be empty");
-            }
             if oauth.issuer_url.is_empty() {
                 anyhow::bail!("McpAppBuilder: OAuth issuer_url must not be empty");
             }

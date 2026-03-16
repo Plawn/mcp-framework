@@ -21,7 +21,7 @@ pub type ConfiguredClient = oauth2::Client<
 #[derive(Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Option<String>,
     pub issuer_url: String,
     pub redirect_url: String,
     pub scopes: Vec<String>,
@@ -32,17 +32,16 @@ impl OAuthConfig {
     ///
     /// Required env vars:
     /// - OAUTH_CLIENT_ID
-    /// - OAUTH_CLIENT_SECRET
     /// - OAUTH_ISSUER_URL (e.g., https://keycloak.example.com/realms/myrealm)
     /// - OAUTH_REDIRECT_URL (e.g., http://localhost:3000/oauth/callback)
     ///
     /// Optional:
+    /// - OAUTH_CLIENT_SECRET (omit for public OIDC clients using PKCE)
     /// - OAUTH_SCOPES (comma-separated, defaults to "openid,profile,email")
     pub fn from_env() -> Result<Self, String> {
         let client_id = std::env::var("OAUTH_CLIENT_ID")
             .map_err(|_| "OAUTH_CLIENT_ID not set")?;
-        let client_secret = std::env::var("OAUTH_CLIENT_SECRET")
-            .map_err(|_| "OAUTH_CLIENT_SECRET not set")?;
+        let client_secret = std::env::var("OAUTH_CLIENT_SECRET").ok();
         let issuer_url = std::env::var("OAUTH_ISSUER_URL")
             .map_err(|_| "OAUTH_ISSUER_URL not set")?;
         let redirect_url = std::env::var("OAUTH_REDIRECT_URL")
@@ -75,11 +74,14 @@ impl OAuthConfig {
             self.issuer_url.trim_end_matches('/')
         );
 
-        let client = BasicClient::new(ClientId::new(self.client_id.clone()))
-            .set_client_secret(ClientSecret::new(self.client_secret.clone()))
+        let mut client = BasicClient::new(ClientId::new(self.client_id.clone()))
             .set_auth_uri(AuthUrl::new(auth_url).map_err(|e| e.to_string())?)
             .set_token_uri(TokenUrl::new(token_url).map_err(|e| e.to_string())?)
             .set_redirect_uri(RedirectUrl::new(self.redirect_url.clone()).map_err(|e| e.to_string())?);
+
+        if let Some(ref secret) = self.client_secret {
+            client = client.set_client_secret(ClientSecret::new(secret.clone()));
+        }
 
         Ok(client)
     }

@@ -50,7 +50,7 @@ impl PendingAuth {
 #[derive(Clone)]
 pub struct RefreshConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Option<String>,
     pub token_url: String,
 }
 
@@ -123,12 +123,14 @@ impl TokenStore {
             .ok_or_else(|| "Refresh configuration not available".to_string())?;
 
         // Build the refresh request
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", &refresh_token),
-            ("client_id", &config.client_id),
-            ("client_secret", &config.client_secret),
+        let mut params = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.clone()),
+            ("client_id", config.client_id.clone()),
         ];
+        if let Some(ref secret) = config.client_secret {
+            params.push(("client_secret", secret.clone()));
+        }
 
         tracing::debug!("Attempting token refresh for session {}", session_id);
 
@@ -354,7 +356,7 @@ mod tests {
         // but with a bogus token_url (so the refresh will fail)
         let store = TokenStore::with_refresh_config(RefreshConfig {
             client_id: "test".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: Some("secret".to_string()),
             token_url: "http://127.0.0.1:1/nonexistent".to_string(),
         });
 
@@ -378,7 +380,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let store = TokenStore::with_refresh_config(RefreshConfig {
             client_id: "test".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: Some("secret".to_string()),
             // Unreachable URL — refresh will fail, but we verify the lock behavior
             // by checking that the second caller sees the still-expired token and also
             // returns None (rather than racing)

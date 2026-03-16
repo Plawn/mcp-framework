@@ -113,7 +113,7 @@ where
             public_url: config.public_url.clone(),
             keycloak_realm_url: oauth_config.issuer_url.clone(),
             keycloak_client_id: oauth_config.client_id.clone(),
-            keycloak_client_secret: Some(oauth_config.client_secret.clone()),
+            keycloak_client_secret: oauth_config.client_secret.clone(),
             http_client: http_client.clone(),
             token_store: token_store.clone(),
         };
