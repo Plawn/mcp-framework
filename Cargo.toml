@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/Plawn/mcp-framework"
 
 [dependencies]
-rmcp = { version = "1.1", features = ["server", "transport-streamable-http-server", "transport-worker", "transport-io"] }
+rmcp = { version = "1.2", features = ["server", "transport-streamable-http-server", "transport-worker", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,7 +31,7 @@ dotenvy = "0.15"
 schemars = "1.2.1"
 
 [dev-dependencies]
-rmcp = { version = "1.1", features = ["client", "transport-child-process"] }
+rmcp = { version = "1.2", features = ["client", "transport-child-process"] }
 serde_json = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
