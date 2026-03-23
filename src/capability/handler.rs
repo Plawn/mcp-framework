@@ -18,6 +18,64 @@ fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
     schema.remove("title");
 }
 
+/// Recursively resolve `$ref: "#/$defs/..."` pointers by inlining the
+/// referenced definition.  Sibling keys on the `$ref` object (e.g.
+/// `description`) are preserved and override keys from the definition.
+fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(ref_str)) = map.get("$ref") {
+                if let Some(name) = ref_str.strip_prefix("#/$defs/") {
+                    if let Some(def) = defs.get(name) {
+                        let mut inlined = def.clone();
+                        if let Value::Object(ref mut inlined_map) = inlined {
+                            // Sibling keys (description, default, …) override the def
+                            for (k, v) in map.iter() {
+                                if k != "$ref" {
+                                    inlined_map.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        *value = inlined;
+                        // The inlined definition may itself contain $refs
+                        resolve_refs(value, defs);
+                        return;
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract `$defs` from a schema and inline all `$ref` pointers that
+/// reference them, then drop `$defs`.  This produces a self-contained
+/// schema without indirection — friendlier for MCP clients that do not
+/// fully support JSON Schema references.
+fn inline_defs(schema: &mut serde_json::Map<String, Value>) {
+    let defs = match schema.remove("$defs") {
+        Some(Value::Object(d)) => d,
+        other => {
+            if let Some(v) = other {
+                schema.insert("$defs".to_string(), v);
+            }
+            return;
+        }
+    };
+
+    for value in schema.values_mut() {
+        resolve_refs(value, &defs);
+    }
+}
+
 /// Sanitize tool schemas for MCP client compatibility.
 ///
 /// 1. Strips `$schema` and `title` keys that schemars 1.x injects — many MCP
@@ -32,6 +90,7 @@ fn sanitize_tool_schemas(tools: &mut [Tool]) {
         // ── input_schema ───────────────────────────────────────────
         let schema = Arc::make_mut(&mut tool.input_schema);
         strip_meta_fields(schema);
+        inline_defs(schema);
 
         if !schema.contains_key("type") {
             tracing::warn!(
@@ -48,7 +107,9 @@ fn sanitize_tool_schemas(tools: &mut [Tool]) {
 
         // ── output_schema ──────────────────────────────────────────
         if let Some(ref mut output_schema) = tool.output_schema {
-            strip_meta_fields(Arc::make_mut(output_schema));
+            let os = Arc::make_mut(output_schema);
+            strip_meta_fields(os);
+            inline_defs(os);
         }
     }
 }
@@ -436,6 +497,83 @@ mod tests {
         assert_eq!(patched.get("type").unwrap(), "object");
         assert!(!patched.contains_key("$schema"));
         assert!(!patched.contains_key("title"));
+    }
+
+    #[test]
+    fn sanitize_inlines_ref_enums() {
+        let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "$defs": {
+                "MyAction": { "enum": ["ask", "brief"], "type": "string" }
+            },
+            "type": "object",
+            "properties": {
+                "action": {
+                    "$ref": "#/$defs/MyAction",
+                    "description": "The action"
+                }
+            },
+            "required": ["action"]
+        }))
+        .unwrap();
+
+        let mut tools = vec![make_tool("t", schema)];
+        sanitize_tool_schemas(&mut tools);
+
+        let patched = tools[0].input_schema.as_ref();
+        assert!(!patched.contains_key("$defs"), "$defs should be removed");
+
+        let action = patched["properties"]["action"].as_object().unwrap();
+        assert_eq!(
+            action.get("enum").unwrap(),
+            &serde_json::json!(["ask", "brief"]),
+            "enum values should be inlined"
+        );
+        assert_eq!(
+            action.get("type").unwrap(),
+            "string",
+            "type from the definition should be present"
+        );
+        assert_eq!(
+            action.get("description").unwrap(),
+            "The action",
+            "sibling description should be preserved"
+        );
+        assert!(!action.contains_key("$ref"), "$ref should be removed");
+    }
+
+    #[test]
+    fn sanitize_inlines_anyof_with_ref() {
+        let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "$defs": {
+                "DetailLevel": { "enum": ["brief", "detailed"], "type": "string" }
+            },
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "anyOf": [
+                        { "$ref": "#/$defs/DetailLevel" },
+                        { "type": "null" }
+                    ],
+                    "description": "Level of detail"
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut tools = vec![make_tool("t", schema)];
+        sanitize_tool_schemas(&mut tools);
+
+        let patched = tools[0].input_schema.as_ref();
+        assert!(!patched.contains_key("$defs"));
+
+        let variants = patched["properties"]["detail"]["anyOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            variants[0],
+            serde_json::json!({"enum": ["brief", "detailed"], "type": "string"}),
+            "$ref inside anyOf should be inlined"
+        );
+        assert_eq!(variants[1], serde_json::json!({"type": "null"}));
     }
 
     #[test]
