@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rmcp::model::{Extensions, Prompt, Resource, Tool};
 
 use crate::auth::{StoredToken, TokenStore};
@@ -103,6 +105,33 @@ pub(crate) async fn resolve_token(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("default");
     token_store.get_token(session_id).await
+}
+
+/// Extract the set of tool names to exclude from the `?filter=` query parameter.
+///
+/// The query parameter value is a comma-separated list of tool names to exclude
+/// from `list_tools` and `call_tool`. For example, `?filter=tool1,tool2` will
+/// hide `tool1` and `tool2`.
+///
+/// Returns an empty set if no filter is present (e.g. stdio mode or no query param).
+pub(crate) fn resolve_query_filter(extensions: &Extensions) -> HashSet<String> {
+    let Some(parts) = extensions.get::<http::request::Parts>() else {
+        return HashSet::new();
+    };
+    let Some(query) = parts.uri.query() else {
+        return HashSet::new();
+    };
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("filter=") {
+            let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+            return decoded
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+    HashSet::new()
 }
 
 #[cfg(test)]
@@ -230,6 +259,75 @@ mod tests {
         let token = resolve_token(&extensions, &store).await;
         assert!(token.is_some());
         assert_eq!(token.unwrap().access_token, "tok");
+    }
+
+    #[test]
+    fn resolve_query_filter_no_parts() {
+        let extensions = Extensions::new();
+        assert!(resolve_query_filter(&extensions).is_empty());
+    }
+
+    #[test]
+    fn resolve_query_filter_no_query() {
+        let mut extensions = Extensions::new();
+        let (parts, _) = http::Request::builder().uri("/mcp").body(()).unwrap().into_parts();
+        extensions.insert(parts);
+        assert!(resolve_query_filter(&extensions).is_empty());
+    }
+
+    #[test]
+    fn resolve_query_filter_with_filter() {
+        let mut extensions = Extensions::new();
+        let (parts, _) = http::Request::builder()
+            .uri("/mcp?filter=tool1,tool2")
+            .body(())
+            .unwrap()
+            .into_parts();
+        extensions.insert(parts);
+        let filter = resolve_query_filter(&extensions);
+        assert_eq!(filter.len(), 2);
+        assert!(filter.contains("tool1"));
+        assert!(filter.contains("tool2"));
+    }
+
+    #[test]
+    fn resolve_query_filter_url_encoded() {
+        let mut extensions = Extensions::new();
+        let (parts, _) = http::Request::builder()
+            .uri("/mcp?filter=my%20tool,other_tool")
+            .body(())
+            .unwrap()
+            .into_parts();
+        extensions.insert(parts);
+        let filter = resolve_query_filter(&extensions);
+        assert!(filter.contains("my tool"));
+        assert!(filter.contains("other_tool"));
+    }
+
+    #[test]
+    fn resolve_query_filter_with_other_params() {
+        let mut extensions = Extensions::new();
+        let (parts, _) = http::Request::builder()
+            .uri("/mcp?other=value&filter=tool1&more=stuff")
+            .body(())
+            .unwrap()
+            .into_parts();
+        extensions.insert(parts);
+        let filter = resolve_query_filter(&extensions);
+        assert_eq!(filter.len(), 1);
+        assert!(filter.contains("tool1"));
+    }
+
+    #[test]
+    fn resolve_query_filter_empty_value() {
+        let mut extensions = Extensions::new();
+        let (parts, _) = http::Request::builder()
+            .uri("/mcp?filter=")
+            .body(())
+            .unwrap()
+            .into_parts();
+        extensions.insert(parts);
+        assert!(resolve_query_filter(&extensions).is_empty());
     }
 
     #[tokio::test]

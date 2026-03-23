@@ -373,6 +373,88 @@ async fn http_multiple_calls_same_session() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Query parameter tool filtering ───────────────────────────────────
+
+/// Connect an rmcp HTTP client with a `?filter=` query parameter.
+async fn connect_client_with_filter(
+    addr: std::net::SocketAddr,
+    filter: &str,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let url = format!("http://{}/mcp?filter={}", addr, filter);
+    let transport = StreamableHttpClientTransport::from_uri(url);
+    ().serve(transport).await.expect("client connect failed")
+}
+
+#[tokio::test]
+async fn http_query_filter_excludes_tools() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let client = connect_client_with_filter(addr, "ping").await;
+
+    let tools = client.list_all_tools().await?;
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    assert!(!names.contains(&"ping"), "ping should be filtered out, got: {names:?}");
+    assert!(names.contains(&"greet"), "greet should still be present, got: {names:?}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_query_filter_rejects_call() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let client = connect_client_with_filter(addr, "ping").await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("ping"))
+        .await;
+
+    assert!(result.is_err(), "calling filtered tool should return error");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_query_filter_multiple_tools() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let client = connect_client_with_filter(addr, "ping,greet").await;
+
+    let tools = client.list_all_tools().await?;
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    assert!(!names.contains(&"ping"), "ping should be filtered");
+    assert!(!names.contains(&"greet"), "greet should be filtered");
+    assert!(names.contains(&"large_response"), "large_response should remain");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_no_filter_returns_all_tools() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let client = connect_client(addr).await;
+
+    let tools = client.list_all_tools().await?;
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    assert!(names.contains(&"ping"));
+    assert!(names.contains(&"greet"));
+    assert!(names.contains(&"large_response"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
 // ── Regression: SSE priming events break clients ────────────────────
 
 /// Start a *raw* MCP server using rmcp's default StreamableHttpServerConfig

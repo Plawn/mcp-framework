@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::auth::TokenStore;
 use crate::session::SessionStore;
 
-use super::filter::{resolve_token, CapabilityFilter};
+use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
 
 /// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object.
@@ -128,6 +128,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
         async move {
             self.enrich_extensions(&mut context.extensions);
             let token = resolve_token(&context.extensions, &self.token_store).await;
+            let query_filter = resolve_query_filter(&context.extensions);
             let mut inner_result = self.inner.list_tools(request, context).await?;
 
             // Merge registry tools, registry wins on name collision
@@ -141,9 +142,16 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             // Patch schemas missing "type": "object" (e.g. Parameters<serde_json::Value>)
             sanitize_tool_schemas(&mut inner_result.tools);
 
-            // Apply filter
+            // Apply trait-based filter
             if let Some(ref filter) = self.filter {
                 inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
+            }
+
+            // Apply URL query parameter filter (?filter=tool1,tool2 excludes named tools)
+            if !query_filter.is_empty() {
+                inner_result
+                    .tools
+                    .retain(|t| !query_filter.contains(t.name.as_ref()));
             }
 
             Ok(inner_result)
@@ -214,6 +222,16 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
+
+            // Reject tools excluded by URL query filter
+            let query_filter = resolve_query_filter(&context.extensions);
+            if query_filter.contains(request.name.as_ref()) {
+                return Err(McpError::invalid_request(
+                    format!("Tool '{}' is not available", request.name),
+                    None,
+                ));
+            }
+
             if let Some(result) = self
                 .registry
                 .call_tool(&request.name, request.arguments.clone())
