@@ -159,10 +159,8 @@ where
     // rmcp 1.x defaults to sending empty SSE "priming" frames before each response,
     // which some MCP clients (e.g. Claude) misinterpret, causing the connection to
     // close before the tool result is delivered.
-    let mcp_config = StreamableHttpServerConfig {
-        sse_retry: None,
-        ..Default::default()
-    };
+    let mcp_config = StreamableHttpServerConfig::default()
+        .with_sse_retry(None);
 
     let mcp_service = StreamableHttpService::new(
         move || {
