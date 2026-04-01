@@ -161,6 +161,7 @@ async fn start_server() -> std::net::SocketAddr {
         capability_registry: None,
         capability_filter: None,
         session_store: SessionStore::default(),
+        tool_call_logger: None,
     };
 
     let (app, _token_store) = build_app(config);

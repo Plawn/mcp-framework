@@ -4,6 +4,9 @@
 //! use mcp_framework::prelude::*;
 //! ```
 
+pub use crate::audit::{
+    NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
+};
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use crate::capability::{
     CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter,

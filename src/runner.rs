@@ -5,6 +5,7 @@ use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, StoredToken, TokenStore};
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
 use crate::session::{SessionStore, DEFAULT_SESSION_TTL};
@@ -97,6 +98,8 @@ where
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
     /// Optional session store. When `None`, a default store is created automatically.
     pub session_store: Option<SessionStore<T>>,
+    /// Optional tool call audit logger.
+    pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
 }
 
 impl<F, T> McpApp<F, T>
@@ -124,6 +127,7 @@ where
             capability_registry: None,
             capability_filter: None,
             session_store: None,
+            tool_call_logger: None,
         }
     }
 }
@@ -161,6 +165,7 @@ pub struct McpAppBuilder<T: Send + Sync + Default + Clone + 'static = (), F = ()
     capability_registry: Option<CapabilityRegistry>,
     capability_filter: Option<Arc<dyn CapabilityFilter>>,
     session_store: Option<SessionStore<T>>,
+    tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
 }
 
 impl McpAppBuilder<()> {
@@ -185,6 +190,7 @@ impl McpAppBuilder<()> {
             capability_registry: None,
             capability_filter: None,
             session_store: None,
+            tool_call_logger: None,
         }
     }
 }
@@ -212,6 +218,7 @@ impl<F> McpAppBuilder<(), F> {
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
             session_store: None,
+            tool_call_logger: self.tool_call_logger,
         }
     }
 }
@@ -254,6 +261,15 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Set the tool call audit logger.
+    ///
+    /// When set, every `call_tool` invocation is logged asynchronously
+    /// (fire-and-forget via `tokio::spawn`).
+    pub fn tool_call_logger(mut self, logger: Arc<dyn ToolCallLogger>) -> Self {
+        self.tool_call_logger = Some(logger);
+        self
+    }
+
     /// Transfer all non-factory fields into a new builder with a different factory type.
     fn with_factory<G>(self, factory: G) -> McpAppBuilder<T, G> {
         McpAppBuilder {
@@ -265,6 +281,7 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
             session_store: self.session_store,
+            tool_call_logger: self.tool_call_logger,
         }
     }
 
@@ -349,6 +366,7 @@ where
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
             session_store: self.session_store,
+            tool_call_logger: self.tool_call_logger,
         })
     }
 
@@ -471,6 +489,7 @@ where
         capability_registry: app.capability_registry,
         capability_filter: app.capability_filter,
         session_store,
+        tool_call_logger: app.tool_call_logger,
     })
     .await
 }
@@ -513,6 +532,7 @@ where
         app.capability_filter,
         token_store,
         session_store,
+        app.tool_call_logger,
     );
     run_stdio(handler).await
 }

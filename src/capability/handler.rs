@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
@@ -6,8 +7,9 @@ use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
+use crate::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
 use crate::auth::TokenStore;
-use crate::session::SessionStore;
+use crate::session::{resolve_session_id, SessionStore};
 
 use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
@@ -124,6 +126,9 @@ fn sanitize_tool_schemas(tools: &mut [Tool]) {
 /// - On `call_tool` / `get_prompt` / `read_resource`, the registry is tried
 ///   first; if the name/uri is not found there, the call falls through to
 ///   the inner handler.
+/// - On `call_tool`, when a [`ToolCallLogger`] is configured, every invocation
+///   is instrumented with timing, session, and outcome data, then logged
+///   asynchronously (fire-and-forget via `tokio::spawn`).
 /// - All other methods are delegated directly to the inner handler.
 ///
 /// Additionally, `TokenStore` and `SessionStore<T>` are injected into
@@ -135,6 +140,7 @@ pub(crate) struct DynamicHandler<S, T: Send + Sync + Default + Clone + 'static> 
     filter: Option<Arc<dyn CapabilityFilter>>,
     token_store: TokenStore,
     session_store: SessionStore<T>,
+    tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
 }
 
 impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
@@ -144,6 +150,7 @@ impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
         filter: Option<Arc<dyn CapabilityFilter>>,
         token_store: TokenStore,
         session_store: SessionStore<T>,
+        tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     ) -> Self {
         Self {
             inner,
@@ -151,6 +158,7 @@ impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
             filter,
             token_store,
             session_store,
+            tool_call_logger,
         }
     }
 
@@ -293,14 +301,59 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
                 ));
             }
 
-            if let Some(result) = self
+            // When a logger is configured, capture state before dispatch
+            let has_logger = self.tool_call_logger.is_some();
+            let tool_name = if has_logger { Some(request.name.to_string()) } else { None };
+            let session_id = if has_logger { Some(resolve_session_id(&context.extensions).to_string()) } else { None };
+            let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
+
+            // Dispatch: try registry first, fall back to inner.
+            // Clone arguments once for registry probe; reuse for audit if needed.
+            let reg_args = request.arguments.clone();
+            let (result, source) = if let Some(reg_result) = self
                 .registry
-                .call_tool(&request.name, request.arguments.clone())
+                .call_tool(&request.name, reg_args.clone())
                 .await
             {
-                return result;
+                (reg_result, ToolCallSource::Registry)
+            } else {
+                (
+                    self.inner.call_tool(request, context).await,
+                    ToolCallSource::Inner,
+                )
+            };
+
+            if let (Some(logger), Some(tool_name), Some(session_id), Some((start_wall, start_instant))) =
+                (self.tool_call_logger.clone(), tool_name, session_id, start)
+            {
+                let duration = start_instant.elapsed();
+                let outcome = match &result {
+                    Ok(call_result) => ToolCallOutcome::Success {
+                        is_error: call_result.is_error.unwrap_or(false),
+                        content_summary: summarize_content(&call_result.content),
+                    },
+                    Err(mcp_err) => ToolCallOutcome::McpError {
+                        code: mcp_err.code.0,
+                        message: mcp_err.message.to_string(),
+                    },
+                };
+
+                let record = ToolCallRecord {
+                    tool_name,
+                    arguments: reg_args,
+                    session_id,
+                    timestamp: start_wall,
+                    duration,
+                    source,
+                    outcome,
+                };
+
+                tokio::spawn(async move {
+                    logger.log(record).await;
+                });
             }
-            self.inner.call_tool(request, context).await
+
+            result
         }
     }
 
@@ -437,6 +490,39 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
         self.enrich_extensions(&mut context.extensions);
         self.inner.on_roots_list_changed(context)
     }
+}
+
+/// Produce a short summary of tool call content for audit logging.
+///
+/// Text is truncated to 256 characters. Binary content is replaced with type
+/// tags (`<image>`, `<audio>`, `<resource>`, `<resource_link>`).
+fn summarize_content(content: &[Content]) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    let mut buf = String::new();
+    for (i, item) in content.iter().enumerate() {
+        if i > 0 {
+            buf.push_str("; ");
+        }
+        match &item.raw {
+            RawContent::Text(tc) => {
+                if tc.text.len() > 256 {
+                    let end = tc.text.floor_char_boundary(256);
+                    buf.push_str(&tc.text[..end]);
+                    buf.push_str("...");
+                } else {
+                    buf.push_str(&tc.text);
+                }
+            }
+            RawContent::Image(_) => buf.push_str("<image>"),
+            RawContent::Resource(_) => buf.push_str("<resource>"),
+            RawContent::Audio(_) => buf.push_str("<audio>"),
+            RawContent::ResourceLink(_) => buf.push_str("<resource_link>"),
+        }
+    }
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -595,5 +681,36 @@ mod tests {
         // $schema and title are stripped for MCP client compatibility
         assert!(!patched.contains_key("$schema"));
         assert!(!patched.contains_key("title"));
+    }
+
+    #[test]
+    fn summarize_content_empty() {
+        assert_eq!(summarize_content(&[]), None);
+    }
+
+    #[test]
+    fn summarize_content_text_truncation() {
+        let long_text = "x".repeat(300);
+        let content = vec![Content::text(long_text)];
+        let summary = summarize_content(&content).unwrap();
+        assert!(summary.len() < 270); // 256 + "..."
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn summarize_content_short_text() {
+        let content = vec![Content::text("hello")];
+        let summary = summarize_content(&content).unwrap();
+        assert_eq!(summary, "hello");
+    }
+
+    #[test]
+    fn summarize_content_mixed() {
+        let content = vec![
+            Content::text("hello"),
+            Content::image("base64data", "image/png"),
+        ];
+        let summary = summarize_content(&content).unwrap();
+        assert_eq!(summary, "hello; <image>");
     }
 }

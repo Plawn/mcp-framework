@@ -48,6 +48,7 @@
 //!   via [`CapabilityRegistry`], with optional per-session filtering via [`CapabilityFilter`]
 //! - **CLI or programmatic config** — built-in CLI args + env vars, or a [`Settings`] struct
 
+pub mod audit;
 pub mod auth;
 pub mod capability;
 pub mod http_util;
@@ -75,6 +76,9 @@ pub mod transport;
 #[derive(Debug, Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct EmptyParams {}
 
+pub use audit::{
+    NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
+};
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter};
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};

@@ -14,6 +14,7 @@ use crate::auth::{
     AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthState, RefreshConfig, TokenStore,
     WellKnownState,
 };
+use crate::audit::ToolCallLogger;
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
 use crate::session::SessionStore;
 
@@ -30,6 +31,8 @@ pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
     /// Session store for typed per-session data.
     pub session_store: SessionStore<T>,
+    /// Optional tool call audit logger.
+    pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
 }
 
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
@@ -154,6 +157,7 @@ where
     let filter = config.capability_filter;
     let token_store_clone = token_store.clone();
     let session_store = config.session_store;
+    let tool_call_logger = config.tool_call_logger;
 
     // Disable SSE priming events (sse_retry: None) for broad client compatibility.
     // rmcp 1.x defaults to sending empty SSE "priming" frames before each response,
@@ -171,6 +175,7 @@ where
                 filter.clone(),
                 token_store_clone.clone(),
                 session_store.clone(),
+                tool_call_logger.clone(),
             ))
         },
         LocalSessionManager::default().into(),

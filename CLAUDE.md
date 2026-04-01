@@ -56,6 +56,76 @@ Key type: `TokenStore` — thread-safe token storage shared between auth middlew
 
 Helper function `resolve_session_id(extensions)` extracts the `mcp-session-id` header from MCP request context extensions, falling back to `"default"` for stdio mode.
 
+### Audit logging (`src/audit/`)
+
+Pluggable tool call audit logging. Every `call_tool` invocation can be logged via a `ToolCallLogger` trait implementation. The framework ships two built-in loggers:
+- `NoopLogger` — discards all records
+- `TracingLogger` — emits structured `tracing::info!` events
+
+Key types:
+- `ToolCallRecord` — captures tool name, arguments (`Option<Map<String, Value>>`), session ID, timestamp (`SystemTime`), duration (`Duration`), dispatch source (registry vs inner handler), and outcome
+- `ToolCallOutcome` — `Success { is_error, content_summary }` or `McpError { code, message }`. `is_error: true` means the tool reported a tool-level error (e.g. bad LLM input) but the MCP protocol call itself succeeded
+- `ToolCallSource` — `Registry` (dynamic tools from `CapabilityRegistry`) or `Inner` (static tools from `ServerHandler`)
+
+Logging is fire-and-forget via `tokio::spawn` — zero impact on tool call latency. When no logger is configured, the hot path has zero overhead (no clones, no allocations).
+
+The interception point is `DynamicHandler::call_tool` in `src/capability/handler.rs`.
+
+#### Using a built-in logger
+
+```rust
+McpAppBuilder::new("my-server")
+    .tool_call_logger(Arc::new(TracingLogger))
+    .server(|| MyServer::new())
+    .run()
+    .await?;
+```
+
+#### Implementing a custom storage backend
+
+Implement the `ToolCallLogger` trait. The `log` method returns `Pin<Box<dyn Future<Output = ()> + Send>>` — this allows async I/O (database writes, HTTP calls). Handle errors internally; the framework cannot act on them since logging is fire-and-forget.
+
+```rust
+use mcp_framework::audit::{ToolCallLogger, ToolCallRecord, ToolCallOutcome};
+use std::future::Future;
+use std::pin::Pin;
+
+struct FileLogger { path: std::path::PathBuf }
+
+impl ToolCallLogger for FileLogger {
+    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            let line = format!(
+                "{} tool={} session={} duration={}ms outcome={}\n",
+                humantime::format_rfc3339(record.timestamp),
+                record.tool_name,
+                record.session_id,
+                record.duration.as_millis(),
+                match &record.outcome {
+                    ToolCallOutcome::Success { is_error, .. } =>
+                        if *is_error { "tool_error" } else { "success" },
+                    ToolCallOutcome::McpError { code, .. } =>
+                        &format!("mcp_error({code})"),
+                },
+            );
+            if let Err(e) = tokio::fs::OpenOptions::new()
+                .create(true).append(true).open(&path).await
+                .and_then(|mut f| {
+                    use tokio::io::AsyncWriteExt;
+                    // write_all requires a mutable borrow in an async block
+                    Box::pin(async move { f.write_all(line.as_bytes()).await })
+                }).await
+            {
+                tracing::warn!("audit log write failed: {e}");
+            }
+        })
+    }
+}
+```
+
+Then wire it via the builder: `.tool_call_logger(Arc::new(FileLogger { path: "audit.log".into() }))`
+
 ### HTTP utilities (`src/http_util/`)
 
 - `HttpError`: unified error type that converts to Axum responses with proper status codes and JSON bodies
