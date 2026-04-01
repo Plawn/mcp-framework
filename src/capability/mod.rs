@@ -10,4 +10,4 @@ mod registry;
 
 pub use filter::{CapabilityFilter, PromptFilter, ResourceFilter, ToolFilter};
 pub use registry::CapabilityRegistry;
-pub(crate) use handler::DynamicHandler;
+pub(crate) use handler::{DynamicHandler, HandlerContext};

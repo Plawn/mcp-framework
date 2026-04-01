@@ -33,21 +33,36 @@ use super::record::{ToolCallOutcome, ToolCallRecord, ToolCallSource};
 /// }
 /// ```
 pub trait ToolCallLogger: Send + Sync + 'static {
-    /// Log a tool call record.
+    /// Log a tool call record asynchronously.
     ///
     /// Called via `tokio::spawn` — must not panic. Errors should be
     /// handled internally.
-    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    ///
+    /// The default implementation delegates to [`log_sync`](Self::log_sync)
+    /// and wraps the result in a ready future, avoiding the `Pin<Box<Future>>`
+    /// allocation for synchronous loggers.
+    ///
+    /// Override this method for async loggers (database, HTTP, etc.).
+    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.log_sync(record);
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Log a tool call record synchronously.
+    ///
+    /// Override this for loggers that do no async I/O (e.g. tracing, stdout).
+    /// The default is a no-op; the default [`log`](Self::log) delegates here,
+    /// so overriding only `log_sync` is sufficient for sync loggers.
+    fn log_sync(&self, _record: ToolCallRecord) {}
 }
 
 /// A no-op logger that discards all records.
+///
+/// Uses the default trait methods — `log_sync` is a no-op by default,
+/// and `log` delegates to it.
 pub struct NoopLogger;
 
-impl ToolCallLogger for NoopLogger {
-    fn log(&self, _record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(std::future::ready(()))
-    }
-}
+impl ToolCallLogger for NoopLogger {}
 
 /// A logger that emits structured `tracing` events at INFO level.
 ///
@@ -56,7 +71,7 @@ impl ToolCallLogger for NoopLogger {
 pub struct TracingLogger;
 
 impl ToolCallLogger for TracingLogger {
-    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn log_sync(&self, record: ToolCallRecord) {
         let source = match record.source {
             ToolCallSource::Registry => "registry",
             ToolCallSource::Inner => "inner",
@@ -83,8 +98,6 @@ impl ToolCallLogger for TracingLogger {
             detail = %detail,
             "tool_call"
         );
-
-        Box::pin(std::future::ready(()))
     }
 }
 

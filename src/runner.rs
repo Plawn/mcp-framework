@@ -7,7 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, StoredToken, TokenStore};
-use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler};
+use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::session::{SessionStore, DEFAULT_SESSION_TTL};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
@@ -529,10 +529,12 @@ where
     let handler = DynamicHandler::new(
         server,
         registry,
-        app.capability_filter,
-        token_store,
-        session_store,
-        app.tool_call_logger,
+        HandlerContext {
+            filter: app.capability_filter,
+            token_store,
+            session_store,
+            tool_call_logger: app.tool_call_logger,
+        },
     );
     run_stdio(handler).await
 }

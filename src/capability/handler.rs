@@ -14,6 +14,26 @@ use crate::session::{resolve_session_id, SessionStore};
 use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
 
+/// Infrastructure concerns shared across transport modes.
+///
+/// Groups the cross-cutting dependencies that `DynamicHandler` needs beyond
+/// the inner `ServerHandler` and the `CapabilityRegistry`.
+pub(crate) struct HandlerContext<T: Send + Sync + Default + Clone + 'static> {
+    pub filter: Option<Arc<dyn CapabilityFilter>>,
+    pub token_store: TokenStore,
+    pub session_store: SessionStore<T>,
+    pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+}
+
+/// Merge `registry` items into `inner`, removing inner items that collide
+/// (registry wins on name/key collision).
+fn merge_registry_items<T>(inner: &mut Vec<T>, registry: Vec<T>, key_eq: fn(&T, &T) -> bool) {
+    for ri in &registry {
+        inner.retain(|item| !key_eq(item, ri));
+    }
+    inner.extend(registry);
+}
+
 /// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object.
 fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
     schema.remove("$schema");
@@ -137,36 +157,23 @@ fn sanitize_tool_schemas(tools: &mut [Tool]) {
 pub(crate) struct DynamicHandler<S, T: Send + Sync + Default + Clone + 'static> {
     inner: S,
     registry: CapabilityRegistry,
-    filter: Option<Arc<dyn CapabilityFilter>>,
-    token_store: TokenStore,
-    session_store: SessionStore<T>,
-    tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    context: HandlerContext<T>,
 }
 
 impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
-    pub fn new(
-        inner: S,
-        registry: CapabilityRegistry,
-        filter: Option<Arc<dyn CapabilityFilter>>,
-        token_store: TokenStore,
-        session_store: SessionStore<T>,
-        tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
-    ) -> Self {
+    pub fn new(inner: S, registry: CapabilityRegistry, context: HandlerContext<T>) -> Self {
         Self {
             inner,
             registry,
-            filter,
-            token_store,
-            session_store,
-            tool_call_logger,
+            context,
         }
     }
 
     /// Insert `TokenStore` and `SessionStore<T>` into the extensions so
     /// handlers can retrieve them via `RequestContextExt`.
     fn enrich_extensions(&self, extensions: &mut Extensions) {
-        extensions.insert(self.token_store.clone());
-        extensions.insert(self.session_store.clone());
+        extensions.insert(self.context.token_store.clone());
+        extensions.insert(self.context.session_store.clone());
     }
 }
 
@@ -196,23 +203,22 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.token_store).await;
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
             let query_filter = resolve_query_filter(&context.extensions);
             let mut inner_result = self.inner.list_tools(request, context).await?;
 
-            // Merge registry tools, registry wins on name collision
-            let registry_tools = self.registry.tools().await;
-            for rt in &registry_tools {
-                let name = rt.name.as_ref();
-                inner_result.tools.retain(|t| t.name.as_ref() != name);
-            }
-            inner_result.tools.extend(registry_tools);
+            // Merge registry tools (registry wins on name collision)
+            merge_registry_items(
+                &mut inner_result.tools,
+                self.registry.tools().await,
+                |a, b| a.name.as_ref() == b.name.as_ref(),
+            );
 
             // Patch schemas missing "type": "object" (e.g. Parameters<serde_json::Value>)
             sanitize_tool_schemas(&mut inner_result.tools);
 
             // Apply trait-based filter
-            if let Some(ref filter) = self.filter {
+            if let Some(ref filter) = self.context.filter {
                 inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
             }
 
@@ -236,16 +242,16 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.token_store).await;
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
             let mut inner_result = self.inner.list_prompts(request, context).await?;
 
-            let registry_prompts = self.registry.prompts().await;
-            for rp in &registry_prompts {
-                inner_result.prompts.retain(|p| p.name != rp.name);
-            }
-            inner_result.prompts.extend(registry_prompts);
+            merge_registry_items(
+                &mut inner_result.prompts,
+                self.registry.prompts().await,
+                |a, b| a.name == b.name,
+            );
 
-            if let Some(ref filter) = self.filter {
+            if let Some(ref filter) = self.context.filter {
                 inner_result.prompts = filter.filter_prompts(inner_result.prompts, token.as_ref());
             }
 
@@ -262,18 +268,16 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.token_store).await;
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
             let mut inner_result = self.inner.list_resources(request, context).await?;
 
-            let registry_resources = self.registry.resources().await;
-            for rr in &registry_resources {
-                inner_result
-                    .resources
-                    .retain(|r| r.raw.uri != rr.raw.uri);
-            }
-            inner_result.resources.extend(registry_resources);
+            merge_registry_items(
+                &mut inner_result.resources,
+                self.registry.resources().await,
+                |a, b| a.raw.uri == b.raw.uri,
+            );
 
-            if let Some(ref filter) = self.filter {
+            if let Some(ref filter) = self.context.filter {
                 inner_result.resources =
                     filter.filter_resources(inner_result.resources, token.as_ref());
             }
@@ -302,7 +306,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             }
 
             // When a logger is configured, capture state before dispatch
-            let has_logger = self.tool_call_logger.is_some();
+            let has_logger = self.context.tool_call_logger.is_some();
             let tool_name = if has_logger { Some(request.name.to_string()) } else { None };
             let session_id = if has_logger { Some(resolve_session_id(&context.extensions).to_string()) } else { None };
             let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
@@ -324,7 +328,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             };
 
             if let (Some(logger), Some(tool_name), Some(session_id), Some((start_wall, start_instant))) =
-                (self.tool_call_logger.clone(), tool_name, session_id, start)
+                (self.context.tool_call_logger.clone(), tool_name, session_id, start)
             {
                 let duration = start_instant.elapsed();
                 let outcome = match &result {
@@ -348,8 +352,14 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
                     outcome,
                 };
 
+                // Observe the JoinHandle so logger panics are reported
+                // instead of silently swallowed.
                 tokio::spawn(async move {
-                    logger.log(record).await;
+                    if let Err(e) = tokio::spawn(async move {
+                        logger.log(record).await;
+                    }).await {
+                        tracing::error!("audit logger panicked: {e}");
+                    }
                 });
             }
 
