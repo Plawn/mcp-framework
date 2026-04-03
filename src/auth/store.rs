@@ -1,15 +1,23 @@
+use std::any::Any;
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 use tokio::sync::RwLock;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use reqwest::Client as HttpClient;
 use tokio::sync::Mutex as TokioMutex;
 
-/// A stored OAuth token with expiry tracking
-#[derive(Clone, Debug)]
+/// A stored OAuth token with expiry tracking and optional decoded claims.
+///
+/// When a [`ClaimsDecoder`](TokenStore::with_claims_decoder) is configured on the
+/// `TokenStore`, claims are decoded automatically during [`store_token`](TokenStore::store_token)
+/// and attached to the `decoded_claims` field. Access them with [`claims::<C>()`](StoredToken::claims).
+#[derive(Clone)]
 pub struct StoredToken {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<Instant>,
+    /// Decoded claims from the access token, populated by the global claims decoder.
+    /// Use [`claims::<C>()`](Self::claims) to access them.
+    pub(crate) decoded_claims: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl StoredToken {
@@ -20,7 +28,16 @@ impl StoredToken {
             access_token: response.access_token().secret().clone(),
             refresh_token: response.refresh_token().map(|t| t.secret().clone()),
             expires_at,
+            decoded_claims: None,
         }
+    }
+
+    /// Downcast the decoded claims to the expected type.
+    ///
+    /// Returns `None` if no claims decoder was configured, if the token could
+    /// not be decoded, or if `C` does not match the type produced by the decoder.
+    pub fn claims<C: 'static>(&self) -> Option<&C> {
+        self.decoded_claims.as_ref()?.downcast_ref::<C>()
     }
 
     /// Check if the token is expired (with 30 second buffer)
@@ -29,6 +46,17 @@ impl StoredToken {
             Some(expires_at) => Instant::now() + Duration::from_secs(30) > expires_at,
             None => false, // No expiry means it doesn't expire
         }
+    }
+}
+
+impl std::fmt::Debug for StoredToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredToken")
+            .field("access_token", &"[redacted]")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[redacted]"))
+            .field("expires_at", &self.expires_at)
+            .field("has_decoded_claims", &self.decoded_claims.is_some())
+            .finish()
     }
 }
 
@@ -54,6 +82,9 @@ pub struct RefreshConfig {
     pub token_url: String,
 }
 
+/// Type-erased claims decoder function.
+pub type ClaimsDecoderFn = Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>;
+
 /// Token store for managing OAuth tokens per session
 #[derive(Clone)]
 pub struct TokenStore {
@@ -67,6 +98,8 @@ pub struct TokenStore {
     refresh_config: Arc<RwLock<Option<RefreshConfig>>>,
     /// Per-session mutex to prevent concurrent refreshes (thundering herd)
     refresh_locks: Arc<RwLock<HashMap<String, Arc<TokioMutex<()>>>>>,
+    /// Global claims decoder applied during `store_token`.
+    pub(crate) claims_decoder: Option<ClaimsDecoderFn>,
 }
 
 impl TokenStore {
@@ -77,6 +110,7 @@ impl TokenStore {
             http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(None)),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
+            claims_decoder: None,
         }
     }
 
@@ -88,7 +122,35 @@ impl TokenStore {
             http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(Some(config))),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
+            claims_decoder: None,
         }
+    }
+
+    /// Configure a global claims decoder.
+    ///
+    /// The decoder is called automatically during [`store_token`](Self::store_token)
+    /// and the result is attached to [`StoredToken::decoded_claims`]. Access the
+    /// decoded claims via [`StoredToken::claims::<C>()`](StoredToken::claims).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// #[derive(Debug, Clone)]
+    /// struct MyClaims { roles: Vec<String> }
+    ///
+    /// let store = TokenStore::new().with_claims_decoder(|token: &str| -> Option<MyClaims> {
+    ///     let payload = base64_decode(token.split('.').nth(1)?)?;
+    ///     serde_json::from_slice(&payload).ok()
+    /// });
+    /// ```
+    pub fn with_claims_decoder<C: Any + Send + Sync + 'static>(
+        mut self,
+        decoder: impl Fn(&str) -> Option<C> + Send + Sync + 'static,
+    ) -> Self {
+        self.claims_decoder = Some(Arc::new(move |token: &str| {
+            decoder(token).map(|c| Arc::new(c) as Arc<dyn Any + Send + Sync>)
+        }));
+        self
     }
 
     /// Get or create a per-session refresh lock
@@ -169,14 +231,16 @@ impl TokenStore {
             access_token,
             refresh_token: new_refresh_token.or(Some(refresh_token)), // Keep old refresh token if not rotated
             expires_at,
+            decoded_claims: None, // re-decoded by store_token via claims_decoder
         };
 
-        // Store the refreshed token
-        self.store_token(session_id.to_string(), new_token.clone()).await;
+        // Store the refreshed token (store_token applies the claims decoder)
+        self.store_token(session_id.to_string(), new_token).await;
 
         tracing::info!("Token refreshed successfully for session {}", session_id);
 
-        Ok(new_token)
+        // Return the stored version which has decoded claims applied
+        Ok(self.get_token_raw(session_id).await.expect("just stored"))
     }
 
     /// Store a pending authorization (before redirect to Keycloak)
@@ -198,8 +262,15 @@ impl TokenStore {
         pending.remove(state)
     }
 
-    /// Store a token for a session
-    pub async fn store_token(&self, session_id: String, token: StoredToken) {
+    /// Store a token for a session.
+    ///
+    /// If a [claims decoder](Self::with_claims_decoder) is configured, it is
+    /// applied automatically and the result is stored in
+    /// [`StoredToken::decoded_claims`].
+    pub async fn store_token(&self, session_id: String, mut token: StoredToken) {
+        if let Some(ref decoder) = self.claims_decoder {
+            token.decoded_claims = (decoder)(&token.access_token);
+        }
         let mut tokens = self.tokens.write().await;
         tokens.insert(session_id, token);
     }
@@ -318,35 +389,30 @@ impl Default for TokenStore {
 mod tests {
     use super::*;
 
+    fn test_token(access_token: &str, refresh_token: Option<&str>, expires_at: Option<Instant>) -> StoredToken {
+        StoredToken {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(|s| s.to_string()),
+            expires_at,
+            decoded_claims: None,
+        }
+    }
+
     #[test]
     fn test_token_expiry_buffer_expired() {
-        // Token that expires in 29 seconds (within the 30s buffer) → expired
-        let token = StoredToken {
-            access_token: "test".to_string(),
-            refresh_token: None,
-            expires_at: Some(Instant::now() + Duration::from_secs(29)),
-        };
+        let token = test_token("test", None, Some(Instant::now() + Duration::from_secs(29)));
         assert!(token.is_expired());
     }
 
     #[test]
     fn test_token_expiry_buffer_valid() {
-        // Token that expires in 31 seconds (outside the 30s buffer) → valid
-        let token = StoredToken {
-            access_token: "test".to_string(),
-            refresh_token: None,
-            expires_at: Some(Instant::now() + Duration::from_secs(31)),
-        };
+        let token = test_token("test", None, Some(Instant::now() + Duration::from_secs(31)));
         assert!(!token.is_expired());
     }
 
     #[test]
     fn test_token_no_expiry_never_expires() {
-        let token = StoredToken {
-            access_token: "test".to_string(),
-            refresh_token: None,
-            expires_at: None,
-        };
+        let token = test_token("test", None, None);
         assert!(!token.is_expired());
     }
 
@@ -361,11 +427,7 @@ mod tests {
         });
 
         // Store an expired token with a refresh_token
-        let expired_token = StoredToken {
-            access_token: "old_access".to_string(),
-            refresh_token: Some("refresh_tok".to_string()),
-            expires_at: Some(Instant::now() - Duration::from_secs(60)),
-        };
+        let expired_token = test_token("old_access", Some("refresh_tok"), Some(Instant::now() - Duration::from_secs(60)));
         store.store_token("session1".to_string(), expired_token).await;
 
         // get_token should return None because refresh fails and token is expired
@@ -388,11 +450,7 @@ mod tests {
         });
 
         // Store an expired token
-        let expired_token = StoredToken {
-            access_token: "old".to_string(),
-            refresh_token: Some("refresh".to_string()),
-            expires_at: Some(Instant::now() - Duration::from_secs(60)),
-        };
+        let expired_token = test_token("old", Some("refresh"), Some(Instant::now() - Duration::from_secs(60)));
         store.store_token("s1".to_string(), expired_token).await;
 
         let store1 = store.clone();
@@ -423,11 +481,7 @@ mod tests {
     #[tokio::test]
     async fn test_valid_token_returned_directly() {
         let store = TokenStore::new();
-        let token = StoredToken {
-            access_token: "valid".to_string(),
-            refresh_token: None,
-            expires_at: Some(Instant::now() + Duration::from_secs(3600)),
-        };
+        let token = test_token("valid", None, Some(Instant::now() + Duration::from_secs(3600)));
         store.store_token("s1".to_string(), token).await;
 
         let result = store.get_token("s1").await;
@@ -438,11 +492,7 @@ mod tests {
     #[tokio::test]
     async fn test_expired_token_no_refresh_config_returns_none() {
         let store = TokenStore::new(); // No refresh config
-        let token = StoredToken {
-            access_token: "expired".to_string(),
-            refresh_token: Some("refresh".to_string()),
-            expires_at: Some(Instant::now() - Duration::from_secs(60)),
-        };
+        let token = test_token("expired", Some("refresh"), Some(Instant::now() - Duration::from_secs(60)));
         store.store_token("s1".to_string(), token).await;
 
         let result = store.get_token("s1").await;
@@ -452,11 +502,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_token_cleans_refresh_lock() {
         let store = TokenStore::new();
-        let token = StoredToken {
-            access_token: "test".to_string(),
-            refresh_token: None,
-            expires_at: None,
-        };
+        let token = test_token("test", None, None);
         store.store_token("s1".to_string(), token).await;
 
         // Create a refresh lock entry
@@ -474,22 +520,14 @@ mod tests {
         let store = TokenStore::new();
 
         // Store an expired token
-        let expired = StoredToken {
-            access_token: "old".to_string(),
-            refresh_token: None,
-            expires_at: Some(Instant::now() - Duration::from_secs(60)),
-        };
+        let expired = test_token("old", None, Some(Instant::now() - Duration::from_secs(60)));
         store.store_token("expired-sess".to_string(), expired).await;
 
         // Create a refresh lock for it
         let _lock = store.get_refresh_lock("expired-sess").await;
 
         // Store a valid token
-        let valid = StoredToken {
-            access_token: "fresh".to_string(),
-            refresh_token: None,
-            expires_at: Some(Instant::now() + Duration::from_secs(3600)),
-        };
+        let valid = test_token("fresh", None, Some(Instant::now() + Duration::from_secs(3600)));
         store.store_token("valid-sess".to_string(), valid).await;
 
         store.purge_expired().await;
@@ -507,14 +545,60 @@ mod tests {
         let store = TokenStore::new();
 
         // Token with no expiry (never expires) should be kept
-        let token = StoredToken {
-            access_token: "eternal".to_string(),
-            refresh_token: None,
-            expires_at: None,
-        };
+        let token = test_token("eternal", None, None);
         store.store_token("s1".to_string(), token).await;
 
         store.purge_expired().await;
         assert!(store.get_token_raw("s1").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_claims_decoder_applied_on_store() {
+        #[derive(Debug)]
+        struct Claims { role: String }
+
+        let store = TokenStore::new().with_claims_decoder(|token: &str| -> Option<Claims> {
+            if token == "admin-jwt" {
+                Some(Claims { role: "admin".into() })
+            } else {
+                None
+            }
+        });
+
+        // Token that the decoder recognizes
+        store.store_token("s1".to_string(), test_token("admin-jwt", None, None)).await;
+        let stored = store.get_token_raw("s1").await.unwrap();
+        let claims = stored.claims::<Claims>().expect("should have decoded claims");
+        assert_eq!(claims.role, "admin");
+
+        // Token that the decoder does not recognize
+        store.store_token("s2".to_string(), test_token("unknown", None, None)).await;
+        let stored = store.get_token_raw("s2").await.unwrap();
+        assert!(stored.claims::<Claims>().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_no_decoder_leaves_claims_none() {
+        let store = TokenStore::new(); // no decoder
+        store.store_token("s1".to_string(), test_token("any", None, None)).await;
+        let stored = store.get_token_raw("s1").await.unwrap();
+        assert!(stored.decoded_claims.is_none());
+    }
+
+    #[test]
+    fn test_claims_wrong_type_returns_none() {
+        #[derive(Debug)]
+        struct A;
+        #[derive(Debug)]
+        struct B;
+
+        let token = StoredToken {
+            access_token: "x".into(),
+            refresh_token: None,
+            expires_at: None,
+            decoded_claims: Some(Arc::new(A)),
+        };
+        assert!(token.claims::<A>().is_some());
+        assert!(token.claims::<B>().is_none());
     }
 }

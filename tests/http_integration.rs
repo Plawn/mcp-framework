@@ -160,6 +160,8 @@ async fn start_server() -> std::net::SocketAddr {
         app_name: "http-test".to_string(),
         capability_registry: None,
         capability_filter: None,
+        access_validator: None,
+        claims_decoder: None,
         session_store: SessionStore::default(),
         tool_call_logger: None,
     };

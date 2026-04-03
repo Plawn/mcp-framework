@@ -15,7 +15,7 @@ use crate::auth::{
     WellKnownState,
 };
 use crate::audit::ToolCallLogger;
-use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
+use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::session::SessionStore;
 
 /// Configuration for building the HTTP app
@@ -29,6 +29,10 @@ pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub capability_registry: Option<CapabilityRegistry>,
     /// Optional capability filter for per-session visibility.
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
+    /// Optional access validator for pre-execution authorization.
+    pub access_validator: Option<Arc<dyn AccessValidator>>,
+    /// Optional global claims decoder.
+    pub claims_decoder: Option<crate::auth::ClaimsDecoderFn>,
     /// Session store for typed per-session data.
     pub session_store: SessionStore<T>,
     /// Optional tool call audit logger.
@@ -82,7 +86,7 @@ where
     T: Send + Sync + Default + Clone + 'static,
 {
     // Create token store based on auth mode
-    let token_store = match &config.auth {
+    let mut token_store = match &config.auth {
         AuthProvider::OAuth(oauth_config) => {
             let refresh_config = RefreshConfig {
                 client_id: oauth_config.client_id.clone(),
@@ -96,6 +100,11 @@ where
         }
         _ => TokenStore::new(),
     };
+
+    // Apply global claims decoder if configured
+    if let Some(decoder) = config.claims_decoder {
+        token_store.claims_decoder = Some(decoder);
+    }
 
     // Start building the router
     let mut app = Router::new();
@@ -155,6 +164,7 @@ where
     let factory = config.server_factory;
     let registry = config.capability_registry.unwrap_or_default();
     let filter = config.capability_filter;
+    let access_validator = config.access_validator;
     let token_store_clone = token_store.clone();
     let session_store = config.session_store;
     let tool_call_logger = config.tool_call_logger;
@@ -174,6 +184,7 @@ where
                 registry.clone(),
                 HandlerContext {
                     filter: filter.clone(),
+                    access_validator: access_validator.clone(),
                     token_store: token_store_clone.clone(),
                     session_store: session_store.clone(),
                     tool_call_logger: tool_call_logger.clone(),

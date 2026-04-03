@@ -5,9 +5,11 @@ use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use std::any::Any;
+
 use crate::audit::ToolCallLogger;
-use crate::auth::{AuthProvider, StoredToken, TokenStore};
-use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
+use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
+use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::session::{SessionStore, DEFAULT_SESSION_TTL};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
@@ -96,6 +98,10 @@ where
     pub capability_registry: Option<CapabilityRegistry>,
     /// Optional filter to control which capabilities are visible per session.
     pub capability_filter: Option<Arc<dyn CapabilityFilter>>,
+    /// Optional access validator for pre-execution authorization checks.
+    pub access_validator: Option<Arc<dyn AccessValidator>>,
+    /// Optional global claims decoder. Applied by the `TokenStore` during `store_token`.
+    pub claims_decoder: Option<ClaimsDecoderFn>,
     /// Optional session store. When `None`, a default store is created automatically.
     pub session_store: Option<SessionStore<T>>,
     /// Optional tool call audit logger.
@@ -126,6 +132,8 @@ where
             settings: None,
             capability_registry: None,
             capability_filter: None,
+            access_validator: None,
+            claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
         }
@@ -164,6 +172,8 @@ pub struct McpAppBuilder<T: Send + Sync + Default + Clone + 'static = (), F = ()
     settings: Option<Settings>,
     capability_registry: Option<CapabilityRegistry>,
     capability_filter: Option<Arc<dyn CapabilityFilter>>,
+    access_validator: Option<Arc<dyn AccessValidator>>,
+    claims_decoder: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>>,
     session_store: Option<SessionStore<T>>,
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
 }
@@ -189,6 +199,8 @@ impl McpAppBuilder<()> {
             settings: None,
             capability_registry: None,
             capability_filter: None,
+            access_validator: None,
+            claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
         }
@@ -217,6 +229,8 @@ impl<F> McpAppBuilder<(), F> {
             settings: self.settings,
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
+            access_validator: self.access_validator,
+            claims_decoder: self.claims_decoder,
             session_store: None,
             tool_call_logger: self.tool_call_logger,
         }
@@ -261,6 +275,33 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Set the access validator for pre-execution authorization checks.
+    ///
+    /// When set, every `call_tool`, `get_prompt`, and `read_resource` request
+    /// is validated before dispatch. Denied requests return an MCP error.
+    pub fn access_validator(mut self, validator: Arc<dyn AccessValidator>) -> Self {
+        self.access_validator = Some(validator);
+        self
+    }
+
+    /// Set the global claims decoder.
+    ///
+    /// The decoder is called automatically during
+    /// [`TokenStore::store_token`](crate::auth::TokenStore::store_token) and the
+    /// result is attached to [`StoredToken::decoded_claims`](crate::auth::StoredToken::decoded_claims).
+    /// Access decoded claims via [`StoredToken::claims::<C>()`](crate::auth::StoredToken::claims).
+    ///
+    /// The decoder is shared between all features that access tokens (filters, validators, handlers).
+    pub fn claims_decoder<C: Any + Send + Sync + 'static>(
+        mut self,
+        decoder: impl Fn(&str) -> Option<C> + Send + Sync + 'static,
+    ) -> Self {
+        self.claims_decoder = Some(Arc::new(move |token: &str| {
+            decoder(token).map(|c| Arc::new(c) as Arc<dyn Any + Send + Sync>)
+        }));
+        self
+    }
+
     /// Set the tool call audit logger.
     ///
     /// When set, every `call_tool` invocation is logged asynchronously
@@ -280,6 +321,8 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
             settings: self.settings,
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
+            access_validator: self.access_validator,
+            claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
         }
@@ -365,6 +408,8 @@ where
             settings: self.settings,
             capability_registry: self.capability_registry,
             capability_filter: self.capability_filter,
+            access_validator: self.access_validator,
+            claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
         })
@@ -488,6 +533,8 @@ where
         app_name: app.name.clone(),
         capability_registry: app.capability_registry,
         capability_filter: app.capability_filter,
+        access_validator: app.access_validator,
+        claims_decoder: app.claims_decoder,
         session_store,
         tool_call_logger: app.tool_call_logger,
     })
@@ -500,7 +547,10 @@ where
     S: ServerHandler + Send + 'static,
     T: Send + Sync + Default + Clone + 'static,
 {
-    let token_store = TokenStore::new();
+    let mut token_store = TokenStore::new();
+    if let Some(decoder) = app.claims_decoder {
+        token_store.claims_decoder = Some(decoder);
+    }
     let session_store = resolve_session_store(&app.session_store, &app.settings);
 
     if let Some(ref env_var) = app.stdio_token_env {
@@ -512,6 +562,7 @@ where
                         access_token: t,
                         refresh_token: None,
                         expires_at: None,
+                        decoded_claims: None,
                     },
                 )
                 .await;
@@ -531,6 +582,7 @@ where
         registry,
         HandlerContext {
             filter: app.capability_filter,
+            access_validator: app.access_validator,
             token_store,
             session_store,
             tool_call_logger: app.tool_call_logger,

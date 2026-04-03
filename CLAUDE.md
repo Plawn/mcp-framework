@@ -126,6 +126,58 @@ impl ToolCallLogger for FileLogger {
 
 Then wire it via the builder: `.tool_call_logger(Arc::new(FileLogger { path: "audit.log".into() }))`
 
+### Access validation (`src/capability/validator.rs`)
+
+Pre-execution authorization for tool calls, prompt access, and resource reads. Unlike `CapabilityFilter` which controls **visibility** (what clients can *see*), `AccessValidator` controls **execution** (what clients can *do*). A tool hidden by the filter can still be called directly if the client knows its name — the access validator closes that gap.
+
+Key types:
+- `AccessDecision` — `Allow` or `Deny(reason)`
+- `AccessValidator` trait — three async methods with default `Allow` implementations: `validate_tool_call`, `validate_prompt_access`, `validate_resource_access`
+- `ToolCallValidator<F>` — convenience wrapper for a closure that validates only tool calls
+
+The interception point is `DynamicHandler::call_tool` / `get_prompt` / `read_resource` in `src/capability/handler.rs`, before dispatch to the registry or inner handler.
+
+#### Global claims decoder
+
+A claims decoder can be configured once on the `TokenStore` (or via `McpAppBuilder::claims_decoder`). It decodes the JWT access token into a typed struct and caches the result in `StoredToken::decoded_claims`. Every component that touches a token — filters, validators, handlers — can access the decoded claims via `token.claims::<C>()`.
+
+The decoder is applied automatically during `TokenStore::store_token`, including after token refresh.
+
+#### Using access validation with JWT roles
+
+```rust
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Claims { roles: Vec<String> }
+
+fn decode_jwt(token: &str) -> Option<Claims> {
+    let payload = base64::decode(token.split('.').nth(1)?).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+fn is_admin(token: Option<&StoredToken>) -> bool {
+    token.and_then(|t| t.claims::<Claims>())
+        .map_or(false, |c| c.roles.contains(&"admin".into()))
+}
+
+McpAppBuilder::new("my-server")
+    .claims_decoder(decode_jwt)                            // global, defined ONCE
+    .capability_filter(Arc::new(ToolFilter(|tools, token| {
+        if is_admin(token) { tools } else {
+            tools.into_iter().filter(|t| !t.name.starts_with("admin_")).collect()
+        }
+    })))
+    .access_validator(Arc::new(ToolCallValidator(|name, _args, token, _session| {
+        if name.starts_with("admin_") && !is_admin(token) {
+            AccessDecision::Deny("admin role required".into())
+        } else {
+            AccessDecision::Allow
+        }
+    })))
+    .server(|| MyServer::new())
+    .run()
+    .await?;
+```
+
 ### HTTP utilities (`src/http_util/`)
 
 - `HttpError`: unified error type that converts to Axum responses with proper status codes and JSON bodies

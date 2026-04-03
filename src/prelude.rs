@@ -9,7 +9,8 @@ pub use crate::audit::{
 };
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use crate::capability::{
-    CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter,
+    AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
+    ResourceFilter, ToolCallValidator, ToolFilter,
 };
 pub use crate::runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
 pub use crate::session::{RequestContextExt, Session, SessionStore};

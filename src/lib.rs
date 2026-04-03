@@ -34,7 +34,10 @@
 //!         settings: None,
 //!         capability_registry: None,
 //!         capability_filter: None,
+//!         access_validator: None,
+//!         claims_decoder: None,
 //!         session_store: None,
+//!         tool_call_logger: None,
 //!     }).await
 //! }
 //! ```
@@ -80,6 +83,9 @@ pub use audit::{
     NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
 };
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
-pub use capability::{CapabilityFilter, CapabilityRegistry, PromptFilter, ResourceFilter, ToolFilter};
+pub use capability::{
+    AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
+    ResourceFilter, ToolCallValidator, ToolFilter,
+};
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
 pub use session::{resolve_session_id, RequestContextExt, Session, SessionStore};

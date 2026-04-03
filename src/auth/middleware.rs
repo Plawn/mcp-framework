@@ -85,6 +85,7 @@ pub async fn bearer_auth_middleware(
         access_token: token.clone(),
         refresh_token: None,
         expires_at: None, // We don't know expiry from the bearer token alone
+        decoded_claims: None, // decoded by TokenStore::store_token if a claims_decoder is set
     };
 
     state.token_store.store_token(session_id, stored_token).await;
@@ -197,6 +198,7 @@ pub async fn basic_auth_middleware(
         access_token: password.clone(),
         refresh_token: None,
         expires_at: None,
+        decoded_claims: None,
     };
 
     state.token_store.store_token(session_id, stored_token).await;

@@ -15,7 +15,7 @@ pub use metadata::{
     authorization_server_metadata_handler, protected_resource_metadata_handler, WellKnownState,
 };
 pub use routes::{oauth_router, OAuthState};
-pub use store::{RefreshConfig, StoredToken, TokenStore};
+pub use store::{ClaimsDecoderFn, RefreshConfig, StoredToken, TokenStore};
 
 // Re-export middleware
 #[allow(unused_imports)]

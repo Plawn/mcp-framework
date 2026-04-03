@@ -13,6 +13,7 @@ use crate::session::{resolve_session_id, SessionStore};
 
 use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
+use super::validator::{AccessDecision, AccessValidator};
 
 /// Infrastructure concerns shared across transport modes.
 ///
@@ -20,6 +21,7 @@ use super::registry::CapabilityRegistry;
 /// the inner `ServerHandler` and the `CapabilityRegistry`.
 pub(crate) struct HandlerContext<T: Send + Sync + Default + Clone + 'static> {
     pub filter: Option<Arc<dyn CapabilityFilter>>,
+    pub access_validator: Option<Arc<dyn AccessValidator>>,
     pub token_store: TokenStore,
     pub session_store: SessionStore<T>,
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
@@ -296,6 +298,26 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
         async move {
             self.enrich_extensions(&mut context.extensions);
 
+            // Access validation (authorization check before execution)
+            if let Some(ref validator) = self.context.access_validator {
+                let token = resolve_token(&context.extensions, &self.context.token_store).await;
+                let session_id = resolve_session_id(&context.extensions);
+                let decision = validator
+                    .validate_tool_call(
+                        request.name.as_ref(),
+                        request.arguments.as_ref(),
+                        token.as_ref(),
+                        session_id,
+                    )
+                    .await;
+                if let AccessDecision::Deny(reason) = decision {
+                    return Err(McpError::invalid_request(
+                        format!("Access denied for tool '{}': {}", request.name, reason),
+                        None,
+                    ));
+                }
+            }
+
             // Reject tools excluded by URL query filter
             let query_filter = resolve_query_filter(&context.extensions);
             if query_filter.contains(request.name.as_ref()) {
@@ -376,6 +398,26 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
+
+            if let Some(ref validator) = self.context.access_validator {
+                let token = resolve_token(&context.extensions, &self.context.token_store).await;
+                let session_id = resolve_session_id(&context.extensions);
+                let decision = validator
+                    .validate_prompt_access(
+                        &request.name,
+                        request.arguments.as_ref(),
+                        token.as_ref(),
+                        session_id,
+                    )
+                    .await;
+                if let AccessDecision::Deny(reason) = decision {
+                    return Err(McpError::invalid_request(
+                        format!("Access denied for prompt '{}': {}", request.name, reason),
+                        None,
+                    ));
+                }
+            }
+
             if let Some(result) = self.registry.get_prompt(&request).await {
                 return result;
             }
@@ -392,6 +434,25 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
             self.enrich_extensions(&mut context.extensions);
+
+            if let Some(ref validator) = self.context.access_validator {
+                let token = resolve_token(&context.extensions, &self.context.token_store).await;
+                let session_id = resolve_session_id(&context.extensions);
+                let decision = validator
+                    .validate_resource_access(
+                        &request.uri,
+                        token.as_ref(),
+                        session_id,
+                    )
+                    .await;
+                if let AccessDecision::Deny(reason) = decision {
+                    return Err(McpError::invalid_request(
+                        format!("Access denied for resource '{}': {}", request.uri, reason),
+                        None,
+                    ));
+                }
+            }
+
             if let Some(result) = self.registry.read_resource(&request).await {
                 return result;
             }

@@ -252,6 +252,7 @@ mod tests {
                     access_token: "tok".to_string(),
                     refresh_token: None,
                     expires_at: None,
+                    decoded_claims: None,
                 },
             )
             .await;
@@ -347,6 +348,7 @@ mod tests {
                     access_token: "default-tok".to_string(),
                     refresh_token: None,
                     expires_at: None,
+                    decoded_claims: None,
                 },
             )
             .await;

@@ -210,6 +210,7 @@ pub async fn token_handler(
                                     access_token: access_token.to_string(),
                                     refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
                                     expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
+                                    decoded_claims: None,
                                 };
                                 // Use the real session ID from request headers, fallback to "default"
                                 let session_key = headers

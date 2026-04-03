@@ -3,11 +3,14 @@
 //! Use [`CapabilityRegistry`] to add or remove tools, prompts, and resources at runtime.
 //! Use [`CapabilityFilter`] to control which capabilities are visible per session
 //! (e.g., based on the authenticated user's token or role).
+//! Use [`AccessValidator`] to control which capabilities can be *executed* per session.
 
 mod filter;
 mod handler;
 mod registry;
+mod validator;
 
 pub use filter::{CapabilityFilter, PromptFilter, ResourceFilter, ToolFilter};
 pub use registry::CapabilityRegistry;
+pub use validator::{AccessDecision, AccessValidator, ToolCallValidator};
 pub(crate) use handler::{DynamicHandler, HandlerContext};
