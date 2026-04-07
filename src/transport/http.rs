@@ -37,6 +37,16 @@ pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub session_store: SessionStore<T>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Extra routes merged into the auth-wrapped MCP router.
+    ///
+    /// Routes registered here sit inside the same `AuthProvider` middleware as
+    /// the MCP fallback, so consumers can expose REST endpoints that share the
+    /// OAuth / Basic auth story with `/mcp` without wiring a second middleware.
+    /// OAuth discovery (`/.well-known/*`) and `/oauth/*` routes remain outside
+    /// this layer and stay publicly accessible.
+    ///
+    /// Avoid registering `/mcp` here — it will silently shadow the MCP fallback.
+    pub extra_routes: Option<Router>,
 }
 
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
@@ -196,7 +206,10 @@ where
     );
 
     let mcp_router = {
-        let base = Router::new().fallback_service(mcp_service);
+        let base = config
+            .extra_routes
+            .unwrap_or_default()
+            .fallback_service(mcp_service);
         wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
     };
 

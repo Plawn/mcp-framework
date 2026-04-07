@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -106,6 +107,10 @@ where
     pub session_store: Option<SessionStore<T>>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Extra axum routes merged into the auth-wrapped MCP router.
+    ///
+    /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
+    pub extra_routes: Option<Router>,
 }
 
 impl<F, T> McpApp<F, T>
@@ -136,6 +141,7 @@ where
             claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
+            extra_routes: None,
         }
     }
 }
@@ -176,6 +182,7 @@ pub struct McpAppBuilder<T: Send + Sync + Default + Clone + 'static = (), F = ()
     claims_decoder: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>>,
     session_store: Option<SessionStore<T>>,
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    extra_routes: Option<Router>,
 }
 
 impl McpAppBuilder<()> {
@@ -203,6 +210,7 @@ impl McpAppBuilder<()> {
             claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
+            extra_routes: None,
         }
     }
 }
@@ -233,6 +241,7 @@ impl<F> McpAppBuilder<(), F> {
             claims_decoder: self.claims_decoder,
             session_store: None,
             tool_call_logger: self.tool_call_logger,
+            extra_routes: self.extra_routes,
         }
     }
 }
@@ -311,6 +320,33 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Register additional axum routes that live inside the auth-wrapped MCP router.
+    ///
+    /// Use this to expose REST endpoints (or any non-MCP HTTP surface) that share
+    /// the same `AuthProvider` middleware as `/mcp`. Routes merged here take
+    /// priority over the MCP fallback, so path collisions resolve in the user's
+    /// favor. OAuth discovery (`/.well-known/*`) and `/oauth/*` stay publicly
+    /// accessible — they are registered on the outer app before the fallback.
+    ///
+    /// Stdio mode ignores this field (no HTTP surface).
+    ///
+    /// ```rust,ignore
+    /// use axum::{routing::get, Router};
+    ///
+    /// let api = Router::new().route("/api/tools", get(list_tools));
+    ///
+    /// McpAppBuilder::new("my-server")
+    ///     .auth(AuthProvider::OAuth(oauth_config))
+    ///     .extra_routes(api)
+    ///     .server(|| MyServer::new())
+    ///     .run()
+    ///     .await?;
+    /// ```
+    pub fn extra_routes(mut self, routes: Router) -> Self {
+        self.extra_routes = Some(routes);
+        self
+    }
+
     /// Transfer all non-factory fields into a new builder with a different factory type.
     fn with_factory<G>(self, factory: G) -> McpAppBuilder<T, G> {
         McpAppBuilder {
@@ -325,6 +361,7 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
             claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
+            extra_routes: self.extra_routes,
         }
     }
 
@@ -412,6 +449,7 @@ where
             claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
+            extra_routes: self.extra_routes,
         })
     }
 
@@ -537,6 +575,7 @@ where
         claims_decoder: app.claims_decoder,
         session_store,
         tool_call_logger: app.tool_call_logger,
+        extra_routes: app.extra_routes,
     })
     .await
 }
