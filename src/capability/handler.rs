@@ -317,7 +317,19 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
         async move {
             self.enrich_extensions(&mut context.extensions);
             self.registry.register_peer(context.peer.clone()).await;
-            self.inner.initialize(request, context).await
+            let mut result = self.inner.initialize(request, context).await?;
+
+            if result.capabilities.tools.is_none() && self.registry.has_tools().await {
+                result.capabilities.tools = Some(ToolsCapability::default());
+            }
+            if result.capabilities.prompts.is_none() && self.registry.has_prompts().await {
+                result.capabilities.prompts = Some(PromptsCapability::default());
+            }
+            if result.capabilities.resources.is_none() && self.registry.has_resources().await {
+                result.capabilities.resources = Some(ResourcesCapability::default());
+            }
+
+            Ok(result)
         }
     }
 

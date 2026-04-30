@@ -169,6 +169,21 @@ impl CapabilityRegistry {
             .collect()
     }
 
+    /// Returns `true` if the registry has any tools registered.
+    pub(crate) async fn has_tools(&self) -> bool {
+        !self.tools.read().await.is_empty()
+    }
+
+    /// Returns `true` if the registry has any prompts registered.
+    pub(crate) async fn has_prompts(&self) -> bool {
+        !self.prompts.read().await.is_empty()
+    }
+
+    /// Returns `true` if the registry has any resources registered.
+    pub(crate) async fn has_resources(&self) -> bool {
+        !self.resources.read().await.is_empty()
+    }
+
     // ── Internal: peer management ────────────────────────────────────
 
     /// Register a connected peer so it receives list-changed notifications.
