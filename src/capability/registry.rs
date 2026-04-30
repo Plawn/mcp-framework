@@ -8,6 +8,7 @@ use rmcp::model::{
     ReadResourceRequestParams, ReadResourceResult, Resource, Tool,
 };
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 /// Type-erased async handler for a dynamic tool.
@@ -175,13 +176,47 @@ impl CapabilityRegistry {
         self.peers.write().await.push(peer);
     }
 
+    // ── Public: programmatic dispatch ───────────────────────────────
+
+    /// Invoke a registered tool by name.
+    ///
+    /// This is the public API for calling tools programmatically from Rust
+    /// (e.g. from a script engine pipeline) without going through the MCP
+    /// protocol. Returns an error if the tool is not registered or if the
+    /// arguments are not a JSON object.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        args: Option<Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let json_args = match args {
+            None => None,
+            Some(Value::Object(map)) => Some(map),
+            Some(Value::Null) => None,
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    "tool arguments must be a JSON object",
+                    None,
+                ));
+            }
+        };
+
+        match self.try_call_tool(name, json_args).await {
+            Some(result) => result,
+            None => Err(McpError::invalid_request(
+                format!("tool '{}' not found in registry", name),
+                None,
+            )),
+        }
+    }
+
     // ── Internal: dispatch ───────────────────────────────────────────
 
     /// Try to dispatch a tool call to the registry.
     ///
     /// Returns `None` if the tool is not in the registry (caller should
     /// fall back to the inner handler).
-    pub(crate) async fn call_tool(
+    pub(crate) async fn try_call_tool(
         &self,
         name: &str,
         args: Option<JsonObject>,
@@ -332,6 +367,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_call_tool_dispatches_to_handler() {
+        let reg = CapabilityRegistry::new();
+        reg.add_tool(make_tool("echo"), |_args| async {
+            Ok(CallToolResult::success(vec![Content::text("hello")]))
+        })
+        .await;
+
+        let result = reg.try_call_tool("echo", None).await;
+        assert!(result.is_some());
+        let result = result.unwrap().unwrap();
+        assert!(!result.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_call_tool_returns_none_for_unknown() {
+        let reg = CapabilityRegistry::new();
+        assert!(reg.try_call_tool("unknown", None).await.is_none());
+    }
+
+    // ── Public call_tool tests ──────────────────────────────────────
+
+    #[tokio::test]
     async fn call_tool_dispatches_to_handler() {
         let reg = CapabilityRegistry::new();
         reg.add_tool(make_tool("echo"), |_args| async {
@@ -339,16 +396,60 @@ mod tests {
         })
         .await;
 
-        let result = reg.call_tool("echo", None).await;
-        assert!(result.is_some());
-        let result = result.unwrap().unwrap();
+        let result = reg
+            .call_tool("echo", Some(serde_json::json!({})))
+            .await
+            .unwrap();
         assert!(!result.content.is_empty());
     }
 
     #[tokio::test]
-    async fn call_tool_returns_none_for_unknown() {
+    async fn call_tool_accepts_none_args() {
         let reg = CapabilityRegistry::new();
-        assert!(reg.call_tool("unknown", None).await.is_none());
+        reg.add_tool(make_tool("ping"), |_args| async {
+            Ok(CallToolResult::success(vec![Content::text("pong")]))
+        })
+        .await;
+
+        let result = reg.call_tool("ping", None).await.unwrap();
+        assert!(!result.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_tool_accepts_null_args() {
+        let reg = CapabilityRegistry::new();
+        reg.add_tool(make_tool("ping"), |_args| async {
+            Ok(CallToolResult::success(vec![Content::text("pong")]))
+        })
+        .await;
+
+        let result = reg
+            .call_tool("ping", Some(serde_json::Value::Null))
+            .await
+            .unwrap();
+        assert!(!result.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_non_object_args() {
+        let reg = CapabilityRegistry::new();
+        reg.add_tool(make_tool("t"), |_| async {
+            Ok(CallToolResult::success(vec![]))
+        })
+        .await;
+
+        let err = reg
+            .call_tool("t", Some(serde_json::json!("string")))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("JSON object"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_returns_error_for_unknown() {
+        let reg = CapabilityRegistry::new();
+        let err = reg.call_tool("missing", None).await.unwrap_err();
+        assert!(err.message.contains("not found"));
     }
 
     // ── Prompt tests ─────────────────────────────────────────────────

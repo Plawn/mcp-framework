@@ -463,7 +463,7 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
             let reg_args = request.arguments.clone();
             let (result, source) = if let Some(reg_result) = self
                 .registry
-                .call_tool(&request.name, reg_args.clone())
+                .try_call_tool(&request.name, reg_args.clone())
                 .await
             {
                 (reg_result, ToolCallSource::Registry)
