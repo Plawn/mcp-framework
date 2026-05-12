@@ -15,6 +15,7 @@ use std::sync::Arc;
 use url::form_urlencoded;
 
 use super::{McpOAuthState, StoredToken};
+use crate::constants::{MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, CONTENT_TYPE_FORM};
 use crate::http_util::HttpError;
 use std::time::{Duration, Instant};
 
@@ -185,7 +186,7 @@ pub async fn token_handler(
     let keycloak_request = state
         .http_client
         .post(&keycloak_token_url)
-        .header("content-type", "application/x-www-form-urlencoded");
+        .header("content-type", CONTENT_TYPE_FORM);
 
     let result = keycloak_request.body(new_body).send().await;
 
@@ -213,9 +214,9 @@ pub async fn token_handler(
                                 };
                                 // Use the real session ID from request headers, fallback to "default"
                                 let session_key = headers
-                                    .get("mcp-session-id")
+                                    .get(MCP_SESSION_ID_HEADER)
                                     .and_then(|h| h.to_str().ok())
-                                    .unwrap_or("default");
+                                    .unwrap_or(DEFAULT_SESSION_ID);
                                 state.token_store.store_token(session_key.to_string(), stored).await;
                                 tracing::debug!("Stored token for session '{}'", session_key);
                             }

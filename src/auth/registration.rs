@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::McpOAuthState;
+use crate::constants::{MCP_CLIENT_ID_PREFIX, CONTENT_TYPE_JSON};
 use crate::http_util::HttpError;
 
 /// Dynamic Client Registration Request (RFC 7591)
@@ -44,7 +45,7 @@ fn build_fallback_registration(request: &ClientRegistrationRequest) -> ClientReg
     let client_id = request
         .client_name
         .clone()
-        .unwrap_or_else(|| format!("mcp-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|| format!("{}{}", MCP_CLIENT_ID_PREFIX, uuid::Uuid::new_v4()));
 
     ClientRegistrationResponse {
         client_id,
@@ -87,7 +88,7 @@ pub async fn register_handler(
     let result = state
         .http_client
         .post(&keycloak_register_url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .json(&keycloak_request)
         .send()
         .await;

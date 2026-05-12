@@ -56,7 +56,9 @@
 pub mod audit;
 pub mod auth;
 pub mod capability;
+pub mod constants;
 pub mod http_util;
+pub mod newtypes;
 pub mod persistence;
 pub mod prelude;
 pub mod runner;
@@ -92,4 +94,5 @@ pub use capability::{
     ResourceFilter, ToolCallValidator, ToolFilter,
 };
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
+pub use newtypes::{SessionId, ToolName};
 pub use session::{resolve_session_id, RequestContextExt, Session, SessionData, SessionStore};

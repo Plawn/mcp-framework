@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{routing::get, Router};
 use rmcp::transport::streamable_http_server::{
@@ -16,6 +15,7 @@ use crate::auth::{
 };
 use crate::audit::ToolCallLogger;
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
+use crate::constants::{HTTP_REQUEST_TIMEOUT, CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, OAUTH_MOUNT};
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
 
@@ -97,7 +97,7 @@ fn setup_oauth_routes(
 ) -> Router {
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
         .expect("Failed to build HTTP client");
 
@@ -138,7 +138,7 @@ fn setup_oauth_routes(
                 .with_state(Arc::new(mcp_oauth_state.clone())),
         )
         .nest(
-            "/oauth",
+            OAUTH_MOUNT,
             mcp_oauth_router(mcp_oauth_state).merge(oauth_router(oauth_state)),
         )
 }
@@ -356,7 +356,7 @@ where
     })?;
 
     // Start token cleanup task (purge expired tokens every 5 minutes)
-    let token_cleanup = token_store.start_cleanup_task(Duration::from_secs(300));
+    let token_cleanup = token_store.start_cleanup_task(CLEANUP_INTERVAL);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
@@ -371,7 +371,7 @@ where
 
         // Give connections 5 seconds to close gracefully, then force exit
         tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
             tracing::warn!("Graceful shutdown timed out, forcing exit");
             std::process::exit(0);
         });

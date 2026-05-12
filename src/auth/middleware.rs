@@ -14,6 +14,11 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use super::{TokenStore, StoredToken, BasicAuthConfig};
+use crate::constants::{
+    AUTHORIZATION_HEADER, BEARER_PREFIX, BEARER_PREFIX_LOWER,
+    BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM,
+    MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, WWW_AUTHENTICATE_HEADER,
+};
 
 /// Shared state for the auth middleware
 #[derive(Clone)]
@@ -38,7 +43,7 @@ pub async fn bearer_auth_middleware(
     next: Next,
 ) -> Response {
     // Extract Authorization header
-    let auth_header = request.headers().get("authorization");
+    let auth_header = request.headers().get(AUTHORIZATION_HEADER);
 
     tracing::info!("Auth middleware: checking request {} {}", request.method(), request.uri());
 
@@ -52,10 +57,10 @@ pub async fn bearer_auth_middleware(
                 }
             };
 
-            if let Some(token) = header_str.strip_prefix("Bearer ") {
+            if let Some(token) = header_str.strip_prefix(BEARER_PREFIX) {
                 tracing::info!("Auth middleware: found Bearer token (len={})", token.len());
                 token.to_string()
-            } else if let Some(token) = header_str.strip_prefix("bearer ") {
+            } else if let Some(token) = header_str.strip_prefix(BEARER_PREFIX_LOWER) {
                 tracing::info!("Auth middleware: found bearer token lowercase (len={})", token.len());
                 token.to_string()
             } else {
@@ -73,10 +78,10 @@ pub async fn bearer_auth_middleware(
     // Get the MCP session ID from headers (if present)
     let session_id = request
         .headers()
-        .get("mcp-session-id")
+        .get(MCP_SESSION_ID_HEADER)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
 
     tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
 
@@ -102,7 +107,7 @@ fn unauthorized_response(resource_metadata_url: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(
-            "WWW-Authenticate",
+            WWW_AUTHENTICATE_HEADER,
             format!("Bearer resource_metadata=\"{}\"", resource_metadata_url),
         )],
         "Unauthorized: Bearer token required",
@@ -126,7 +131,7 @@ pub async fn basic_auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let auth_header = request.headers().get("authorization");
+    let auth_header = request.headers().get(AUTHORIZATION_HEADER);
 
     tracing::debug!("Basic auth middleware: checking request to {}", request.uri());
 
@@ -140,7 +145,7 @@ pub async fn basic_auth_middleware(
                 }
             };
 
-            let encoded = match header_str.strip_prefix("Basic ").or_else(|| header_str.strip_prefix("basic ")) {
+            let encoded = match header_str.strip_prefix(BASIC_PREFIX).or_else(|| header_str.strip_prefix(BASIC_PREFIX_LOWER)) {
                 Some(e) => e,
                 None => {
                     tracing::debug!("Basic auth middleware: authorization header not Basic type");
@@ -186,10 +191,10 @@ pub async fn basic_auth_middleware(
 
     let session_id = request
         .headers()
-        .get("mcp-session-id")
+        .get(MCP_SESSION_ID_HEADER)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
 
     tracing::debug!("Basic auth validated for session {}, storing token", session_id);
 
@@ -212,7 +217,7 @@ pub async fn basic_auth_middleware(
 fn basic_unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [("WWW-Authenticate", "Basic realm=\"MCP\"")],
+        [(WWW_AUTHENTICATE_HEADER, BASIC_REALM)],
         "Unauthorized: Basic credentials required",
     )
         .into_response()

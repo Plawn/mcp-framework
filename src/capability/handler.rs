@@ -8,6 +8,7 @@ use rmcp::ErrorData as McpError;
 
 use crate::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
 use crate::auth::TokenStore;
+use crate::newtypes::{SessionId, ToolName};
 use crate::session::{SessionData, resolve_session_id, SessionStore};
 
 use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
@@ -223,8 +224,8 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         }
 
         let has_logger = self.context.tool_call_logger.is_some();
-        let tool_name = if has_logger { Some(request.name.to_string()) } else { None };
-        let session_id = if has_logger { Some(resolve_session_id(&context.extensions).to_string()) } else { None };
+        let tool_name = if has_logger { Some(ToolName::new(request.name.as_ref())) } else { None };
+        let session_id = if has_logger { Some(SessionId::new(resolve_session_id(&context.extensions))) } else { None };
         let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
 
         // Dispatch: try registry first, fall back to inner.
@@ -485,37 +486,5 @@ fn summarize_content(content: &[Content]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn summarize_content_empty() {
-        assert_eq!(summarize_content(&[]), None);
-    }
-
-    #[test]
-    fn summarize_content_text_truncation() {
-        let long_text = "x".repeat(300);
-        let content = vec![Content::text(long_text)];
-        let summary = summarize_content(&content).unwrap();
-        assert!(summary.len() < 270); // 256 + "..."
-        assert!(summary.ends_with("..."));
-    }
-
-    #[test]
-    fn summarize_content_short_text() {
-        let content = vec![Content::text("hello")];
-        let summary = summarize_content(&content).unwrap();
-        assert_eq!(summary, "hello");
-    }
-
-    #[test]
-    fn summarize_content_mixed() {
-        let content = vec![
-            Content::text("hello"),
-            Content::image("base64data", "image/png"),
-        ];
-        let summary = summarize_content(&content).unwrap();
-        assert_eq!(summary, "hello; <image>");
-    }
-}
+#[path = "handler_tests.rs"]
+mod tests;

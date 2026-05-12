@@ -2,6 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value};
 
+use crate::newtypes::{SessionId, ToolName};
+
 /// Which dispatch path handled the tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallSource {
@@ -31,11 +33,11 @@ pub enum ToolCallOutcome {
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {
     /// Name of the tool that was called.
-    pub tool_name: String,
+    pub tool_name: ToolName,
     /// Arguments passed to the tool (raw JSON object), if any.
     pub arguments: Option<Map<String, Value>>,
     /// MCP session ID (falls back to `"default"` in stdio mode).
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Wall-clock time when the call started.
     pub timestamp: SystemTime,
     /// How long the tool call took to complete.

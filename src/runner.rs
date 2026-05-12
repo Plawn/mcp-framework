@@ -12,10 +12,9 @@ use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::persistence::PersistenceBackend;
-use crate::session::{SessionData, SessionStore, DEFAULT_SESSION_TTL};
+use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_TTL};
+use crate::session::{SessionData, SessionStore};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
-
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
 
 /// Transport mode for the MCP server.
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]

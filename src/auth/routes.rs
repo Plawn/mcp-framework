@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use super::{OAuthConfig, TokenStore, StoredToken};
 use super::templates;
+use crate::constants::{OAUTH_LOGIN_PATH, OAUTH_CALLBACK_PATH, OAUTH_STATUS_PATH};
 use crate::http_util::HttpError;
 
 /// Shared state for OAuth routes
@@ -40,9 +41,9 @@ pub struct AuthorizeQuery {
 /// Create the OAuth router
 pub fn oauth_router(state: OAuthState) -> Router {
     Router::new()
-        .route("/login", get(login_handler))
-        .route("/callback", get(callback_handler))
-        .route("/status", get(status_handler))
+        .route(OAUTH_LOGIN_PATH, get(login_handler))
+        .route(OAUTH_CALLBACK_PATH, get(callback_handler))
+        .route(OAUTH_STATUS_PATH, get(status_handler))
         .with_state(Arc::new(state))
 }
 

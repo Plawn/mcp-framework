@@ -9,6 +9,7 @@ mod templates;
 
 use axum::{routing::{get, post}, Router};
 use std::sync::Arc;
+use crate::constants::{OAUTH_REGISTER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_TOKEN_PATH};
 
 pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig};
 pub use metadata::{
@@ -38,8 +39,8 @@ pub struct McpOAuthState {
 /// Create the MCP OAuth router with register, authorize, and token endpoints.
 pub fn mcp_oauth_router(state: McpOAuthState) -> Router {
     Router::new()
-        .route("/register", post(registration::register_handler))
-        .route("/authorize", get(proxy::authorize_handler))
-        .route("/token", post(proxy::token_handler))
+        .route(OAUTH_REGISTER_PATH, post(registration::register_handler))
+        .route(OAUTH_AUTHORIZE_PATH, get(proxy::authorize_handler))
+        .route(OAUTH_TOKEN_PATH, post(proxy::token_handler))
         .with_state(Arc::new(state))
 }
