@@ -38,6 +38,8 @@
 //!         claims_decoder: None,
 //!         session_store: None,
 //!         tool_call_logger: None,
+//!         persistence: None,
+//!         extra_routes: None,
 //!     }).await
 //! }
 //! ```
@@ -55,6 +57,7 @@ pub mod audit;
 pub mod auth;
 pub mod capability;
 pub mod http_util;
+pub mod persistence;
 pub mod prelude;
 pub mod runner;
 pub mod session;
@@ -82,10 +85,11 @@ pub struct EmptyParams {}
 pub use audit::{
     NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
 };
+pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallValidator, ToolFilter,
 };
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
-pub use session::{resolve_session_id, RequestContextExt, Session, SessionStore};
+pub use session::{resolve_session_id, RequestContextExt, Session, SessionData, SessionStore};

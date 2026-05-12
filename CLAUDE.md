@@ -52,7 +52,7 @@ Key type: `TokenStore` — thread-safe token storage shared between auth middlew
 
 ### Session layer (`src/session/`)
 
-`SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
+`SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
 
 Helper function `resolve_session_id(extensions)` extracts the `mcp-session-id` header from MCP request context extensions, falling back to `"default"` for stdio mode.
 
@@ -177,6 +177,18 @@ McpAppBuilder::new("my-server")
     .run()
     .await?;
 ```
+
+### Persistence layer (`src/persistence.rs`)
+
+`PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:
+
+- **Write-through**: mutations (`store_token`, `update`, `remove`, `purge_expired`) are written to the backend asynchronously (fire-and-forget via `tokio::spawn`)
+- **Load-at-startup**: `load_persisted()` reads all keys from the backend and populates the in-memory store. Called automatically during `run()` before the listener starts
+- **No backend = current behavior**: zero overhead, no serialization
+
+The trait uses `Pin<Box<dyn Future>>` returns for object safety (`Arc<dyn PersistenceBackend>`). `InMemoryBackend` is shipped for testing. `Instant` fields are serialized as seconds-remaining and reconstructed on load. `StoredToken::decoded_claims` is not serialized — it is re-decoded via the existing `claims_decoder`.
+
+Builder API: `.persistence(Arc::new(MyBackend::new()))` wires the backend into both stores.
 
 ### HTTP utilities (`src/http_util/`)
 

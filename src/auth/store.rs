@@ -1,9 +1,14 @@
 use std::any::Any;
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use serde::{Serialize, Deserialize};
 use tokio::sync::RwLock;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use reqwest::Client as HttpClient;
 use tokio::sync::Mutex as TokioMutex;
+
+use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
+
+const NS_TOKENS: &str = "tokens";
 
 /// A stored OAuth token with expiry tracking and optional decoded claims.
 ///
@@ -74,6 +79,44 @@ impl PendingAuth {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in_secs: Option<u64>,
+}
+
+impl PersistedToken {
+    fn from_stored(token: &StoredToken) -> Self {
+        let expires_in_secs = token.expires_at.map(|ea| {
+            let now = Instant::now();
+            if ea > now {
+                // Round up to avoid truncating sub-second time
+                (ea - now).as_secs().saturating_add(1)
+            } else {
+                0
+            }
+        });
+        Self {
+            access_token: token.access_token.clone(),
+            refresh_token: token.refresh_token.clone(),
+            expires_in_secs,
+        }
+    }
+
+    fn into_stored(self) -> StoredToken {
+        let expires_at = self
+            .expires_in_secs
+            .map(|secs| Instant::now() + Duration::from_secs(secs));
+        StoredToken {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            expires_at,
+            decoded_claims: None,
+        }
+    }
+}
+
 /// Configuration needed for token refresh
 #[derive(Clone)]
 pub struct RefreshConfig {
@@ -100,6 +143,8 @@ pub struct TokenStore {
     refresh_locks: Arc<RwLock<HashMap<String, Arc<TokioMutex<()>>>>>,
     /// Global claims decoder applied during `store_token`.
     pub(crate) claims_decoder: Option<ClaimsDecoderFn>,
+    /// Optional persistence backend for surviving restarts.
+    persistence: Option<Arc<dyn PersistenceBackend>>,
 }
 
 impl TokenStore {
@@ -111,6 +156,7 @@ impl TokenStore {
             refresh_config: Arc::new(RwLock::new(None)),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             claims_decoder: None,
+            persistence: None,
         }
     }
 
@@ -123,7 +169,19 @@ impl TokenStore {
             refresh_config: Arc::new(RwLock::new(Some(config))),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             claims_decoder: None,
+            persistence: None,
         }
+    }
+
+    /// Attach a persistence backend for surviving server restarts.
+    pub fn with_persistence(mut self, backend: Arc<dyn PersistenceBackend>) -> Self {
+        self.persistence = Some(backend);
+        self
+    }
+
+    /// Set the persistence backend (mutable reference variant).
+    pub fn set_persistence(&mut self, backend: Arc<dyn PersistenceBackend>) {
+        self.persistence = Some(backend);
     }
 
     /// Configure a global claims decoder.
@@ -271,8 +329,23 @@ impl TokenStore {
         if let Some(ref decoder) = self.claims_decoder {
             token.decoded_claims = (decoder)(&token.access_token);
         }
+
+        let persist_data = self.persistence.as_ref().map(|backend| {
+            let persisted = PersistedToken::from_stored(&token);
+            let ttl = token.expires_at.map(|ea| {
+                let now = Instant::now();
+                if ea > now { ea - now } else { Duration::ZERO }
+            });
+            (backend, persisted, ttl)
+        });
+
         let mut tokens = self.tokens.write().await;
-        tokens.insert(session_id, token);
+        tokens.insert(session_id.clone(), token);
+        drop(tokens);
+
+        if let Some((backend, persisted, ttl)) = persist_data {
+            spawn_persist(backend, NS_TOKENS, session_id, &persisted, ttl);
+        }
     }
 
     /// Get a token for a session (raw, no auto-refresh)
@@ -327,6 +400,17 @@ impl TokenStore {
 
         let mut locks = self.refresh_locks.write().await;
         locks.remove(session_id);
+        drop(locks);
+
+        if let Some(ref backend) = self.persistence {
+            let backend = backend.clone();
+            let key = session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = backend.delete(NS_TOKENS, &key).await {
+                    tracing::warn!("Failed to delete persisted token for session {key}: {e}");
+                }
+            });
+        }
     }
 
     /// Purge all expired tokens and their associated refresh locks.
@@ -352,6 +436,18 @@ impl TokenStore {
         }
 
         tracing::debug!("Purged {} expired token(s)", expired_keys.len());
+
+        if let Some(ref backend) = self.persistence {
+            let backend = backend.clone();
+            let keys = expired_keys;
+            tokio::spawn(async move {
+                for key in &keys {
+                    if let Err(e) = backend.delete(NS_TOKENS, key).await {
+                        tracing::warn!("Failed to delete persisted token {key}: {e}");
+                    }
+                }
+            });
+        }
     }
 
     /// Spawn a background task that periodically purges expired tokens.
@@ -367,6 +463,59 @@ impl TokenStore {
                 store.purge_expired().await;
             }
         })
+    }
+
+    /// Load all tokens from the persistence backend into memory.
+    ///
+    /// Entries that fail to deserialize are skipped with a warning.
+    /// The claims decoder is applied to each loaded token.
+    pub async fn load_persisted(&self) -> Result<(), PersistenceError> {
+        let backend = match &self.persistence {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let keys = backend.keys(NS_TOKENS).await?;
+        let mut entries = Vec::new();
+
+        for key in keys {
+            let bytes = match backend.get(NS_TOKENS, &key).await? {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let persisted: PersistedToken = match serde_json::from_slice(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Skipping corrupted persisted token for session {key}: {e}");
+                    continue;
+                }
+            };
+
+            let mut token = persisted.into_stored();
+
+            if token.is_expired() {
+                let _ = backend.delete(NS_TOKENS, &key).await;
+                continue;
+            }
+
+            if let Some(ref decoder) = self.claims_decoder {
+                token.decoded_claims = (decoder)(&token.access_token);
+            }
+
+            entries.push((key, token));
+        }
+
+        if !entries.is_empty() {
+            let count = entries.len();
+            let mut tokens = self.tokens.write().await;
+            for (key, token) in entries {
+                tokens.insert(key, token);
+            }
+            tracing::info!("Loaded {count} persisted token(s)");
+        }
+
+        Ok(())
     }
 
     /// Check if a session has a valid (non-expired) token (no side-effects)
@@ -599,5 +748,135 @@ mod tests {
         };
         assert!(token.claims::<A>().is_some());
         assert!(token.claims::<B>().is_none());
+    }
+
+    // ── Persistence tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn token_store_persists_on_store() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+        let store = TokenStore::new().with_persistence(backend.clone());
+
+        let token = test_token("my-access", Some("my-refresh"), Some(Instant::now() + Duration::from_secs(3600)));
+        store.store_token("sess-1".to_string(), token).await;
+
+        // Give fire-and-forget task time to complete
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let data = backend.dump().await;
+        assert!(data.contains_key(&("tokens".to_string(), "sess-1".to_string())));
+
+        let bytes = &data[&("tokens".to_string(), "sess-1".to_string())];
+        let persisted: PersistedToken = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(persisted.access_token, "my-access");
+        assert_eq!(persisted.refresh_token.as_deref(), Some("my-refresh"));
+        assert!(persisted.expires_in_secs.unwrap() > 3500);
+    }
+
+    #[tokio::test]
+    async fn token_store_loads_persisted() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+
+        let persisted = PersistedToken {
+            access_token: "loaded-token".to_string(),
+            refresh_token: Some("loaded-refresh".to_string()),
+            expires_in_secs: Some(7200),
+        };
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        backend.set("tokens", "sess-x", &bytes, None).await.unwrap();
+
+        let store = TokenStore::new().with_persistence(backend);
+        store.load_persisted().await.unwrap();
+
+        let token = store.get_token_raw("sess-x").await.unwrap();
+        assert_eq!(token.access_token, "loaded-token");
+        assert_eq!(token.refresh_token.as_deref(), Some("loaded-refresh"));
+        assert!(!token.is_expired());
+    }
+
+    #[tokio::test]
+    async fn token_store_loads_persisted_applies_claims_decoder() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+
+        let persisted = PersistedToken {
+            access_token: "admin-jwt".to_string(),
+            refresh_token: None,
+            expires_in_secs: Some(3600),
+        };
+        backend.set("tokens", "s1", &serde_json::to_vec(&persisted).unwrap(), None).await.unwrap();
+
+        #[derive(Debug)]
+        struct Claims { role: String }
+
+        let store = TokenStore::new()
+            .with_claims_decoder(|token: &str| -> Option<Claims> {
+                if token == "admin-jwt" { Some(Claims { role: "admin".into() }) } else { None }
+            })
+            .with_persistence(backend);
+
+        store.load_persisted().await.unwrap();
+
+        let token = store.get_token_raw("s1").await.unwrap();
+        let claims = token.claims::<Claims>().expect("claims should be decoded");
+        assert_eq!(claims.role, "admin");
+    }
+
+    #[tokio::test]
+    async fn token_store_skips_corrupted() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+
+        backend.set("tokens", "bad", b"not-json{{{", None).await.unwrap();
+
+        let persisted = PersistedToken {
+            access_token: "good".to_string(),
+            refresh_token: None,
+            expires_in_secs: Some(3600),
+        };
+        backend.set("tokens", "good", &serde_json::to_vec(&persisted).unwrap(), None).await.unwrap();
+
+        let store = TokenStore::new().with_persistence(backend);
+        store.load_persisted().await.unwrap();
+
+        assert!(store.get_token_raw("bad").await.is_none());
+        assert!(store.get_token_raw("good").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn token_store_purge_cleans_backend() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+        let store = TokenStore::new().with_persistence(backend.clone());
+
+        let expired = test_token("old", None, Some(Instant::now() - Duration::from_secs(60)));
+        store.store_token("expired-sess".to_string(), expired).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!backend.dump().await.is_empty());
+
+        store.purge_expired().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(backend.dump().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_store_remove_cleans_backend() {
+        let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+        let store = TokenStore::new().with_persistence(backend.clone());
+
+        store.store_token("s1".to_string(), test_token("tok", None, None)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(backend.dump().await.contains_key(&("tokens".into(), "s1".into())));
+
+        store.remove_token("s1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!backend.dump().await.contains_key(&("tokens".into(), "s1".into())));
+    }
+
+    #[tokio::test]
+    async fn token_store_no_backend_unchanged() {
+        let store = TokenStore::new();
+        store.store_token("s1".to_string(), test_token("t", None, None)).await;
+        assert!(store.get_token_raw("s1").await.is_some());
+        store.load_persisted().await.unwrap();
     }
 }

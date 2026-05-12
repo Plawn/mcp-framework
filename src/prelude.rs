@@ -7,13 +7,14 @@
 pub use crate::audit::{
     NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
 };
+pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use crate::capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallValidator, ToolFilter,
 };
 pub use crate::runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
-pub use crate::session::{RequestContextExt, Session, SessionStore};
+pub use crate::session::{RequestContextExt, Session, SessionData, SessionStore};
 pub use crate::EmptyParams;
 
 // Re-exports from rmcp so consumers don't need it as a direct dependency

@@ -12,7 +12,7 @@ use mcp_framework::prelude::*;
 
 // ── Session data ─────────────────────────────────────────────────────
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct MySession {
     call_count: u32,
 }

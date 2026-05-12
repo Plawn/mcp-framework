@@ -8,7 +8,7 @@ use rmcp::ErrorData as McpError;
 
 use crate::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
 use crate::auth::TokenStore;
-use crate::session::{resolve_session_id, SessionStore};
+use crate::session::{SessionData, resolve_session_id, SessionStore};
 
 use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
 use super::registry::CapabilityRegistry;
@@ -19,7 +19,7 @@ use super::validator::{AccessDecision, AccessValidator};
 ///
 /// Groups the cross-cutting dependencies that `DynamicHandler` needs beyond
 /// the inner `ServerHandler` and the `CapabilityRegistry`.
-pub(crate) struct HandlerContext<T: Send + Sync + Default + Clone + 'static> {
+pub(crate) struct HandlerContext<T: SessionData> {
     pub filter: Option<Arc<dyn CapabilityFilter>>,
     pub access_validator: Option<Arc<dyn AccessValidator>>,
     pub token_store: TokenStore,
@@ -54,13 +54,13 @@ fn merge_registry_items<T>(inner: &mut Vec<T>, registry: Vec<T>, key_eq: fn(&T, 
 /// Additionally, `TokenStore` and `SessionStore<T>` are injected into
 /// `context.extensions` before every call, so handlers can access them
 /// via [`RequestContextExt`](crate::session::RequestContextExt).
-pub(crate) struct DynamicHandler<S, T: Send + Sync + Default + Clone + 'static> {
+pub(crate) struct DynamicHandler<S, T: SessionData> {
     inner: S,
     registry: CapabilityRegistry,
     context: HandlerContext<T>,
 }
 
-impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
+impl<S, T: SessionData> DynamicHandler<S, T> {
     pub fn new(inner: S, registry: CapabilityRegistry, context: HandlerContext<T>) -> Self {
         Self {
             inner,
@@ -77,7 +77,7 @@ impl<S, T: Send + Sync + Default + Clone + 'static> DynamicHandler<S, T> {
     }
 }
 
-impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
+impl<S: ServerHandler, T: SessionData> ServerHandler
     for DynamicHandler<S, T>
 {
     // ── initialize: capture the peer ─────────────────────────────────

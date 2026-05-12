@@ -164,6 +164,7 @@ async fn start_server() -> std::net::SocketAddr {
         claims_decoder: None,
         session_store: SessionStore::default(),
         tool_call_logger: None,
+        persistence: None,
         extra_routes: None,
     };
 

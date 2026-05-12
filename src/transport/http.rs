@@ -16,10 +16,11 @@ use crate::auth::{
 };
 use crate::audit::ToolCallLogger;
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
-use crate::session::SessionStore;
+use crate::persistence::PersistenceBackend;
+use crate::session::{SessionData, SessionStore};
 
 /// Configuration for building the HTTP app
-pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
+pub struct HttpAppConfig<F, T: SessionData = ()> {
     pub public_url: String,
     pub bind_addr: String,
     pub auth: AuthProvider,
@@ -37,6 +38,8 @@ pub struct HttpAppConfig<F, T: Send + Sync + Default + Clone + 'static = ()> {
     pub session_store: SessionStore<T>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Optional persistence backend for TokenStore.
+    pub persistence: Option<Arc<dyn PersistenceBackend>>,
     /// Extra routes merged into the auth-wrapped MCP router.
     ///
     /// Routes registered here sit inside the same `AuthProvider` middleware as
@@ -148,7 +151,7 @@ pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore)
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     let mut token_store = match &config.auth {
         AuthProvider::OAuth(oauth_config) => {
@@ -167,6 +170,9 @@ where
 
     if let Some(decoder) = config.claims_decoder {
         token_store.claims_decoder = Some(decoder);
+    }
+    if let Some(backend) = config.persistence {
+        token_store.set_persistence(backend);
     }
 
     let mut app = Router::new();
@@ -306,7 +312,7 @@ pub async fn run_http<F, S, T>(config: HttpAppConfig<F, T>) -> anyhow::Result<()
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     let bind_addr: std::net::SocketAddr = config.bind_addr.parse()?;
 
@@ -344,6 +350,10 @@ where
     let session_cleanup = config.session_store.start_cleanup_task();
 
     let (app, token_store) = build_app(config);
+
+    token_store.load_persisted().await.map_err(|e| {
+        anyhow::anyhow!("failed to load persisted tokens: {e}")
+    })?;
 
     // Start token cleanup task (purge expired tokens every 5 minutes)
     let token_cleanup = token_store.start_cleanup_task(Duration::from_secs(300));

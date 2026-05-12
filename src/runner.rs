@@ -11,7 +11,8 @@ use std::any::Any;
 use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
-use crate::session::{SessionStore, DEFAULT_SESSION_TTL};
+use crate::persistence::PersistenceBackend;
+use crate::session::{SessionData, SessionStore, DEFAULT_SESSION_TTL};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:4000";
@@ -82,7 +83,7 @@ impl Default for Settings {
 /// ```
 pub struct McpApp<F, T = ()>
 where
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     /// Application name (used in OAuth templates and logs)
     pub name: String,
@@ -107,6 +108,8 @@ where
     pub session_store: Option<SessionStore<T>>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Optional persistence backend shared by `TokenStore` and `SessionStore`.
+    pub persistence: Option<Arc<dyn PersistenceBackend>>,
     /// Extra axum routes merged into the auth-wrapped MCP router.
     ///
     /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
@@ -115,7 +118,7 @@ where
 
 impl<F, T> McpApp<F, T>
 where
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     /// Create a builder for an `McpApp` with the given application name.
     ///
@@ -141,6 +144,7 @@ where
             claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
+            persistence: None,
             extra_routes: None,
         }
     }
@@ -170,7 +174,7 @@ where
 ///     .run()
 ///     .await?;
 /// ```
-pub struct McpAppBuilder<T: Send + Sync + Default + Clone + 'static = (), F = ()> {
+pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     name: String,
     auth: AuthProvider,
     server_factory: F,
@@ -182,6 +186,7 @@ pub struct McpAppBuilder<T: Send + Sync + Default + Clone + 'static = (), F = ()
     claims_decoder: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>>,
     session_store: Option<SessionStore<T>>,
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    persistence: Option<Arc<dyn PersistenceBackend>>,
     extra_routes: Option<Router>,
 }
 
@@ -210,6 +215,7 @@ impl McpAppBuilder<()> {
             claims_decoder: None,
             session_store: None,
             tool_call_logger: None,
+            persistence: None,
             extra_routes: None,
         }
     }
@@ -226,7 +232,7 @@ impl<F> McpAppBuilder<(), F> {
     ///     .run()
     ///     .await?;
     /// ```
-    pub fn with_sessions<T: Send + Sync + Default + Clone + 'static>(
+    pub fn with_sessions<T: SessionData>(
         self,
     ) -> McpAppBuilder<T, F> {
         McpAppBuilder {
@@ -241,13 +247,14 @@ impl<F> McpAppBuilder<(), F> {
             claims_decoder: self.claims_decoder,
             session_store: None,
             tool_call_logger: self.tool_call_logger,
+            persistence: self.persistence,
             extra_routes: self.extra_routes,
         }
     }
 }
 
 // Configuration methods available on any builder state.
-impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
+impl<T: SessionData, F> McpAppBuilder<T, F> {
     /// Set the authentication provider (default: `AuthProvider::None`).
     pub fn auth(mut self, auth: AuthProvider) -> Self {
         self.auth = auth;
@@ -347,6 +354,12 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Set the persistence backend, shared by `TokenStore` and `SessionStore`.
+    pub fn persistence(mut self, backend: Arc<dyn PersistenceBackend>) -> Self {
+        self.persistence = Some(backend);
+        self
+    }
+
     /// Transfer all non-factory fields into a new builder with a different factory type.
     fn with_factory<G>(self, factory: G) -> McpAppBuilder<T, G> {
         McpAppBuilder {
@@ -361,6 +374,7 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
             claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
+            persistence: self.persistence,
             extra_routes: self.extra_routes,
         }
     }
@@ -382,7 +396,7 @@ impl<T: Send + Sync + Default + Clone + 'static, F> McpAppBuilder<T, F> {
 // Build and run methods — only available when a valid server factory is set.
 impl<T, F, S> McpAppBuilder<T, F>
 where
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
 {
@@ -447,6 +461,7 @@ where
             claims_decoder: self.claims_decoder,
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
+            persistence: self.persistence,
             extra_routes: self.extra_routes,
         })
     }
@@ -538,7 +553,7 @@ fn resolve_http_addrs(settings: Option<&Settings>) -> (String, String) {
     }
 }
 
-fn resolve_session_store<T: Send + Sync + Default + Clone + 'static>(
+fn resolve_session_store<T: SessionData>(
     session_store: &Option<SessionStore<T>>,
     settings: &Option<Settings>,
 ) -> SessionStore<T> {
@@ -556,10 +571,16 @@ async fn run_http_mode<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     let (bind_addr, public_url) = resolve_http_addrs(app.settings.as_ref());
-    let session_store = resolve_session_store(&app.session_store, &app.settings);
+    let mut session_store = resolve_session_store(&app.session_store, &app.settings);
+    let persistence = app.persistence;
+
+    if let Some(ref backend) = persistence {
+        session_store.set_persistence(backend.clone());
+        session_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+    }
 
     run_http(HttpAppConfig {
         public_url,
@@ -573,6 +594,7 @@ where
         claims_decoder: app.claims_decoder,
         session_store,
         tool_call_logger: app.tool_call_logger,
+        persistence,
         extra_routes: app.extra_routes,
     })
     .await
@@ -582,13 +604,19 @@ async fn run_stdio_mode<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     let mut token_store = TokenStore::new();
     if let Some(decoder) = app.claims_decoder {
         token_store.claims_decoder = Some(decoder);
     }
-    let session_store = resolve_session_store(&app.session_store, &app.settings);
+    let mut session_store = resolve_session_store(&app.session_store, &app.settings);
+    if let Some(ref backend) = app.persistence {
+        token_store.set_persistence(backend.clone());
+        token_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+        session_store.set_persistence(backend.clone());
+        session_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+    }
 
     if let Some(ref env_var) = app.stdio_token_env {
         if let Ok(t) = std::env::var(env_var) {
@@ -639,7 +667,7 @@ pub async fn run<F, S, T>(app: McpApp<F, T>) -> anyhow::Result<()>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
-    T: Send + Sync + Default + Clone + 'static,
+    T: SessionData,
 {
     if let Some(ref settings) = app.settings {
         let transport = settings.transport.clone();
