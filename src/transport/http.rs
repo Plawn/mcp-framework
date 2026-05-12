@@ -183,8 +183,29 @@ where
     // rmcp 1.x defaults to sending empty SSE "priming" frames before each response,
     // which some MCP clients (e.g. Claude) misinterpret, causing the connection to
     // close before the tool result is delivered.
+    //
+    // rmcp 1.5 validates the Host header against an allowlist (default: loopback
+    // only). For public deployments we derive the allowed host from PUBLIC_URL.
+    let mut allowed_hosts: Vec<String> = vec![
+        "localhost".into(),
+        "127.0.0.1".into(),
+        "::1".into(),
+    ];
+    if let Ok(url) = url::Url::parse(&config.public_url) {
+        if let Some(host) = url.host_str() {
+            let authority = match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            if !allowed_hosts.contains(&authority) {
+                allowed_hosts.push(authority);
+            }
+        }
+    }
+    tracing::info!(allowed_hosts = ?allowed_hosts, "MCP host validation configured");
     let mcp_config = StreamableHttpServerConfig::default()
-        .with_sse_retry(None);
+        .with_sse_retry(None)
+        .with_allowed_hosts(allowed_hosts);
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -228,10 +249,16 @@ where
     // Add request/response tracing to log every HTTP request
     let trace_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(|request: &axum::http::Request<_>| {
+            let host = request
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
             tracing::info_span!(
                 "http_request",
                 method = %request.method(),
                 uri = %request.uri(),
+                host = %host,
             )
         })
         .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
@@ -245,11 +272,20 @@ where
             |response: &axum::http::Response<_>,
              latency: std::time::Duration,
              _span: &tracing::Span| {
-                tracing::info!(
-                    status = %response.status(),
-                    latency_ms = latency.as_millis(),
-                    "<< response"
-                );
+                let status = response.status();
+                if status == axum::http::StatusCode::FORBIDDEN {
+                    tracing::warn!(
+                        status = %status,
+                        latency_ms = latency.as_millis(),
+                        "<< request rejected (check allowed_hosts if Host header mismatch)"
+                    );
+                } else {
+                    tracing::info!(
+                        status = %status,
+                        latency_ms = latency.as_millis(),
+                        "<< response"
+                    );
+                }
             },
         );
 
