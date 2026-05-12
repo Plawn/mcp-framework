@@ -8,6 +8,7 @@
 mod filter;
 mod handler;
 mod registry;
+mod sanitize;
 mod validator;
 
 pub use filter::{CapabilityFilter, PromptFilter, ResourceFilter, ToolFilter};
