@@ -52,6 +52,8 @@
 //! - **Dynamic capabilities** — add/remove tools, prompts, and resources at runtime
 //!   via [`CapabilityRegistry`], with optional per-session filtering via [`CapabilityFilter`]
 //! - **CLI or programmatic config** — built-in CLI args + env vars, or a [`Settings`] struct
+//! - **Persistence** — pluggable key-value backend for surviving restarts
+//!   ([`InMemoryBackend`] for testing, [`RedisBackend`](persistence::RedisBackend) with the `redis` feature)
 
 pub mod audit;
 pub mod auth;
@@ -88,6 +90,8 @@ pub use audit::{
     NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
 };
 pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
+#[cfg(feature = "redis")]
+pub use persistence::RedisBackend;
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,

@@ -190,6 +190,40 @@ The trait uses `Pin<Box<dyn Future>>` returns for object safety (`Arc<dyn Persis
 
 Builder API: `.persistence(Arc::new(MyBackend::new()))` wires the backend into both stores.
 
+#### Built-in backends
+
+- `InMemoryBackend` — always available, useful for testing. TTL is ignored.
+- `RedisBackend` — requires the `redis` cargo feature. Stores keys as `{ns}:{key}` with a companion index Set (`{ns}:__idx__`) per namespace so that `keys()` is O(members) via `SMEMBERS` rather than scanning the keyspace. `set` and `delete` maintain the index atomically using pipelined transactions. TTL is handled natively via Redis `EXPIRE`.
+
+#### Using Redis persistence
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+mcp-framework = { version = "0.1", features = ["redis"] }
+```
+
+Then wire it via the builder:
+
+```rust
+use std::sync::Arc;
+use mcp_framework::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let redis = RedisBackend::connect("redis://127.0.0.1/").await?;
+
+    McpAppBuilder::new("my-server")
+        .persistence(Arc::new(redis))
+        .server(|| MyServer::new())
+        .run()
+        .await
+}
+```
+
+If you already have a `redis::aio::ConnectionManager` (e.g. shared with other parts of your application), use `RedisBackend::from_connection_manager(conn)` instead.
+
 ### HTTP utilities (`src/http_util/`)
 
 - `HttpError`: unified error type that converts to Axum responses with proper status codes and JSON bodies

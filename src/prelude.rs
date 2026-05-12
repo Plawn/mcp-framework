@@ -8,6 +8,8 @@ pub use crate::audit::{
     NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
 };
 pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
+#[cfg(feature = "redis")]
+pub use crate::persistence::RedisBackend;
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use crate::capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,

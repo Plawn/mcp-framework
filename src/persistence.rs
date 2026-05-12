@@ -158,6 +158,12 @@ pub(crate) fn spawn_persist<T: Serialize>(
     }
 }
 
+#[cfg(feature = "redis")]
+#[path = "persistence_redis.rs"]
+mod redis_backend;
+#[cfg(feature = "redis")]
+pub use redis_backend::RedisBackend;
+
 #[cfg(test)]
 #[path = "persistence_tests.rs"]
 mod tests;
