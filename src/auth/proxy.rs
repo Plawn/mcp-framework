@@ -168,11 +168,10 @@ pub async fn token_handler(
     }
 
     // Add client_secret if we have one and it's not already in the request
-    if let Some(ref secret) = state.keycloak_client_secret {
-        if !params.iter().any(|(k, _)| k == "client_secret") {
+    if let Some(ref secret) = state.keycloak_client_secret
+        && !params.iter().any(|(k, _)| k == "client_secret") {
             params.push(("client_secret".to_string(), secret.clone()));
         }
-    }
 
     // Rebuild the form body
     let new_body: String = form_urlencoded::Serializer::new(String::new())
@@ -204,8 +203,8 @@ pub async fn token_handler(
                         tracing::debug!("Token response: {}", body_str);
 
                         // Store token in the token store for auto-refresh support
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str) {
-                            if let Some(access_token) = json["access_token"].as_str() {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
+                            && let Some(access_token) = json["access_token"].as_str() {
                                 let stored = StoredToken {
                                     access_token: access_token.to_string(),
                                     refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
@@ -220,7 +219,6 @@ pub async fn token_handler(
                                 state.token_store.store_token(session_key.to_string(), stored).await;
                                 tracing::debug!("Stored token for session '{}'", session_key);
                             }
-                        }
                     } else {
                         tracing::error!(
                             "Token exchange failed, status: {}, body: {}",

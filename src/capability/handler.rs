@@ -82,292 +82,270 @@ impl<S: ServerHandler, T: Send + Sync + Default + Clone + 'static> ServerHandler
 {
     // ── initialize: capture the peer ─────────────────────────────────
 
-    fn initialize(
+    async fn initialize(
         &self,
         request: InitializeRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
-            self.registry.register_peer(context.peer.clone()).await;
-            let mut result = self.inner.initialize(request, context).await?;
+    ) -> Result<InitializeResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
+        self.registry.register_peer(context.peer.clone()).await;
+        let mut result = self.inner.initialize(request, context).await?;
 
-            if result.capabilities.tools.is_none() && self.registry.has_tools().await {
-                result.capabilities.tools = Some(ToolsCapability::default());
-            }
-            if result.capabilities.prompts.is_none() && self.registry.has_prompts().await {
-                result.capabilities.prompts = Some(PromptsCapability::default());
-            }
-            if result.capabilities.resources.is_none() && self.registry.has_resources().await {
-                result.capabilities.resources = Some(ResourcesCapability::default());
-            }
-
-            Ok(result)
+        if result.capabilities.tools.is_none() && self.registry.has_tools().await {
+            result.capabilities.tools = Some(ToolsCapability::default());
         }
+        if result.capabilities.prompts.is_none() && self.registry.has_prompts().await {
+            result.capabilities.prompts = Some(PromptsCapability::default());
+        }
+        if result.capabilities.resources.is_none() && self.registry.has_resources().await {
+            result.capabilities.resources = Some(ResourcesCapability::default());
+        }
+
+        Ok(result)
     }
 
     // ── list_tools: merge + filter ───────────────────────────────────
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.context.token_store).await;
-            let query_filter = resolve_query_filter(&context.extensions);
-            let mut inner_result = self.inner.list_tools(request, context).await?;
+    ) -> Result<ListToolsResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
+        let token = resolve_token(&context.extensions, &self.context.token_store).await;
+        let query_filter = resolve_query_filter(&context.extensions);
+        let mut inner_result = self.inner.list_tools(request, context).await?;
 
-            // Merge registry tools (registry wins on name collision)
-            merge_registry_items(
-                &mut inner_result.tools,
-                self.registry.tools().await,
-                |a, b| a.name.as_ref() == b.name.as_ref(),
-            );
+        merge_registry_items(
+            &mut inner_result.tools,
+            self.registry.tools().await,
+            |a, b| a.name.as_ref() == b.name.as_ref(),
+        );
 
-            // Patch schemas missing "type": "object" (e.g. Parameters<serde_json::Value>)
-            sanitize_tool_schemas(&mut inner_result.tools);
+        sanitize_tool_schemas(&mut inner_result.tools);
 
-            // Apply trait-based filter
-            if let Some(ref filter) = self.context.filter {
-                inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
-            }
-
-            // Apply URL query parameter filter (?filter=tool1,tool2 excludes named tools)
-            if !query_filter.is_empty() {
-                inner_result
-                    .tools
-                    .retain(|t| !query_filter.contains(t.name.as_ref()));
-            }
-
-            Ok(inner_result)
+        if let Some(ref filter) = self.context.filter {
+            inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
         }
+
+        if !query_filter.is_empty() {
+            inner_result
+                .tools
+                .retain(|t| !query_filter.contains(t.name.as_ref()));
+        }
+
+        Ok(inner_result)
     }
 
     // ── list_prompts: merge + filter ─────────────────────────────────
 
-    fn list_prompts(
+    async fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.context.token_store).await;
-            let mut inner_result = self.inner.list_prompts(request, context).await?;
+    ) -> Result<ListPromptsResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
+        let token = resolve_token(&context.extensions, &self.context.token_store).await;
+        let mut inner_result = self.inner.list_prompts(request, context).await?;
 
-            merge_registry_items(
-                &mut inner_result.prompts,
-                self.registry.prompts().await,
-                |a, b| a.name == b.name,
-            );
+        merge_registry_items(
+            &mut inner_result.prompts,
+            self.registry.prompts().await,
+            |a, b| a.name == b.name,
+        );
 
-            if let Some(ref filter) = self.context.filter {
-                inner_result.prompts = filter.filter_prompts(inner_result.prompts, token.as_ref());
-            }
-
-            Ok(inner_result)
+        if let Some(ref filter) = self.context.filter {
+            inner_result.prompts = filter.filter_prompts(inner_result.prompts, token.as_ref());
         }
+
+        Ok(inner_result)
     }
 
     // ── list_resources: merge + filter ───────────────────────────────
 
-    fn list_resources(
+    async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
-            let token = resolve_token(&context.extensions, &self.context.token_store).await;
-            let mut inner_result = self.inner.list_resources(request, context).await?;
+    ) -> Result<ListResourcesResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
+        let token = resolve_token(&context.extensions, &self.context.token_store).await;
+        let mut inner_result = self.inner.list_resources(request, context).await?;
 
-            merge_registry_items(
-                &mut inner_result.resources,
-                self.registry.resources().await,
-                |a, b| a.raw.uri == b.raw.uri,
-            );
+        merge_registry_items(
+            &mut inner_result.resources,
+            self.registry.resources().await,
+            |a, b| a.raw.uri == b.raw.uri,
+        );
 
-            if let Some(ref filter) = self.context.filter {
-                inner_result.resources =
-                    filter.filter_resources(inner_result.resources, token.as_ref());
-            }
-
-            Ok(inner_result)
+        if let Some(ref filter) = self.context.filter {
+            inner_result.resources =
+                filter.filter_resources(inner_result.resources, token.as_ref());
         }
+
+        Ok(inner_result)
     }
 
     // ── call_tool: registry first, fallback to inner ─────────────────
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
+    ) -> Result<CallToolResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
 
-            // Access validation (authorization check before execution)
-            if let Some(ref validator) = self.context.access_validator {
-                let token = resolve_token(&context.extensions, &self.context.token_store).await;
-                let session_id = resolve_session_id(&context.extensions);
-                let decision = validator
-                    .validate_tool_call(
-                        request.name.as_ref(),
-                        request.arguments.as_ref(),
-                        token.as_ref(),
-                        session_id,
-                    )
-                    .await;
-                if let AccessDecision::Deny(reason) = decision {
-                    return Err(McpError::invalid_request(
-                        format!("Access denied for tool '{}': {}", request.name, reason),
-                        None,
-                    ));
-                }
-            }
-
-            // Reject tools excluded by URL query filter
-            let query_filter = resolve_query_filter(&context.extensions);
-            if query_filter.contains(request.name.as_ref()) {
+        if let Some(ref validator) = self.context.access_validator {
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
+            let session_id = resolve_session_id(&context.extensions);
+            let decision = validator
+                .validate_tool_call(
+                    request.name.as_ref(),
+                    request.arguments.as_ref(),
+                    token.as_ref(),
+                    session_id,
+                )
+                .await;
+            if let AccessDecision::Deny(reason) = decision {
                 return Err(McpError::invalid_request(
-                    format!("Tool '{}' is not available", request.name),
+                    format!("Access denied for tool '{}': {}", request.name, reason),
                     None,
                 ));
             }
+        }
 
-            // When a logger is configured, capture state before dispatch
-            let has_logger = self.context.tool_call_logger.is_some();
-            let tool_name = if has_logger { Some(request.name.to_string()) } else { None };
-            let session_id = if has_logger { Some(resolve_session_id(&context.extensions).to_string()) } else { None };
-            let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
+        let query_filter = resolve_query_filter(&context.extensions);
+        if query_filter.contains(request.name.as_ref()) {
+            return Err(McpError::invalid_request(
+                format!("Tool '{}' is not available", request.name),
+                None,
+            ));
+        }
 
-            // Dispatch: try registry first, fall back to inner.
-            // Clone arguments once for registry probe; reuse for audit if needed.
-            let reg_args = request.arguments.clone();
-            let (result, source) = if let Some(reg_result) = self
-                .registry
-                .try_call_tool(&request.name, reg_args.clone())
-                .await
-            {
-                (reg_result, ToolCallSource::Registry)
-            } else {
-                (
-                    self.inner.call_tool(request, context).await,
-                    ToolCallSource::Inner,
-                )
+        let has_logger = self.context.tool_call_logger.is_some();
+        let tool_name = if has_logger { Some(request.name.to_string()) } else { None };
+        let session_id = if has_logger { Some(resolve_session_id(&context.extensions).to_string()) } else { None };
+        let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
+
+        // Dispatch: try registry first, fall back to inner.
+        // Clone arguments once for the registry probe; move the original into audit_args.
+        let (result, source, audit_args) = if let Some(reg_result) = self
+            .registry
+            .try_call_tool(&request.name, request.arguments.clone())
+            .await
+        {
+            (reg_result, ToolCallSource::Registry, request.arguments)
+        } else {
+            let audit_args = if has_logger { request.arguments.clone() } else { None };
+            (
+                self.inner.call_tool(request, context).await,
+                ToolCallSource::Inner,
+                audit_args,
+            )
+        };
+
+        if let (Some(logger), Some(tool_name), Some(session_id), Some((start_wall, start_instant))) =
+            (self.context.tool_call_logger.clone(), tool_name, session_id, start)
+        {
+            let duration = start_instant.elapsed();
+            let outcome = match &result {
+                Ok(call_result) => ToolCallOutcome::Success {
+                    is_error: call_result.is_error.unwrap_or(false),
+                    content_summary: summarize_content(&call_result.content),
+                },
+                Err(mcp_err) => ToolCallOutcome::McpError {
+                    code: mcp_err.code.0,
+                    message: mcp_err.message.to_string(),
+                },
             };
 
-            if let (Some(logger), Some(tool_name), Some(session_id), Some((start_wall, start_instant))) =
-                (self.context.tool_call_logger.clone(), tool_name, session_id, start)
-            {
-                let duration = start_instant.elapsed();
-                let outcome = match &result {
-                    Ok(call_result) => ToolCallOutcome::Success {
-                        is_error: call_result.is_error.unwrap_or(false),
-                        content_summary: summarize_content(&call_result.content),
-                    },
-                    Err(mcp_err) => ToolCallOutcome::McpError {
-                        code: mcp_err.code.0,
-                        message: mcp_err.message.to_string(),
-                    },
-                };
+            let record = ToolCallRecord {
+                tool_name,
+                arguments: audit_args,
+                session_id,
+                timestamp: start_wall,
+                duration,
+                source,
+                outcome,
+            };
 
-                let record = ToolCallRecord {
-                    tool_name,
-                    arguments: reg_args,
-                    session_id,
-                    timestamp: start_wall,
-                    duration,
-                    source,
-                    outcome,
-                };
-
-                // Observe the JoinHandle so logger panics are reported
-                // instead of silently swallowed.
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::spawn(async move {
-                        logger.log(record).await;
-                    }).await {
-                        tracing::error!("audit logger panicked: {e}");
-                    }
-                });
-            }
-
-            result
+            tokio::spawn(async move {
+                if let Err(e) = tokio::spawn(async move {
+                    logger.log(record).await;
+                }).await {
+                    tracing::error!("audit logger panicked: {e}");
+                }
+            });
         }
+
+        result
     }
 
     // ── get_prompt: registry first, fallback to inner ────────────────
 
-    fn get_prompt(
+    async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
+    ) -> Result<GetPromptResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
 
-            if let Some(ref validator) = self.context.access_validator {
-                let token = resolve_token(&context.extensions, &self.context.token_store).await;
-                let session_id = resolve_session_id(&context.extensions);
-                let decision = validator
-                    .validate_prompt_access(
-                        &request.name,
-                        request.arguments.as_ref(),
-                        token.as_ref(),
-                        session_id,
-                    )
-                    .await;
-                if let AccessDecision::Deny(reason) = decision {
-                    return Err(McpError::invalid_request(
-                        format!("Access denied for prompt '{}': {}", request.name, reason),
-                        None,
-                    ));
-                }
+        if let Some(ref validator) = self.context.access_validator {
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
+            let session_id = resolve_session_id(&context.extensions);
+            let decision = validator
+                .validate_prompt_access(
+                    &request.name,
+                    request.arguments.as_ref(),
+                    token.as_ref(),
+                    session_id,
+                )
+                .await;
+            if let AccessDecision::Deny(reason) = decision {
+                return Err(McpError::invalid_request(
+                    format!("Access denied for prompt '{}': {}", request.name, reason),
+                    None,
+                ));
             }
-
-            if let Some(result) = self.registry.get_prompt(&request).await {
-                return result;
-            }
-            self.inner.get_prompt(request, context).await
         }
+
+        if let Some(result) = self.registry.get_prompt(&request).await {
+            return result;
+        }
+        self.inner.get_prompt(request, context).await
     }
 
     // ── read_resource: registry first, fallback to inner ─────────────
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
-        async move {
-            self.enrich_extensions(&mut context.extensions);
+    ) -> Result<ReadResourceResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
 
-            if let Some(ref validator) = self.context.access_validator {
-                let token = resolve_token(&context.extensions, &self.context.token_store).await;
-                let session_id = resolve_session_id(&context.extensions);
-                let decision = validator
-                    .validate_resource_access(
-                        &request.uri,
-                        token.as_ref(),
-                        session_id,
-                    )
-                    .await;
-                if let AccessDecision::Deny(reason) = decision {
-                    return Err(McpError::invalid_request(
-                        format!("Access denied for resource '{}': {}", request.uri, reason),
-                        None,
-                    ));
-                }
+        if let Some(ref validator) = self.context.access_validator {
+            let token = resolve_token(&context.extensions, &self.context.token_store).await;
+            let session_id = resolve_session_id(&context.extensions);
+            let decision = validator
+                .validate_resource_access(
+                    &request.uri,
+                    token.as_ref(),
+                    session_id,
+                )
+                .await;
+            if let AccessDecision::Deny(reason) = decision {
+                return Err(McpError::invalid_request(
+                    format!("Access denied for resource '{}': {}", request.uri, reason),
+                    None,
+                ));
             }
-
-            if let Some(result) = self.registry.read_resource(&request).await {
-                return result;
-            }
-            self.inner.read_resource(request, context).await
         }
+
+        if let Some(result) = self.registry.read_resource(&request).await {
+            return result;
+        }
+        self.inner.read_resource(request, context).await
     }
 
     // ── get_tool: check registry first, then inner ─────────────────

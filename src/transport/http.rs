@@ -11,8 +11,8 @@ use rmcp::ServerHandler;
 use crate::auth::{
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
     mcp_oauth_router, oauth_router, protected_resource_metadata_handler, AuthMiddlewareState,
-    AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthState, RefreshConfig, TokenStore,
-    WellKnownState,
+    AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig, OAuthState, RefreshConfig,
+    TokenStore, WellKnownState,
 };
 use crate::audit::ToolCallLogger;
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
@@ -85,6 +85,61 @@ fn wrap_auth_middleware(
     }
 }
 
+/// Build OAuth discovery and authorization routes.
+fn setup_oauth_routes(
+    oauth_config: &OAuthConfig,
+    public_url: &str,
+    app_name: &str,
+    token_store: &TokenStore,
+) -> Router {
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let well_known_state = Arc::new(WellKnownState {
+        resource_url: format!("{}/mcp", public_url),
+        authorization_server: public_url.to_string(),
+        scopes: oauth_config.scopes.clone(),
+    });
+
+    let mcp_oauth_state = McpOAuthState {
+        public_url: public_url.to_string(),
+        keycloak_realm_url: oauth_config.issuer_url.clone(),
+        keycloak_client_id: oauth_config.client_id.clone(),
+        keycloak_client_secret: oauth_config.client_secret.clone(),
+        http_client: http_client.clone(),
+        token_store: token_store.clone(),
+    };
+
+    let oauth_state = OAuthState {
+        config: oauth_config.clone(),
+        store: token_store.clone(),
+        http_client,
+        app_name: app_name.to_string(),
+    };
+
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server_metadata_handler)
+                .with_state(Arc::new(mcp_oauth_state.clone())),
+        )
+        .nest(
+            "/oauth",
+            mcp_oauth_router(mcp_oauth_state).merge(oauth_router(oauth_state)),
+        )
+}
+
 /// Build the axum router with all routes configured.
 ///
 /// Returns `(Router, TokenStore)` so the caller can start a cleanup task on
@@ -95,7 +150,6 @@ where
     S: ServerHandler + Send + 'static,
     T: Send + Sync + Default + Clone + 'static,
 {
-    // Create token store based on auth mode
     let mut token_store = match &config.auth {
         AuthProvider::OAuth(oauth_config) => {
             let refresh_config = RefreshConfig {
@@ -111,63 +165,19 @@ where
         _ => TokenStore::new(),
     };
 
-    // Apply global claims decoder if configured
     if let Some(decoder) = config.claims_decoder {
         token_store.claims_decoder = Some(decoder);
     }
 
-    // Start building the router
     let mut app = Router::new();
 
-    // OAuth-specific routes (only registered for AuthProvider::OAuth)
     if let AuthProvider::OAuth(oauth_config) = &config.auth {
-        let http_client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HTTP client");
-
-        // Both well-known endpoints describe the same protected resource: the MCP endpoint at /mcp
-        let well_known_state = Arc::new(WellKnownState {
-            resource_url: format!("{}/mcp", config.public_url),
-            authorization_server: config.public_url.clone(),
-            scopes: oauth_config.scopes.clone(),
-        });
-
-        let mcp_oauth_state = McpOAuthState {
-            public_url: config.public_url.clone(),
-            keycloak_realm_url: oauth_config.issuer_url.clone(),
-            keycloak_client_id: oauth_config.client_id.clone(),
-            keycloak_client_secret: oauth_config.client_secret.clone(),
-            http_client: http_client.clone(),
-            token_store: token_store.clone(),
-        };
-
-        let oauth_state = OAuthState {
-            config: oauth_config.clone(),
-            store: token_store.clone(),
-            http_client,
-            app_name: config.app_name.clone(),
-        };
-
-        app = app
-            .route(
-                "/.well-known/oauth-protected-resource",
-                get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/mcp",
-                get(protected_resource_metadata_handler).with_state(well_known_state.clone()),
-            )
-            .route(
-                "/.well-known/oauth-authorization-server",
-                get(authorization_server_metadata_handler)
-                    .with_state(Arc::new(mcp_oauth_state.clone())),
-            )
-            .nest(
-                "/oauth",
-                mcp_oauth_router(mcp_oauth_state).merge(oauth_router(oauth_state)),
-            );
+        app = app.merge(setup_oauth_routes(
+            oauth_config,
+            &config.public_url,
+            &config.app_name,
+            &token_store,
+        ));
     }
 
     // Create MCP service / router with Streamable HTTP transport
@@ -191,8 +201,8 @@ where
         "127.0.0.1".into(),
         "::1".into(),
     ];
-    if let Ok(url) = url::Url::parse(&config.public_url) {
-        if let Some(host) = url.host_str() {
+    if let Ok(url) = url::Url::parse(&config.public_url)
+        && let Some(host) = url.host_str() {
             let authority = match url.port() {
                 Some(port) => format!("{host}:{port}"),
                 None => host.to_string(),
@@ -201,7 +211,6 @@ where
                 allowed_hosts.push(authority);
             }
         }
-    }
     tracing::info!(allowed_hosts = ?allowed_hosts, "MCP host validation configured");
     let mcp_config = StreamableHttpServerConfig::default()
         .with_sse_retry(None)

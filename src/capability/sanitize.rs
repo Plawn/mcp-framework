@@ -60,9 +60,9 @@ fn sanitize_value_recursive(value: &mut Value) {
 fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
     match value {
         Value::Object(map) => {
-            if let Some(Value::String(ref_str)) = map.get("$ref") {
-                if let Some(name) = ref_str.strip_prefix("#/$defs/") {
-                    if let Some(def) = defs.get(name) {
+            if let Some(Value::String(ref_str)) = map.get("$ref")
+                && let Some(name) = ref_str.strip_prefix("#/$defs/")
+                    && let Some(def) = defs.get(name) {
                         let mut inlined = def.clone();
                         if let Value::Object(ref mut inlined_map) = inlined {
                             for (k, v) in map.iter() {
@@ -104,8 +104,6 @@ fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
                         resolve_refs(value, defs);
                         return;
                     }
-                }
-            }
             for v in map.values_mut() {
                 resolve_refs(v, defs);
             }

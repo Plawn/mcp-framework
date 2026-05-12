@@ -11,6 +11,22 @@ use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+enum NotifyKind {
+    Tools,
+    Prompts,
+    Resources,
+}
+
+impl std::fmt::Display for NotifyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tools => write!(f, "tool list"),
+            Self::Prompts => write!(f, "prompt list"),
+            Self::Resources => write!(f, "resource list"),
+        }
+    }
+}
+
 /// Type-erased async handler for a dynamic tool.
 ///
 /// Receives the optional JSON arguments and returns a `CallToolResult`.
@@ -81,14 +97,14 @@ impl CapabilityRegistry {
         let name = tool.name.to_string();
         let handler: ToolHandler = Arc::new(move |args| Box::pin(handler(args)));
         self.tools.write().await.insert(name, (tool, handler));
-        self.notify_tools_changed().await;
+        self.notify_peers(NotifyKind::Tools).await;
     }
 
     /// Remove a dynamic tool by name. Returns `true` if it existed.
     pub async fn remove_tool(&self, name: &str) -> bool {
         let removed = self.tools.write().await.remove(name).is_some();
         if removed {
-            self.notify_tools_changed().await;
+            self.notify_peers(NotifyKind::Tools).await;
         }
         removed
     }
@@ -114,14 +130,14 @@ impl CapabilityRegistry {
         let name = prompt.name.clone();
         let handler: PromptHandler = Arc::new(move |params| Box::pin(handler(params)));
         self.prompts.write().await.insert(name, (prompt, handler));
-        self.notify_prompts_changed().await;
+        self.notify_peers(NotifyKind::Prompts).await;
     }
 
     /// Remove a dynamic prompt by name. Returns `true` if it existed.
     pub async fn remove_prompt(&self, name: &str) -> bool {
         let removed = self.prompts.write().await.remove(name).is_some();
         if removed {
-            self.notify_prompts_changed().await;
+            self.notify_peers(NotifyKind::Prompts).await;
         }
         removed
     }
@@ -147,14 +163,14 @@ impl CapabilityRegistry {
         let uri = resource.raw.uri.clone();
         let handler: ResourceHandler = Arc::new(move |params| Box::pin(handler(params)));
         self.resources.write().await.insert(uri, (resource, handler));
-        self.notify_resources_changed().await;
+        self.notify_peers(NotifyKind::Resources).await;
     }
 
     /// Remove a dynamic resource by URI. Returns `true` if it existed.
     pub async fn remove_resource(&self, uri: &str) -> bool {
         let removed = self.resources.write().await.remove(uri).is_some();
         if removed {
-            self.notify_resources_changed().await;
+            self.notify_peers(NotifyKind::Resources).await;
         }
         removed
     }
@@ -269,7 +285,7 @@ impl CapabilityRegistry {
 
     // ── Internal: notifications ──────────────────────────────────────
 
-    async fn notify_tools_changed(&self) {
+    async fn notify_peers(&self, kind: NotifyKind) {
         let mut peers = self.peers.write().await;
         let mut to_remove = Vec::new();
         for (i, peer) in peers.iter().enumerate() {
@@ -277,45 +293,13 @@ impl CapabilityRegistry {
                 to_remove.push(i);
                 continue;
             }
-            if let Err(e) = peer.notify_tool_list_changed().await {
-                tracing::warn!("Failed to notify peer of tool list change: {}", e);
-                to_remove.push(i);
-            }
-        }
-        // Remove closed/failed peers in reverse order to keep indices valid
-        for i in to_remove.into_iter().rev() {
-            peers.swap_remove(i);
-        }
-    }
-
-    async fn notify_prompts_changed(&self) {
-        let mut peers = self.peers.write().await;
-        let mut to_remove = Vec::new();
-        for (i, peer) in peers.iter().enumerate() {
-            if peer.is_transport_closed() {
-                to_remove.push(i);
-                continue;
-            }
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("Failed to notify peer of prompt list change: {}", e);
-                to_remove.push(i);
-            }
-        }
-        for i in to_remove.into_iter().rev() {
-            peers.swap_remove(i);
-        }
-    }
-
-    async fn notify_resources_changed(&self) {
-        let mut peers = self.peers.write().await;
-        let mut to_remove = Vec::new();
-        for (i, peer) in peers.iter().enumerate() {
-            if peer.is_transport_closed() {
-                to_remove.push(i);
-                continue;
-            }
-            if let Err(e) = peer.notify_resource_list_changed().await {
-                tracing::warn!("Failed to notify peer of resource list change: {}", e);
+            let result = match kind {
+                NotifyKind::Tools => peer.notify_tool_list_changed().await,
+                NotifyKind::Prompts => peer.notify_prompt_list_changed().await,
+                NotifyKind::Resources => peer.notify_resource_list_changed().await,
+            };
+            if let Err(e) = result {
+                tracing::warn!("Failed to notify peer of {kind} change: {e}");
                 to_remove.push(i);
             }
         }

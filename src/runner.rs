@@ -399,14 +399,13 @@ where
             })?;
 
             // Validate session_ttl >= 1 second
-            if let Some(ttl) = s.session_ttl {
-                if ttl < Duration::from_secs(1) {
+            if let Some(ttl) = s.session_ttl
+                && ttl < Duration::from_secs(1) {
                     anyhow::bail!(
                         "McpAppBuilder: session_ttl must be at least 1 second, got {:?}",
                         ttl
                     );
                 }
-            }
         }
 
         // Validate OAuth config fields are non-empty
@@ -423,13 +422,12 @@ where
         }
 
         // Warn if auth != None in stdio mode (auth is ignored there)
-        if let Some(ref s) = self.settings {
-            if s.transport == TransportMode::Stdio && !matches!(self.auth, AuthProvider::None) {
+        if let Some(ref s) = self.settings
+            && s.transport == TransportMode::Stdio && !matches!(self.auth, AuthProvider::None) {
                 tracing::warn!(
                     "Auth provider is set but transport is Stdio — auth will be ignored"
                 );
             }
-        }
 
         Ok(())
     }

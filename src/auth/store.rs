@@ -299,11 +299,10 @@ impl TokenStore {
             let _guard = lock.lock().await;
 
             // Double-check: another task may have refreshed while we waited
-            if let Some(refreshed) = self.get_token_raw(session_id).await {
-                if !refreshed.is_expired() {
+            if let Some(refreshed) = self.get_token_raw(session_id).await
+                && !refreshed.is_expired() {
                     return Some(refreshed);
                 }
-            }
 
             // Still expired — do the refresh
             match self.refresh_token(session_id).await {
