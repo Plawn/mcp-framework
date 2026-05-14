@@ -27,6 +27,7 @@ pub const OAUTH_STATUS_PATH: &str = "/status";
 // === Persistence namespaces ===
 pub const NS_TOKENS: &str = "tokens";
 pub const NS_SESSIONS: &str = "sessions";
+pub const NS_CAP_VERSIONS: &str = "cap_versions";
 
 // === Auth ===
 pub const BEARER_PREFIX: &str = "Bearer ";

@@ -240,3 +240,149 @@ async fn cloned_registry_shares_state() {
 
     assert_eq!(reg2.tools().await.len(), 1);
 }
+
+// ── Version tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn empty_registry_has_consistent_version() {
+    let reg1 = CapabilityRegistry::new();
+    let reg2 = CapabilityRegistry::new();
+    assert_eq!(reg1.version(), reg2.version());
+}
+
+#[tokio::test]
+async fn version_changes_on_add_tool() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool(make_tool("a"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    let v1 = reg.version();
+    assert_ne!(v1, 0);
+
+    reg.add_tool(make_tool("b"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    let v2 = reg.version();
+    assert_ne!(v2, v1);
+}
+
+#[tokio::test]
+async fn version_changes_on_remove_tool() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool(make_tool("x"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    let v = reg.version();
+
+    reg.remove_tool("x").await;
+    assert_ne!(reg.version(), v);
+}
+
+#[tokio::test]
+async fn version_unchanged_on_noop_remove() {
+    let reg = CapabilityRegistry::new();
+    let v = reg.version();
+    reg.remove_tool("nonexistent").await;
+    assert_eq!(reg.version(), v);
+}
+
+#[tokio::test]
+async fn version_changes_on_prompt_mutations() {
+    let reg = CapabilityRegistry::new();
+    let empty_version = reg.version();
+
+    reg.add_prompt(make_prompt("p"), |_| async {
+        Ok(GetPromptResult::new(vec![]))
+    })
+    .await;
+    assert_ne!(reg.version(), empty_version);
+
+    reg.remove_prompt("p").await;
+    assert_eq!(reg.version(), empty_version);
+}
+
+#[tokio::test]
+async fn version_changes_on_resource_mutations() {
+    let reg = CapabilityRegistry::new();
+    let empty_version = reg.version();
+
+    reg.add_resource(make_resource("file:///a"), |_| async {
+        Ok(ReadResourceResult::new(vec![]))
+    })
+    .await;
+    assert_ne!(reg.version(), empty_version);
+
+    reg.remove_resource("file:///a").await;
+    assert_eq!(reg.version(), empty_version);
+}
+
+#[tokio::test]
+async fn version_returns_to_original_after_add_remove() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool(make_tool("a"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    let v_with_a = reg.version();
+
+    reg.add_tool(make_tool("b"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    assert_ne!(reg.version(), v_with_a);
+
+    reg.remove_tool("b").await;
+    assert_eq!(reg.version(), v_with_a);
+}
+
+#[tokio::test]
+async fn version_deterministic_across_registries() {
+    let reg1 = CapabilityRegistry::new();
+    let reg2 = CapabilityRegistry::new();
+
+    for reg in [&reg1, &reg2] {
+        reg.add_tool(make_tool("a"), |_| async {
+            Ok(CallToolResult::success(vec![]))
+        })
+        .await;
+        reg.add_prompt(make_prompt("b"), |_| async {
+            Ok(GetPromptResult::new(vec![]))
+        })
+        .await;
+    }
+
+    assert_eq!(reg1.version(), reg2.version());
+}
+
+#[tokio::test]
+async fn version_differs_with_different_tools() {
+    let reg1 = CapabilityRegistry::new();
+    let reg2 = CapabilityRegistry::new();
+
+    reg1.add_tool(make_tool("a"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    reg2.add_tool(make_tool("b"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+
+    assert_ne!(reg1.version(), reg2.version());
+}
+
+#[tokio::test]
+async fn version_shared_across_clones() {
+    let reg = CapabilityRegistry::new();
+    let reg2 = reg.clone();
+
+    reg.add_tool(make_tool("x"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+
+    assert_eq!(reg2.version(), reg.version());
+}

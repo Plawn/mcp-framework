@@ -147,7 +147,7 @@ fn setup_oauth_routes(
 ///
 /// Returns `(Router, TokenStore)` so the caller can start a cleanup task on
 /// the token store and abort it on shutdown.
-pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore)
+pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore, CapabilityRegistry)
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
@@ -171,8 +171,11 @@ where
     if let Some(decoder) = config.claims_decoder {
         token_store.claims_decoder = Some(decoder);
     }
-    if let Some(backend) = config.persistence {
-        token_store.set_persistence(backend);
+
+    let mut registry = config.capability_registry.unwrap_or_default();
+    if let Some(ref backend) = config.persistence {
+        token_store.set_persistence(backend.clone());
+        registry.set_persistence(backend.clone());
     }
 
     let mut app = Router::new();
@@ -188,7 +191,7 @@ where
 
     // Create MCP service / router with Streamable HTTP transport
     let factory = config.server_factory;
-    let registry = config.capability_registry.unwrap_or_default();
+    let registry_ref = registry.clone();
     let filter = config.capability_filter;
     let access_validator = config.access_validator;
     let token_store_clone = token_store.clone();
@@ -304,7 +307,7 @@ where
             },
         );
 
-    (app.layer(cors).layer(trace_layer), token_store)
+    (app.layer(cors).layer(trace_layer), token_store, registry_ref)
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
@@ -349,10 +352,14 @@ where
     // Start session cleanup task
     let session_cleanup = config.session_store.start_cleanup_task();
 
-    let (app, token_store) = build_app(config);
+    let (app, token_store, registry) = build_app(config);
 
     token_store.load_persisted().await.map_err(|e| {
         anyhow::anyhow!("failed to load persisted tokens: {e}")
+    })?;
+
+    registry.load_persisted_versions().await.map_err(|e| {
+        anyhow::anyhow!("failed to load persisted capability versions: {e}")
     })?;
 
     // Start token cleanup task (purge expired tokens every 5 minutes)

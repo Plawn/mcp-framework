@@ -435,12 +435,16 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.inner.on_progress(notification, context)
     }
 
-    fn on_initialized(
+    async fn on_initialized(
         &self,
         mut context: NotificationContext<RoleServer>,
-    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+    ) {
         self.enrich_extensions(&mut context.extensions);
-        self.inner.on_initialized(context)
+        let session_id = resolve_session_id(&context.extensions);
+        self.registry
+            .notify_if_changed(session_id, &context.peer)
+            .await;
+        self.inner.on_initialized(context).await;
     }
 
     fn on_roots_list_changed(

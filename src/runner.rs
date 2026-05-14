@@ -640,7 +640,11 @@ where
     }
 
     let server = (app.server_factory)();
-    let registry = app.capability_registry.unwrap_or_default();
+    let mut registry = app.capability_registry.unwrap_or_default();
+    if let Some(ref backend) = app.persistence {
+        registry.set_persistence(backend.clone());
+        registry.load_persisted_versions().await.map_err(anyhow::Error::from_boxed)?;
+    }
     let handler = DynamicHandler::new(
         server,
         registry,

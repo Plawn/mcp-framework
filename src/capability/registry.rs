@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::model::{
     CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
@@ -10,6 +12,9 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
 use tokio::sync::RwLock;
+
+use crate::constants::NS_CAP_VERSIONS;
+use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
 
 enum NotifyKind {
     Tools,
@@ -56,6 +61,19 @@ pub type ResourceHandler = Arc<
         + Sync,
 >;
 
+async fn hash_sorted_keys<V>(map: &RwLock<HashMap<String, V>>, hasher: &mut impl Hasher) {
+    let guard = map.read().await;
+    let mut keys: Vec<&String> = guard.keys().collect();
+    keys.sort();
+    for key in keys {
+        key.hash(hasher);
+    }
+}
+
+fn empty_capability_hash() -> u64 {
+    std::collections::hash_map::DefaultHasher::new().finish()
+}
+
 /// A thread-safe registry for dynamic MCP capabilities (tools, prompts, resources).
 ///
 /// The registry stores capabilities alongside their execution handlers and keeps
@@ -70,6 +88,9 @@ pub struct CapabilityRegistry {
     prompts: Arc<RwLock<HashMap<String, (Prompt, PromptHandler)>>>,
     resources: Arc<RwLock<HashMap<String, (Resource, ResourceHandler)>>>,
     peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+    version: Arc<AtomicU64>,
+    session_versions: Arc<RwLock<HashMap<String, u64>>>,
+    persistence: Option<Arc<dyn PersistenceBackend>>,
 }
 
 impl CapabilityRegistry {
@@ -80,6 +101,96 @@ impl CapabilityRegistry {
             prompts: Arc::new(RwLock::new(HashMap::new())),
             resources: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(Vec::new())),
+            version: Arc::new(AtomicU64::new(empty_capability_hash())),
+            session_versions: Arc::new(RwLock::new(HashMap::new())),
+            persistence: None,
+        }
+    }
+
+    // ── Versioning ──────────────────────────────────────────────────
+
+    async fn recompute_version(&self) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_sorted_keys(&self.tools, &mut hasher).await;
+        hash_sorted_keys(&self.prompts, &mut hasher).await;
+        hash_sorted_keys(&self.resources, &mut hasher).await;
+        self.version.store(hasher.finish(), Ordering::Release);
+    }
+
+    /// Current capability version — a content hash of all registered names/URIs.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Attach a persistence backend for `session_versions`.
+    pub fn set_persistence(&mut self, backend: Arc<dyn PersistenceBackend>) {
+        self.persistence = Some(backend);
+    }
+
+    /// Load persisted session versions from the backend.
+    pub async fn load_persisted_versions(&self) -> Result<(), PersistenceError> {
+        let backend = match &self.persistence {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let keys = backend.keys(NS_CAP_VERSIONS).await?;
+        let mut loaded = 0usize;
+
+        for key in keys {
+            let bytes = match backend.get(NS_CAP_VERSIONS, &key).await? {
+                Some(b) => b,
+                None => continue,
+            };
+            match serde_json::from_slice::<u64>(&bytes) {
+                Ok(v) => {
+                    self.session_versions.write().await.insert(key, v);
+                    loaded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping corrupted cap_version {key}: {e}");
+                }
+            }
+        }
+
+        if loaded > 0 {
+            tracing::info!("Loaded {loaded} persisted capability version(s)");
+        }
+        Ok(())
+    }
+
+    /// Compare the current version with the last version seen by a session.
+    /// If they differ (or the session is new), send list-changed notifications
+    /// and update the tracked version.
+    pub(crate) async fn notify_if_changed(&self, session_id: &str, peer: &Peer<RoleServer>) {
+        let current = self.version();
+
+        let should_notify = {
+            let mut versions = self.session_versions.write().await;
+            let stale = match versions.get(session_id) {
+                Some(&last) => last != current,
+                None => true,
+            };
+            if stale {
+                versions.insert(session_id.to_string(), current);
+            }
+            stale
+        };
+
+        if should_notify {
+            if let Some(ref backend) = self.persistence {
+                spawn_persist(backend, NS_CAP_VERSIONS, session_id.to_string(), &current, None);
+            }
+
+            if let Err(e) = peer.notify_tool_list_changed().await {
+                tracing::warn!("Failed to notify session {session_id} of tool list change: {e}");
+            }
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("Failed to notify session {session_id} of prompt list change: {e}");
+            }
+            if let Err(e) = peer.notify_resource_list_changed().await {
+                tracing::warn!("Failed to notify session {session_id} of resource list change: {e}");
+            }
         }
     }
 
@@ -97,6 +208,7 @@ impl CapabilityRegistry {
         let name = tool.name.to_string();
         let handler: ToolHandler = Arc::new(move |args| Box::pin(handler(args)));
         self.tools.write().await.insert(name, (tool, handler));
+        self.recompute_version().await;
         self.notify_peers(NotifyKind::Tools).await;
     }
 
@@ -104,6 +216,7 @@ impl CapabilityRegistry {
     pub async fn remove_tool(&self, name: &str) -> bool {
         let removed = self.tools.write().await.remove(name).is_some();
         if removed {
+            self.recompute_version().await;
             self.notify_peers(NotifyKind::Tools).await;
         }
         removed
@@ -130,6 +243,7 @@ impl CapabilityRegistry {
         let name = prompt.name.clone();
         let handler: PromptHandler = Arc::new(move |params| Box::pin(handler(params)));
         self.prompts.write().await.insert(name, (prompt, handler));
+        self.recompute_version().await;
         self.notify_peers(NotifyKind::Prompts).await;
     }
 
@@ -137,6 +251,7 @@ impl CapabilityRegistry {
     pub async fn remove_prompt(&self, name: &str) -> bool {
         let removed = self.prompts.write().await.remove(name).is_some();
         if removed {
+            self.recompute_version().await;
             self.notify_peers(NotifyKind::Prompts).await;
         }
         removed
@@ -163,6 +278,7 @@ impl CapabilityRegistry {
         let uri = resource.raw.uri.clone();
         let handler: ResourceHandler = Arc::new(move |params| Box::pin(handler(params)));
         self.resources.write().await.insert(uri, (resource, handler));
+        self.recompute_version().await;
         self.notify_peers(NotifyKind::Resources).await;
     }
 
@@ -170,6 +286,7 @@ impl CapabilityRegistry {
     pub async fn remove_resource(&self, uri: &str) -> bool {
         let removed = self.resources.write().await.remove(uri).is_some();
         if removed {
+            self.recompute_version().await;
             self.notify_peers(NotifyKind::Resources).await;
         }
         removed
