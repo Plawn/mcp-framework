@@ -497,7 +497,8 @@ fn init_tracing(level: &str) {
                 .unwrap_or_else(|_| level.into()),
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .init();
+        .try_init()
+        .ok();
 }
 
 fn setup_tracing_from_cli(args: &CliArgs) {
