@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::model::{
-    CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
-    ReadResourceRequestParams, ReadResourceResult, Resource, Tool,
+    Annotated, CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
+    RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, Tool,
 };
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
@@ -300,6 +300,49 @@ impl CapabilityRegistry {
             .values()
             .map(|(r, _)| r.clone())
             .collect()
+    }
+
+    // ── MCP Apps (ext-apps) ──────────────────────────────────────────
+
+    /// Register an MCP App resource — a single-file HTML bundle served via
+    /// `resources/read` with MIME type `application/vnd.mcp.app+html`.
+    ///
+    /// The `uri` must use the `ui://` scheme (e.g. `ui://my-server/nps-chart`).
+    /// The `html` content is stored in memory and returned verbatim on read.
+    pub async fn register_app_resource(&self, uri: impl Into<String>, html: impl Into<String>) {
+        let uri: String = uri.into();
+        let html: String = html.into();
+        let resource = Annotated {
+            raw: RawResource::new(&uri, &uri)
+                .with_mime_type(crate::constants::APP_MIME_TYPE),
+            annotations: None,
+        };
+        let uri_clone = uri.clone();
+        self.add_resource(resource, move |_params| {
+            let uri = uri_clone.clone();
+            let html = html.clone();
+            async move {
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(html, uri)
+                        .with_mime_type(crate::constants::APP_MIME_TYPE),
+                ]))
+            }
+        })
+        .await;
+    }
+
+    /// Enrich a [`Tool`] with `_meta.ui.resourceUri` so that MCP hosts render
+    /// the associated app resource inline.
+    ///
+    /// This is a pure transformation — the tool is not registered. Call
+    /// [`add_tool`](Self::add_tool) separately.
+    pub fn app_tool(mut tool: Tool, resource_uri: &str) -> Tool {
+        let mut meta = tool.meta.take().unwrap_or_default();
+        meta.0.insert(
+            "ui".to_string(),
+            serde_json::json!({ "resourceUri": resource_uri }),
+        );
+        tool.with_meta(meta)
     }
 
     /// Returns `true` if the registry has any tools registered.

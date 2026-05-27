@@ -178,6 +178,34 @@ McpAppBuilder::new("my-server")
     .await?;
 ```
 
+### MCP Apps / ext-apps (`src/capability/registry.rs`)
+
+Support for MCP Apps (ext-apps, spec v1.7.0) — tools that declare a `ui://` resource rendered by the host in a sandboxed iframe.
+
+Two helpers on `CapabilityRegistry`:
+
+- `register_app_resource(uri, html)` — registers a `ui://` resource with MIME type `application/vnd.mcp.app+html`. The HTML is returned verbatim via `resources/read`.
+- `app_tool(tool, resource_uri)` — static method that injects `_meta.ui.resourceUri` into a `Tool`'s metadata. Does not register the tool.
+
+```rust
+let registry = CapabilityRegistry::new();
+
+// 1. Register the HTML bundle as a ui:// resource
+registry.register_app_resource(
+    "ui://my-server/nps-chart",
+    include_str!("../ui/dist/nps-chart.html"),
+).await;
+
+// 2. Enrich the tool with _meta.ui, then register it
+let tool = CapabilityRegistry::app_tool(
+    Tool::new("get_nps", "Get NPS scores", serde_json::Map::new()),
+    "ui://my-server/nps-chart",
+);
+registry.add_tool(tool, |args| async { /* ... */ }).await;
+```
+
+The constant `APP_MIME_TYPE` is in `src/constants.rs`.
+
 ### Persistence layer (`src/persistence.rs`)
 
 `PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:

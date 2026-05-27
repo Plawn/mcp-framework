@@ -29,6 +29,9 @@ pub const NS_TOKENS: &str = "tokens";
 pub const NS_SESSIONS: &str = "sessions";
 pub const NS_CAP_VERSIONS: &str = "cap_versions";
 
+// === MCP Apps (ext-apps) ===
+pub const APP_MIME_TYPE: &str = "application/vnd.mcp.app+html";
+
 // === Auth ===
 pub const BEARER_PREFIX: &str = "Bearer ";
 pub const BEARER_PREFIX_LOWER: &str = "bearer ";

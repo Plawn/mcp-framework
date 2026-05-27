@@ -1,5 +1,5 @@
 use super::*;
-use rmcp::model::{Annotated, Content, GetPromptResult, RawResource, ReadResourceResult};
+use rmcp::model::{Annotated, Content, GetPromptResult, RawResource, ReadResourceResult, ResourceContents};
 
 fn make_tool(name: &str) -> Tool {
     Tool::new(name.to_string(), format!("Tool {name}"), serde_json::Map::new())
@@ -385,4 +385,76 @@ async fn version_shared_across_clones() {
     .await;
 
     assert_eq!(reg2.version(), reg.version());
+}
+
+// ── MCP Apps (ext-apps) tests ──────────────────────────────────
+
+#[tokio::test]
+async fn register_app_resource_listed_with_correct_mime() {
+    let reg = CapabilityRegistry::new();
+    reg.register_app_resource("ui://test/chart", "<html>chart</html>").await;
+
+    let resources = reg.resources().await;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].raw.uri, "ui://test/chart");
+    assert_eq!(
+        resources[0].raw.mime_type.as_deref(),
+        Some(crate::constants::APP_MIME_TYPE)
+    );
+}
+
+#[tokio::test]
+async fn register_app_resource_read_returns_html() {
+    let reg = CapabilityRegistry::new();
+    let html = "<html><body>NPS Dashboard</body></html>";
+    reg.register_app_resource("ui://test/nps", html).await;
+
+    let result = reg
+        .read_resource(&ReadResourceRequestParams::new("ui://test/nps"))
+        .await
+        .expect("resource should exist")
+        .expect("read should succeed");
+
+    assert_eq!(result.contents.len(), 1);
+    match &result.contents[0] {
+        ResourceContents::TextResourceContents { uri, mime_type, text, .. } => {
+            assert_eq!(uri, "ui://test/nps");
+            assert_eq!(mime_type.as_deref(), Some(crate::constants::APP_MIME_TYPE));
+            assert_eq!(text, html);
+        }
+        _ => panic!("expected TextResourceContents"),
+    }
+}
+
+#[tokio::test]
+async fn app_tool_injects_meta_ui() {
+    let tool = make_tool("get_nps");
+    let enriched = CapabilityRegistry::app_tool(tool, "ui://example/nps");
+
+    let meta = enriched.meta.expect("meta should be set");
+    let ui = meta.0.get("ui").expect("ui key should exist");
+    assert_eq!(ui["resourceUri"], "ui://example/nps");
+}
+
+#[tokio::test]
+async fn app_tool_preserves_existing_meta() {
+    let mut tool = make_tool("get_nps");
+    let mut meta = rmcp::model::Meta::new();
+    meta.0.insert("existing".to_string(), serde_json::json!("value"));
+    tool.meta = Some(meta);
+
+    let enriched = CapabilityRegistry::app_tool(tool, "ui://example/nps");
+
+    let meta = enriched.meta.expect("meta should be set");
+    assert_eq!(meta.0.get("existing").unwrap(), "value");
+    assert!(meta.0.get("ui").is_some());
+}
+
+#[tokio::test]
+async fn app_resource_version_changes() {
+    let reg = CapabilityRegistry::new();
+    let v0 = reg.version();
+
+    reg.register_app_resource("ui://test/v", "<html/>").await;
+    assert_ne!(reg.version(), v0);
 }
