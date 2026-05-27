@@ -180,31 +180,62 @@ McpAppBuilder::new("my-server")
 
 ### MCP Apps / ext-apps (`src/capability/registry.rs`)
 
-Support for MCP Apps (ext-apps, spec v1.7.0) — tools that declare a `ui://` resource rendered by the host in a sandboxed iframe.
+Support for [MCP Apps](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/ext-apps) (ext-apps, spec v1.7.0) — tools that declare a companion UI rendered by the host inline in the chat.
+
+#### How it works
+
+MCP Apps let a tool return both **structured data** (JSON text for the LLM) and a **visual UI** (HTML for the human) in a single interaction. The flow has three steps:
+
+1. **Tool call** — the host calls a tool (e.g. `get_nps`). The tool returns JSON text as usual. But the tool's metadata contains `_meta.ui.resourceUri` pointing to a `ui://` URI.
+2. **Resource fetch** — the host sees the `_meta.ui` pointer and calls `resources/read` on the **same MCP server** with that `ui://` URI. The server returns a self-contained HTML bundle with MIME type `application/vnd.mcp.app+html`.
+3. **Render** — the host renders the HTML in a sandboxed iframe inline next to the text response.
+
+The HTML is served over the MCP protocol itself (via `resources/read`), not over a separate HTTP endpoint. The bundle must be **single-file** — all CSS, JS, and assets inlined — because it is delivered as a string in the resource contents.
+
+#### API
 
 Two helpers on `CapabilityRegistry`:
 
-- `register_app_resource(uri, html)` — registers a `ui://` resource with MIME type `application/vnd.mcp.app+html`. The HTML is returned verbatim via `resources/read`.
-- `app_tool(tool, resource_uri)` — static method that injects `_meta.ui.resourceUri` into a `Tool`'s metadata. Does not register the tool.
+- **`register_app_resource(uri, html)`** — registers a `ui://` resource with MIME type `application/vnd.mcp.app+html`. The HTML string is stored in memory and returned verbatim when the host calls `resources/read`. The resource appears in `resources/list` automatically.
+- **`app_tool(tool, resource_uri)`** — static method that injects `_meta.ui.resourceUri` into a `Tool`'s existing metadata (preserving any other `_meta` fields). Returns the enriched `Tool`. Does **not** register the tool — call `add_tool` separately.
+
+The MIME type constant `APP_MIME_TYPE` is in `src/constants.rs`.
+
+#### Usage
 
 ```rust
-let registry = CapabilityRegistry::new();
+use mcp_framework::prelude::*;
 
-// 1. Register the HTML bundle as a ui:// resource
+// In your server setup, with access to a CapabilityRegistry:
+
+// 1. Register the HTML bundle as a ui:// resource.
+//    Use include_str! to embed the file at compile time,
+//    or pass a String loaded at runtime.
 registry.register_app_resource(
     "ui://my-server/nps-chart",
     include_str!("../ui/dist/nps-chart.html"),
 ).await;
 
-// 2. Enrich the tool with _meta.ui, then register it
+// 2. Create a tool and tag it with the resource URI.
 let tool = CapabilityRegistry::app_tool(
     Tool::new("get_nps", "Get NPS scores", serde_json::Map::new()),
     "ui://my-server/nps-chart",
 );
-registry.add_tool(tool, |args| async { /* ... */ }).await;
+
+// 3. Register the tool with its handler as usual.
+//    The handler returns JSON for the LLM; the host fetches
+//    the HTML separately via resources/read.
+registry.add_tool(tool, |args| async {
+    let data = compute_nps(args).await;
+    Ok(CallToolResult::success(vec![
+        Content::text(serde_json::to_string(&data).unwrap()),
+    ]))
+}).await;
 ```
 
-The constant `APP_MIME_TYPE` is in `src/constants.rs`.
+#### Passing data to the UI
+
+The HTML bundle runs in an isolated iframe — it does not receive the tool call arguments or result automatically. To pass data, embed it in the HTML at build time (e.g. template variables in the Vite build), or use a convention like a `<script id="data">` tag populated by the resource handler. The current implementation serves the HTML as a static string; dynamic per-call rendering would require creating a unique resource per invocation.
 
 ### Persistence layer (`src/persistence.rs`)
 
