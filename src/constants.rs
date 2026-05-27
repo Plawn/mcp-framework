@@ -30,7 +30,7 @@ pub const NS_SESSIONS: &str = "sessions";
 pub const NS_CAP_VERSIONS: &str = "cap_versions";
 
 // === MCP Apps (ext-apps) ===
-pub const APP_MIME_TYPE: &str = "application/vnd.mcp.app+html";
+pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 
 // === Auth ===
 pub const BEARER_PREFIX: &str = "Bearer ";

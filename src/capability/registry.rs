@@ -305,7 +305,7 @@ impl CapabilityRegistry {
     // ── MCP Apps (ext-apps) ──────────────────────────────────────────
 
     /// Register an MCP App resource — a single-file HTML bundle served via
-    /// `resources/read` with MIME type `application/vnd.mcp.app+html`.
+    /// `resources/read` with MIME type `text/html;profile=mcp-app`.
     ///
     /// The `uri` must use the `ui://` scheme (e.g. `ui://my-server/nps-chart`).
     /// The `html` content is stored in memory and returned verbatim on read.
