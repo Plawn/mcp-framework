@@ -187,7 +187,7 @@ Support for [MCP Apps](https://modelcontextprotocol.io/specification/2025-11-25/
 MCP Apps let a tool return both **structured data** (JSON text for the LLM) and a **visual UI** (HTML for the human) in a single interaction. The flow has three steps:
 
 1. **Tool call** — the host calls a tool (e.g. `get_nps`). The tool returns JSON text as usual. But the tool's metadata contains `_meta.ui.resourceUri` pointing to a `ui://` URI.
-2. **Resource fetch** — the host sees the `_meta.ui` pointer and calls `resources/read` on the **same MCP server** with that `ui://` URI. The server returns a self-contained HTML bundle with MIME type `application/vnd.mcp.app+html`.
+2. **Resource fetch** — the host sees the `_meta.ui` pointer and calls `resources/read` on the **same MCP server** with that `ui://` URI. The server returns a self-contained HTML bundle with MIME type `text/html;profile=mcp-app`.
 3. **Render** — the host renders the HTML in a sandboxed iframe inline next to the text response.
 
 The HTML is served over the MCP protocol itself (via `resources/read`), not over a separate HTTP endpoint. The bundle must be **single-file** — all CSS, JS, and assets inlined — because it is delivered as a string in the resource contents.
@@ -196,7 +196,7 @@ The HTML is served over the MCP protocol itself (via `resources/read`), not over
 
 Two helpers on `CapabilityRegistry`:
 
-- **`register_app_resource(uri, html)`** — registers a `ui://` resource with MIME type `application/vnd.mcp.app+html`. The HTML string is stored in memory and returned verbatim when the host calls `resources/read`. The resource appears in `resources/list` automatically.
+- **`register_app_resource(uri, html)`** — registers a `ui://` resource with MIME type `text/html;profile=mcp-app`. The HTML string is stored in memory and returned verbatim when the host calls `resources/read`. The resource appears in `resources/list` automatically.
 - **`app_tool(tool, resource_uri)`** — static method that injects `_meta.ui.resourceUri` into a `Tool`'s existing metadata (preserving any other `_meta` fields). Returns the enriched `Tool`. Does **not** register the tool — call `add_tool` separately.
 
 The MIME type constant `APP_MIME_TYPE` is in `src/constants.rs`.

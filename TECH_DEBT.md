@@ -9,3 +9,7 @@
 ## Builder plumbing
 
 - **Field propagation boilerplate in `McpAppBuilder`.** Every optional field (`capability_filter`, `access_validator`, `claims_decoder`, `session_store`, `tool_call_logger`, `extra_routes`, …) is copied field-by-field through `with_sessions`, `with_factory`, and `build`. Adding a new field touches ~5 sites. A struct-update helper or a macro could cut the tax, but the refactor is broader than any single feature PR.
+
+## Capability registry
+
+- **No integration test for `call_tool_with_context` happy path.** The `WithContext` error path (no context) has unit tests, but the happy path (`Some(ctx)`) cannot be tested in `registry_tests.rs` because `Peer<RoleServer>` can only be constructed inside the `rmcp` crate. An integration test that sets up a full MCP connection would be needed to cover this.

@@ -54,7 +54,7 @@ async fn try_call_tool_dispatches_to_handler() {
     })
     .await;
 
-    let result = reg.try_call_tool("echo", None).await;
+    let result = reg.try_call_tool("echo", None, None).await;
     assert!(result.is_some());
     let result = result.unwrap().unwrap();
     assert!(!result.content.is_empty());
@@ -63,7 +63,7 @@ async fn try_call_tool_dispatches_to_handler() {
 #[tokio::test]
 async fn try_call_tool_returns_none_for_unknown() {
     let reg = CapabilityRegistry::new();
-    assert!(reg.try_call_tool("unknown", None).await.is_none());
+    assert!(reg.try_call_tool("unknown", None, None).await.is_none());
 }
 
 // ── Public call_tool tests ──────────────────────────────────────
@@ -385,6 +385,62 @@ async fn version_shared_across_clones() {
     .await;
 
     assert_eq!(reg2.version(), reg.version());
+}
+
+// ── WithContext tool tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn call_tool_returns_error_for_context_tool() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
+        Ok(CallToolResult::success(vec![Content::text("with context")]))
+    })
+    .await;
+
+    let err = reg.call_tool("ctx_tool", None).await.unwrap_err();
+    assert!(err.message.contains("context"));
+}
+
+#[tokio::test]
+async fn try_call_tool_returns_error_for_context_tool_without_context() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    })
+    .await;
+
+    let result = reg.try_call_tool("ctx_tool", None, None).await;
+    assert!(result.is_some());
+    let err = result.unwrap().unwrap_err();
+    assert!(err.message.contains("context"));
+}
+
+#[tokio::test]
+async fn add_tool_with_context_is_listed() {
+    let reg = CapabilityRegistry::new();
+    reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+
+    let tools = reg.tools().await;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name.as_ref(), "ctx_tool");
+}
+
+#[tokio::test]
+async fn contains_tool_works() {
+    let reg = CapabilityRegistry::new();
+    assert!(!reg.contains_tool("x").await);
+
+    reg.add_tool(make_tool("x"), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    assert!(reg.contains_tool("x").await);
+
+    reg.remove_tool("x").await;
+    assert!(!reg.contains_tool("x").await);
 }
 
 // ── MCP Apps (ext-apps) tests ──────────────────────────────────

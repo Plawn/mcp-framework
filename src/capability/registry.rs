@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::model::{
-    Annotated, CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
+    Annotated, CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Meta, Prompt,
     RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, Tool,
 };
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
@@ -32,12 +32,16 @@ impl std::fmt::Display for NotifyKind {
     }
 }
 
-/// Type-erased async handler for a dynamic tool.
-///
-/// Receives the optional JSON arguments and returns a `CallToolResult`.
-pub type ToolHandler = Arc<
+#[derive(Clone)]
+pub struct ToolCallContext {
+    pub peer: Peer<RoleServer>,
+    pub meta: Meta,
+}
+
+type StoredHandler = Arc<
     dyn Fn(
             Option<JsonObject>,
+            Option<ToolCallContext>,
         ) -> Pin<Box<dyn Future<Output = Result<CallToolResult, McpError>> + Send>>
         + Send
         + Sync,
@@ -84,7 +88,7 @@ fn empty_capability_hash() -> u64 {
 /// be shared across tasks.
 #[derive(Clone)]
 pub struct CapabilityRegistry {
-    tools: Arc<RwLock<HashMap<String, (Tool, ToolHandler)>>>,
+    tools: Arc<RwLock<HashMap<String, (Tool, StoredHandler)>>>,
     prompts: Arc<RwLock<HashMap<String, (Prompt, PromptHandler)>>>,
     resources: Arc<RwLock<HashMap<String, (Resource, ResourceHandler)>>>,
     peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
@@ -206,7 +210,27 @@ impl CapabilityRegistry {
         Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
     {
         let name = tool.name.to_string();
-        let handler: ToolHandler = Arc::new(move |args| Box::pin(handler(args)));
+        let handler: StoredHandler = Arc::new(move |args, _ctx| Box::pin(handler(args)));
+        self.tools.write().await.insert(name, (tool, handler));
+        self.recompute_version().await;
+        self.notify_peers(NotifyKind::Tools).await;
+    }
+
+    pub async fn add_tool_with_context<H, Fut>(&self, tool: Tool, handler: H)
+    where
+        H: Fn(Option<JsonObject>, ToolCallContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
+    {
+        let name = tool.name.to_string();
+        let handler: StoredHandler = Arc::new(move |args, ctx| match ctx {
+            Some(ctx) => Box::pin(handler(args, ctx)),
+            None => Box::pin(async {
+                Err(McpError::internal_error(
+                    "tool requires call context but none was provided (programmatic call)",
+                    None,
+                ))
+            }),
+        });
         self.tools.write().await.insert(name, (tool, handler));
         self.recompute_version().await;
         self.notify_peers(NotifyKind::Tools).await;
@@ -345,6 +369,11 @@ impl CapabilityRegistry {
         tool.with_meta(meta)
     }
 
+    /// Returns `true` if the registry contains a tool with the given name.
+    pub(crate) async fn contains_tool(&self, name: &str) -> bool {
+        self.tools.read().await.contains_key(name)
+    }
+
     /// Returns `true` if the registry has any tools registered.
     pub(crate) async fn has_tools(&self) -> bool {
         !self.tools.read().await.is_empty()
@@ -360,14 +389,37 @@ impl CapabilityRegistry {
         !self.resources.read().await.is_empty()
     }
 
-    // ── Internal: peer management ────────────────────────────────────
+    // ── Peer management ───────────────────────────────────────────────
 
     /// Register a connected peer so it receives list-changed notifications.
     pub(crate) async fn register_peer(&self, peer: Peer<RoleServer>) {
         self.peers.write().await.push(peer);
     }
 
+    /// Return a snapshot of all connected (non-closed) peers.
+    ///
+    /// Stale peers whose transport has closed are pruned from the backing
+    /// storage on each call, preventing unbounded accumulation in
+    /// long-running servers.
+    pub async fn peers(&self) -> Vec<Peer<RoleServer>> {
+        let mut peers = self.peers.write().await;
+        peers.retain(|p| !p.is_transport_closed());
+        peers.iter().cloned().collect()
+    }
+
     // ── Public: programmatic dispatch ───────────────────────────────
+
+    fn validate_tool_args(args: Option<Value>) -> Result<Option<JsonObject>, McpError> {
+        match args {
+            None => Ok(None),
+            Some(Value::Object(map)) => Ok(Some(map)),
+            Some(Value::Null) => Ok(None),
+            Some(_) => Err(McpError::invalid_params(
+                "tool arguments must be a JSON object",
+                None,
+            )),
+        }
+    }
 
     /// Invoke a registered tool by name.
     ///
@@ -375,30 +427,56 @@ impl CapabilityRegistry {
     /// (e.g. from a script engine pipeline) without going through the MCP
     /// protocol. Returns an error if the tool is not registered or if the
     /// arguments are not a JSON object.
+    ///
+    /// **Note:** tools registered via [`add_tool_with_context`](Self::add_tool_with_context)
+    /// will fail through this method because no call context is available.
+    /// Use [`call_tool_with_context`](Self::call_tool_with_context) instead.
     pub async fn call_tool(
         &self,
         name: &str,
         args: Option<Value>,
     ) -> Result<CallToolResult, McpError> {
-        let json_args = match args {
-            None => None,
-            Some(Value::Object(map)) => Some(map),
-            Some(Value::Null) => None,
-            Some(_) => {
-                return Err(McpError::invalid_params(
-                    "tool arguments must be a JSON object",
+        let json_args = Self::validate_tool_args(args)?;
+
+        let guard = self.tools.read().await;
+        let handler = match guard.get(name) {
+            Some((_, h)) => Arc::clone(h),
+            None => {
+                return Err(McpError::invalid_request(
+                    format!("tool '{}' not found in registry", name),
                     None,
-                ));
+                ))
             }
         };
+        drop(guard);
+        handler(json_args, None).await
+    }
 
-        match self.try_call_tool(name, json_args).await {
-            Some(result) => result,
-            None => Err(McpError::invalid_request(
-                format!("tool '{}' not found in registry", name),
-                None,
-            )),
-        }
+    /// Invoke a registered tool by name, providing a [`ToolCallContext`].
+    ///
+    /// This is the context-aware variant of [`call_tool`](Self::call_tool).
+    /// Use this when calling tools registered via
+    /// [`add_tool_with_context`](Self::add_tool_with_context).
+    pub async fn call_tool_with_context(
+        &self,
+        name: &str,
+        args: Option<Value>,
+        context: ToolCallContext,
+    ) -> Result<CallToolResult, McpError> {
+        let json_args = Self::validate_tool_args(args)?;
+
+        let guard = self.tools.read().await;
+        let handler = match guard.get(name) {
+            Some((_, h)) => Arc::clone(h),
+            None => {
+                return Err(McpError::invalid_request(
+                    format!("tool '{}' not found in registry", name),
+                    None,
+                ))
+            }
+        };
+        drop(guard);
+        handler(json_args, Some(context)).await
     }
 
     // ── Internal: dispatch ───────────────────────────────────────────
@@ -411,12 +489,13 @@ impl CapabilityRegistry {
         &self,
         name: &str,
         args: Option<JsonObject>,
+        context: Option<ToolCallContext>,
     ) -> Option<Result<CallToolResult, McpError>> {
         let guard = self.tools.read().await;
         let (_, handler) = guard.get(name)?;
         let handler = Arc::clone(handler);
         drop(guard);
-        Some(handler(args).await)
+        Some(handler(args, context).await)
     }
 
     /// Try to dispatch a prompt request to the registry.

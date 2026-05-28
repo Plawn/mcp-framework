@@ -95,7 +95,7 @@ pub use persistence::RedisBackend;
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
-    ResourceFilter, ToolCallValidator, ToolFilter,
+    ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
 };
 pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
 pub use newtypes::{SessionId, ToolName};

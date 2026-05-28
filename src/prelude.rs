@@ -13,7 +13,7 @@ pub use crate::persistence::RedisBackend;
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
 pub use crate::capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
-    ResourceFilter, ToolCallValidator, ToolFilter,
+    ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
 };
 pub use crate::runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
 pub use crate::session::{RequestContextExt, Session, SessionData, SessionStore};

@@ -229,12 +229,21 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
 
         // Dispatch: try registry first, fall back to inner.
-        // Clone arguments once for the registry probe; move the original into audit_args.
-        let (result, source, audit_args) = if let Some(reg_result) = self
-            .registry
-            .try_call_tool(&request.name, request.arguments.clone())
-            .await
-        {
+        // Only construct ToolCallContext (which clones Meta) when the tool
+        // is actually in the registry, avoiding the heap allocation on miss.
+        let reg_result = if self.registry.contains_tool(&request.name).await {
+            let tool_ctx = crate::capability::registry::ToolCallContext {
+                peer: context.peer.clone(),
+                meta: context.meta.clone(),
+            };
+            self.registry
+                .try_call_tool(&request.name, request.arguments.clone(), Some(tool_ctx))
+                .await
+        } else {
+            None
+        };
+
+        let (result, source, audit_args) = if let Some(reg_result) = reg_result {
             (reg_result, ToolCallSource::Registry, request.arguments)
         } else {
             let audit_args = if has_logger { request.arguments.clone() } else { None };
