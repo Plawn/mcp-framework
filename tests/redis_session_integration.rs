@@ -172,7 +172,6 @@ async fn start_server(redis: Arc<RedisBackend>) -> TestServer {
         tool_call_logger: None,
         persistence: Some(redis),
         extra_routes: None,
-        token_mode: mcp_framework::TokenMode::default(),
     };
 
     let (app, _token_store, _registry) = build_app(config);

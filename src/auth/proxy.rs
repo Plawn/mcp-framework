@@ -82,18 +82,235 @@ pub async fn authorize_handler(
     Redirect::temporary(&keycloak_auth_url)
 }
 
-/// Handler for `/oauth/token` - proxies to Keycloak.
-pub async fn token_handler(
-    State(state): State<Arc<McpOAuthState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> Result<impl IntoResponse, HttpError> {
+/// Parse the token request body into a list of key-value parameters.
+fn parse_token_params(content_type: &str, body_str: &str) -> Result<Vec<(String, String)>, HttpError> {
+    // Always try form-urlencoded first (OAuth 2.1 spec requires it).
+    // Some clients send Content-Type: application/json but still use form-urlencoded body.
+    let params: Vec<(String, String)> = form_urlencoded::parse(body_str.as_bytes())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    if params.iter().any(|(k, _)| k == "grant_type") {
+        tracing::info!("Parsed {} params from form body", params.len());
+        return Ok(params);
+    }
+
+    if content_type.contains("application/json") {
+        match serde_json::from_str::<serde_json::Value>(body_str) {
+            Ok(json) => {
+                let mut jp = Vec::new();
+                if let Some(obj) = json.as_object() {
+                    for (k, v) in obj {
+                        let val = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        jp.push((k.clone(), val));
+                    }
+                }
+                tracing::info!("Parsed {} params from JSON body", jp.len());
+                return Ok(jp);
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse token request body: {}", e);
+                return Err(HttpError::invalid_request("Invalid request body"));
+            }
+        }
+    }
+
+    tracing::info!("Parsed {} params from form body (no grant_type found)", params.len());
+    Ok(params)
+}
+
+/// Inject the Keycloak client credentials into the parameter list.
+fn inject_keycloak_credentials(params: &mut Vec<(String, String)>, state: &McpOAuthState) {
+    for (key, value) in params.iter_mut() {
+        if key == "client_id" {
+            *value = state.keycloak_client_id.clone();
+        }
+    }
+
+    if let Some(ref secret) = state.keycloak_client_secret
+        && !params.iter().any(|(k, _)| k == "client_secret") {
+            params.push(("client_secret".to_string(), secret.clone()));
+        }
+}
+
+/// Forward a token request to Keycloak and return the raw response.
+async fn forward_to_keycloak(
+    state: &McpOAuthState,
+    params: &[(String, String)],
+) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), HttpError> {
     let keycloak_token_url = format!(
         "{}/protocol/openid-connect/token",
         state.keycloak_realm_url
     );
 
-    // Read the body
+    let new_body: String = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
+
+    tracing::debug!("Token request to Keycloak: {}", keycloak_token_url);
+    tracing::debug!("Forwarded body: {}", new_body);
+
+    let result = state
+        .http_client
+        .post(&keycloak_token_url)
+        .header("content-type", CONTENT_TYPE_FORM)
+        .body(new_body)
+        .send()
+        .await;
+
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            match response.bytes().await {
+                Ok(body) => Ok((status, headers, body.to_vec())),
+                Err(e) => {
+                    tracing::error!("Failed to read Keycloak token response: {}", e);
+                    Err(HttpError::server_error("Failed to read token response"))
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to contact Keycloak for token: {}", e);
+            Err(HttpError::server_error("Failed to contact authorization server"))
+        }
+    }
+}
+
+/// Build an HTTP response from a Keycloak token response, forwarding status and content-type.
+fn build_passthrough_response(
+    status: reqwest::StatusCode,
+    response_headers: &HeaderMap,
+    body: &[u8],
+) -> axum::response::Response {
+    let mut builder = axum::response::Response::builder()
+        .status(status.as_u16());
+
+    if let Some(ct) = response_headers.get("content-type") {
+        builder = builder.header("content-type", ct);
+    }
+
+    builder
+        .body(axum::body::Body::from(body.to_vec()))
+        .unwrap()
+}
+
+/// Handler for `/oauth/token` — proxies to Keycloak.
+///
+/// Dispatches to [`passthrough_token_handler`] or [`opaque_token_handler`]
+/// depending on the configured [`TokenMode`].
+pub async fn token_handler(
+    State(state): State<Arc<McpOAuthState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<impl IntoResponse, HttpError> {
+    match state.token_mode {
+        TokenMode::Opaque => opaque_token_handler(state, headers, body).await,
+        TokenMode::Passthrough => passthrough_token_handler(state, headers, body).await,
+    }
+}
+
+/// Passthrough token handler: proxies the token request to Keycloak and
+/// forwards the response as-is. On success, stores the token in the
+/// `TokenStore` for downstream use.
+async fn passthrough_token_handler(
+    state: Arc<McpOAuthState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<axum::response::Response, HttpError> {
+    let (mut params, _grant_type) = read_token_request(body, &headers).await?;
+    inject_keycloak_credentials(&mut params, &state);
+
+    let (status, response_headers, response_body) = forward_to_keycloak(&state, &params).await?;
+    let body_str = String::from_utf8_lossy(&response_body);
+
+    if status.is_success() {
+        tracing::info!("Token exchange successful, status: {}", status);
+        tracing::debug!("Token response: {}", body_str);
+
+        let session_key = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or(DEFAULT_SESSION_ID);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
+            && let Some(access_token) = json["access_token"].as_str() {
+                let stored = StoredToken {
+                    access_token: access_token.to_string(),
+                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
+                    decoded_claims: None,
+                };
+                state.token_store.store_token(session_key.to_string(), stored).await;
+                tracing::debug!("Stored token for session '{}'", session_key);
+            }
+    } else {
+        tracing::error!("Token exchange failed, status: {}, body: {}", status, body_str);
+    }
+
+    Ok(build_passthrough_response(status, &response_headers, &response_body))
+}
+
+/// Opaque token handler: wraps [`passthrough_token_handler`]-style Keycloak
+/// proxying with opaque token issuance. Refresh requests are intercepted
+/// to resolve opaque tokens before contacting Keycloak.
+async fn opaque_token_handler(
+    state: Arc<McpOAuthState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<axum::response::Response, HttpError> {
+    let (mut params, grant_type) = read_token_request(body, &headers).await?;
+
+    // Intercept refresh_token grants: resolve the opaque refresh token
+    // to the real Keycloak token before forwarding.
+    if grant_type == "refresh_token" {
+        return handle_opaque_refresh(&state, &params).await;
+    }
+
+    inject_keycloak_credentials(&mut params, &state);
+
+    let (status, response_headers, response_body) = forward_to_keycloak(&state, &params).await?;
+    let body_str = String::from_utf8_lossy(&response_body);
+
+    if status.is_success() {
+        tracing::info!("Token exchange successful, status: {}", status);
+        tracing::debug!("Token response: {}", body_str);
+
+        let session_key = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or(DEFAULT_SESSION_ID);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
+            && let Some(access_token) = json["access_token"].as_str() {
+                let stored = StoredToken {
+                    access_token: access_token.to_string(),
+                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
+                    decoded_claims: None,
+                };
+                state.token_store.store_token(session_key.to_string(), stored).await;
+                tracing::debug!("Stored token for session '{}'", session_key);
+
+                let kc_expires_in = json["expires_in"].as_u64();
+                return Ok(build_opaque_response(&state, session_key, kc_expires_in).await);
+            }
+    } else {
+        tracing::error!("Token exchange failed, status: {}, body: {}", status, body_str);
+    }
+
+    // Keycloak error or unparseable success — forward as-is
+    Ok(build_passthrough_response(status, &response_headers, &response_body))
+}
+
+/// Read the request body, parse parameters, and extract the grant_type.
+async fn read_token_request(
+    body: Body,
+    headers: &HeaderMap,
+) -> Result<(Vec<(String, String)>, String), HttpError> {
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -115,46 +332,8 @@ pub async fn token_handler(
         body_str
     );
 
-    // Always try form-urlencoded first (OAuth 2.1 spec requires it).
-    // Some clients send Content-Type: application/json but still use form-urlencoded body.
-    let mut params: Vec<(String, String)> = {
-        let p: Vec<(String, String)> = form_urlencoded::parse(body_str.as_bytes())
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+    let params = parse_token_params(content_type, &body_str)?;
 
-        // If form parsing got params with a grant_type, use them
-        if p.iter().any(|(k, _)| k == "grant_type") {
-            tracing::info!("Parsed {} params from form body", p.len());
-            p
-        } else if content_type.contains("application/json") {
-            // Fallback: try JSON parsing
-            match serde_json::from_str::<serde_json::Value>(&body_str) {
-                Ok(json) => {
-                    let mut jp = Vec::new();
-                    if let Some(obj) = json.as_object() {
-                        for (k, v) in obj {
-                            let val = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            jp.push((k.clone(), val));
-                        }
-                    }
-                    tracing::info!("Parsed {} params from JSON body", jp.len());
-                    jp
-                }
-                Err(e) => {
-                    tracing::error!("Failed to parse token request body: {}", e);
-                    return Err(HttpError::invalid_request("Invalid request body"));
-                }
-            }
-        } else {
-            tracing::info!("Parsed {} params from form body (no grant_type found)", p.len());
-            p
-        }
-    };
-
-    // Log parsed params (redact sensitive values)
     for (k, v) in &params {
         let display_val = match k.as_str() {
             "client_secret" | "code" | "code_verifier" | "refresh_token" => "***".to_string(),
@@ -169,107 +348,7 @@ pub async fn token_handler(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
-    // In Opaque mode with grant_type=refresh_token, intercept before forwarding
-    // to resolve the opaque refresh token → real Keycloak refresh token.
-    if state.token_mode == TokenMode::Opaque && grant_type == "refresh_token" {
-        return handle_opaque_refresh(&state, &params).await;
-    }
-
-    // Replace client_id with our Keycloak client_id
-    for (key, value) in params.iter_mut() {
-        if key == "client_id" {
-            *value = state.keycloak_client_id.clone();
-        }
-    }
-
-    // Add client_secret if we have one and it's not already in the request
-    if let Some(ref secret) = state.keycloak_client_secret
-        && !params.iter().any(|(k, _)| k == "client_secret") {
-            params.push(("client_secret".to_string(), secret.clone()));
-        }
-
-    // Rebuild the form body
-    let new_body: String = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(&params)
-        .finish();
-
-    tracing::debug!("Token request to Keycloak: {}", keycloak_token_url);
-    tracing::debug!("Forwarded body: {}", new_body);
-
-    // Forward to Keycloak - always use form-urlencoded content type
-    let keycloak_request = state
-        .http_client
-        .post(&keycloak_token_url)
-        .header("content-type", CONTENT_TYPE_FORM);
-
-    let result = keycloak_request.body(new_body).send().await;
-
-    match result {
-        Ok(response) => {
-            let status = response.status();
-            let response_headers = response.headers().clone();
-
-            match response.bytes().await {
-                Ok(body) => {
-                    let body_str = String::from_utf8_lossy(&body);
-                    if status.is_success() {
-                        tracing::info!("Token exchange successful, status: {}", status);
-                        tracing::debug!("Token response: {}", body_str);
-
-                        let session_key = headers
-                            .get(MCP_SESSION_ID_HEADER)
-                            .and_then(|h| h.to_str().ok())
-                            .unwrap_or(DEFAULT_SESSION_ID);
-
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
-                            && let Some(access_token) = json["access_token"].as_str() {
-                                let stored = StoredToken {
-                                    access_token: access_token.to_string(),
-                                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
-                                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
-                                    decoded_claims: None,
-                                };
-                                state.token_store.store_token(session_key.to_string(), stored).await;
-                                tracing::debug!("Stored token for session '{}'", session_key);
-
-                                // In Opaque mode, replace the response with opaque tokens
-                                if state.token_mode == TokenMode::Opaque {
-                                    let kc_expires_in = json["expires_in"].as_u64();
-                                    return Ok(build_opaque_response(&state, session_key, kc_expires_in).await);
-                                }
-                            }
-                    } else {
-                        tracing::error!(
-                            "Token exchange failed, status: {}, body: {}",
-                            status,
-                            body_str
-                        );
-                    }
-
-                    let mut builder = axum::response::Response::builder().status(status);
-
-                    // Copy content-type header
-                    if let Some(ct) = response_headers.get("content-type") {
-                        builder = builder.header("content-type", ct);
-                    }
-
-                    Ok(builder
-                        .body(axum::body::Body::from(body.to_vec()))
-                        .unwrap())
-                }
-                Err(e) => {
-                    tracing::error!("Failed to read Keycloak token response: {}", e);
-                    Err(HttpError::server_error("Failed to read token response"))
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to contact Keycloak for token: {}", e);
-            Err(HttpError::server_error(
-                "Failed to contact authorization server",
-            ))
-        }
-    }
+    Ok((params, grant_type))
 }
 
 /// Build an opaque token response for the given session.

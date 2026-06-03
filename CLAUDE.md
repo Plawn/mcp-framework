@@ -58,19 +58,23 @@ When using OAuth, the framework supports two token modes controlled by `TokenMod
 - **Opaque**: The framework emits its own opaque UUID tokens to MCP clients and keeps the real Keycloak tokens server-side. The client never sees a JWT. Refresh is handled internally.
 
 Configurable via:
-- Builder API: `.token_mode(TokenMode::Opaque)`
-- Environment variable: `MCP_TOKEN_MODE=opaque` (default: `passthrough`)
+- `OAuthConfig` field: `token_mode: TokenMode::Opaque`
+- Environment variable: `MCP_TOKEN_MODE=opaque` (default: `passthrough`, read by `OAuthConfig::from_env()`)
 
-**Architecture**: In opaque mode, `token_handler` (`src/auth/proxy.rs`) intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
+`TokenMode` lives inside `OAuthConfig`, making misconfiguration structurally impossible (e.g. setting opaque mode with Basic auth).
+
+**Architecture**: The `token_handler` (`src/auth/proxy.rs`) dispatches to either `passthrough_token_handler` or `opaque_token_handler` based on the configured `TokenMode`. In opaque mode, the handler intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
 
 **Persistence**: Opaque mappings are stored in the `NS_OPAQUE` persistence namespace (keyed by session_id). They survive restarts when a persistence backend (e.g. Redis) is configured.
 
 **Zombie handling**: When a Keycloak refresh fails (e.g. token revoked via platform logout), the opaque mapping is cleaned up and the client receives a 401, forcing re-authentication.
 
 ```rust
+let mut oauth = OAuthConfig::from_env().unwrap();
+oauth.token_mode = TokenMode::Opaque;
+
 McpAppBuilder::new("my-server")
-    .auth(AuthProvider::OAuth(OAuthConfig::from_env().unwrap()))
-    .token_mode(TokenMode::Opaque)
+    .auth(AuthProvider::OAuth(oauth))
     .persistence(Arc::new(redis))
     .server(|| MyServer::new())
     .run()
@@ -324,4 +328,4 @@ If you already have a `redis::aio::ConnectionManager` (e.g. shared with other pa
 | `BASIC_AUTH_USERNAME`, `BASIC_AUTH_PASSWORD` | Basic auth | — |
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth | `openid,profile,email` |
-| `MCP_TOKEN_MODE` | OAuth | `passthrough` |
+| `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` |

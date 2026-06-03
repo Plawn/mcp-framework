@@ -40,7 +40,6 @@
 //!         tool_call_logger: None,
 //!         persistence: None,
 //!         extra_routes: None,
-//!         token_mode: TokenMode::default(),
 //!     }).await
 //! }
 //! ```

@@ -25,6 +25,7 @@ pub struct OAuthConfig {
     pub issuer_url: String,
     pub redirect_url: String,
     pub scopes: Vec<String>,
+    pub token_mode: TokenMode,
 }
 
 impl OAuthConfig {
@@ -53,12 +54,15 @@ impl OAuthConfig {
             .map(|s| s.trim().to_string())
             .collect();
 
+        let token_mode = TokenMode::from_env();
+
         Ok(Self {
             client_id,
             client_secret,
             issuer_url,
             redirect_url,
             scopes,
+            token_mode,
         })
     }
 

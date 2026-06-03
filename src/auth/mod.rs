@@ -37,6 +37,25 @@ pub struct McpOAuthState {
     pub token_mode: TokenMode,
 }
 
+impl McpOAuthState {
+    pub fn from_oauth_config(
+        oauth_config: &OAuthConfig,
+        public_url: String,
+        token_store: TokenStore,
+        http_client: reqwest::Client,
+    ) -> Self {
+        Self {
+            public_url,
+            keycloak_realm_url: oauth_config.issuer_url.clone(),
+            keycloak_client_id: oauth_config.client_id.clone(),
+            keycloak_client_secret: oauth_config.client_secret.clone(),
+            http_client,
+            token_store,
+            token_mode: oauth_config.token_mode.clone(),
+        }
+    }
+}
+
 /// Create the MCP OAuth router with register, authorize, and token endpoints.
 pub fn mcp_oauth_router(state: McpOAuthState) -> Router {
     Router::new()
