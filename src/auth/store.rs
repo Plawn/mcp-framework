@@ -6,7 +6,7 @@ use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use reqwest::Client as HttpClient;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::constants::{NS_TOKENS, TOKEN_EXPIRY_BUFFER, PENDING_AUTH_TIMEOUT};
+use crate::constants::{NS_TOKENS, NS_OPAQUE, TOKEN_EXPIRY_BUFFER, PENDING_AUTH_TIMEOUT, OPAQUE_REFRESH_TTL};
 use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
 
 /// A stored OAuth token with expiry tracking and optional decoded claims.
@@ -116,6 +116,13 @@ impl PersistedToken {
     }
 }
 
+/// Persisted opaque-to-session mapping (one entry per session in opaque mode).
+#[derive(Serialize, Deserialize)]
+struct PersistedOpaqueMapping {
+    opaque_access: String,
+    opaque_refresh: String,
+}
+
 /// Configuration needed for token refresh
 #[derive(Clone)]
 pub struct RefreshConfig {
@@ -126,6 +133,27 @@ pub struct RefreshConfig {
 
 /// Type-erased claims decoder function.
 pub type ClaimsDecoderFn = Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>;
+
+/// Consolidated index for opaque token mappings, guarded by a single RwLock
+/// to ensure atomicity across all three maps.
+#[derive(Default)]
+struct OpaqueIndex {
+    /// opaque access token → session_id
+    access_to_session: HashMap<String, String>,
+    /// opaque refresh token → session_id
+    refresh_to_session: HashMap<String, String>,
+    /// session_id → (opaque_access, opaque_refresh)
+    session_to_opaques: HashMap<String, (String, String)>,
+}
+
+impl OpaqueIndex {
+    fn remove_session(&mut self, session_id: &str) {
+        if let Some((oa, or)) = self.session_to_opaques.remove(session_id) {
+            self.access_to_session.remove(&oa);
+            self.refresh_to_session.remove(&or);
+        }
+    }
+}
 
 /// Token store for managing OAuth tokens per session
 #[derive(Clone)]
@@ -144,6 +172,9 @@ pub struct TokenStore {
     pub(crate) claims_decoder: Option<ClaimsDecoderFn>,
     /// Optional persistence backend for surviving restarts.
     persistence: Option<Arc<dyn PersistenceBackend>>,
+
+    /// Opaque token index (only populated in Opaque token mode).
+    opaque_index: Arc<RwLock<OpaqueIndex>>,
 }
 
 impl TokenStore {
@@ -156,6 +187,7 @@ impl TokenStore {
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             claims_decoder: None,
             persistence: None,
+            opaque_index: Arc::new(RwLock::new(OpaqueIndex::default())),
         }
     }
 
@@ -169,6 +201,7 @@ impl TokenStore {
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             claims_decoder: None,
             persistence: None,
+            opaque_index: Arc::new(RwLock::new(OpaqueIndex::default())),
         }
     }
 
@@ -390,6 +423,67 @@ impl TokenStore {
         None
     }
 
+    // === Opaque token mode ===
+
+    /// Store an opaque-to-session mapping (used in Opaque token mode).
+    ///
+    /// Replaces any existing mapping for the same session, cleaning up old
+    /// opaque tokens in the process. All index mutations happen under a
+    /// single write lock to prevent concurrent observers from seeing
+    /// inconsistent state.
+    pub async fn store_opaque_mapping(
+        &self,
+        session_id: String,
+        opaque_access: String,
+        opaque_refresh: String,
+    ) {
+        let persist_mapping = self.persistence.is_some().then(|| PersistedOpaqueMapping {
+            opaque_access: opaque_access.clone(),
+            opaque_refresh: opaque_refresh.clone(),
+        });
+
+        {
+            let mut idx = self.opaque_index.write().await;
+            idx.remove_session(&session_id);
+            idx.access_to_session.insert(opaque_access.clone(), session_id.clone());
+            idx.refresh_to_session.insert(opaque_refresh.clone(), session_id.clone());
+            idx.session_to_opaques.insert(session_id.clone(), (opaque_access, opaque_refresh));
+        }
+
+        if let Some(ref backend) = self.persistence {
+            spawn_persist(backend, NS_OPAQUE, session_id, &persist_mapping.unwrap(), Some(OPAQUE_REFRESH_TTL));
+        }
+    }
+
+    /// Resolve an opaque access token to a session ID.
+    pub async fn resolve_opaque_access(&self, opaque_access: &str) -> Option<String> {
+        let idx = self.opaque_index.read().await;
+        idx.access_to_session.get(opaque_access).cloned()
+    }
+
+    /// Resolve an opaque refresh token to a session ID.
+    pub async fn resolve_opaque_refresh(&self, opaque_refresh: &str) -> Option<String> {
+        let idx = self.opaque_index.read().await;
+        idx.refresh_to_session.get(opaque_refresh).cloned()
+    }
+
+    /// Remove all opaque mappings for a session.
+    pub async fn remove_opaque_for_session(&self, session_id: &str) {
+        {
+            let mut idx = self.opaque_index.write().await;
+            idx.remove_session(session_id);
+        }
+        if let Some(ref backend) = self.persistence {
+            let backend = backend.clone();
+            let key = session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = backend.delete(NS_OPAQUE, &key).await {
+                    tracing::warn!("Failed to delete persisted opaque mapping for {key}: {e}");
+                }
+            });
+        }
+    }
+
     /// Remove a token for a session
     #[allow(dead_code)]
     pub async fn remove_token(&self, session_id: &str) {
@@ -400,6 +494,8 @@ impl TokenStore {
         let mut locks = self.refresh_locks.write().await;
         locks.remove(session_id);
         drop(locks);
+
+        self.remove_opaque_for_session(session_id).await;
 
         if let Some(ref backend) = self.persistence {
             let backend = backend.clone();
@@ -412,7 +508,7 @@ impl TokenStore {
         }
     }
 
-    /// Purge all expired tokens and their associated refresh locks.
+    /// Purge all expired tokens and their associated refresh locks and opaque mappings.
     pub async fn purge_expired(&self) {
         let expired_keys: Vec<String> = {
             let tokens = self.tokens.read().await;
@@ -433,6 +529,16 @@ impl TokenStore {
             tokens.remove(key);
             locks.remove(key);
         }
+        drop(tokens);
+        drop(locks);
+
+        // Clean up opaque mappings for expired sessions
+        {
+            let mut idx = self.opaque_index.write().await;
+            for key in &expired_keys {
+                idx.remove_session(key);
+            }
+        }
 
         tracing::debug!("Purged {} expired token(s)", expired_keys.len());
 
@@ -443,6 +549,9 @@ impl TokenStore {
                 for key in &keys {
                     if let Err(e) = backend.delete(NS_TOKENS, key).await {
                         tracing::warn!("Failed to delete persisted token {key}: {e}");
+                    }
+                    if let Err(e) = backend.delete(NS_OPAQUE, key).await {
+                        tracing::warn!("Failed to delete persisted opaque mapping {key}: {e}");
                     }
                 }
             });
@@ -464,7 +573,7 @@ impl TokenStore {
         })
     }
 
-    /// Load all tokens from the persistence backend into memory.
+    /// Load all tokens and opaque mappings from the persistence backend into memory.
     ///
     /// Entries that fail to deserialize are skipped with a warning.
     /// The claims decoder is applied to each loaded token.
@@ -474,6 +583,7 @@ impl TokenStore {
             None => return Ok(()),
         };
 
+        // Load tokens
         let keys = backend.keys(NS_TOKENS).await?;
         let mut entries = Vec::new();
 
@@ -512,6 +622,49 @@ impl TokenStore {
                 tokens.insert(key, token);
             }
             tracing::info!("Loaded {count} persisted token(s)");
+        }
+
+        // Load opaque mappings.
+        // Snapshot valid session IDs under a short read lock, then release it
+        // before the I/O loop so token writes aren't blocked.
+        let opaque_keys = backend.keys(NS_OPAQUE).await?;
+        let valid_sessions: std::collections::HashSet<String> = {
+            let tokens = self.tokens.read().await;
+            tokens.keys().cloned().collect()
+        };
+        let mut opaque_entries = Vec::new();
+
+        for session_id in opaque_keys {
+            let bytes = match backend.get(NS_OPAQUE, &session_id).await? {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let mapping: PersistedOpaqueMapping = match serde_json::from_slice(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Skipping corrupted opaque mapping for session {session_id}: {e}");
+                    continue;
+                }
+            };
+
+            if !valid_sessions.contains(&session_id) {
+                let _ = backend.delete(NS_OPAQUE, &session_id).await;
+                continue;
+            }
+
+            opaque_entries.push((session_id, mapping));
+        }
+
+        if !opaque_entries.is_empty() {
+            let count = opaque_entries.len();
+            let mut idx = self.opaque_index.write().await;
+            for (session_id, mapping) in opaque_entries {
+                idx.access_to_session.insert(mapping.opaque_access.clone(), session_id.clone());
+                idx.refresh_to_session.insert(mapping.opaque_refresh.clone(), session_id.clone());
+                idx.session_to_opaques.insert(session_id, (mapping.opaque_access, mapping.opaque_refresh));
+            }
+            tracing::info!("Loaded {count} persisted opaque mapping(s)");
         }
 
         Ok(())

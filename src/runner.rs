@@ -9,7 +9,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::any::Any;
 
 use crate::audit::ToolCallLogger;
-use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
+use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenMode, TokenStore};
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::persistence::PersistenceBackend;
 use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_TTL};
@@ -113,6 +113,11 @@ where
     ///
     /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
     pub extra_routes: Option<Router>,
+    /// Token mode for OAuth (Passthrough or Opaque).
+    ///
+    /// In Opaque mode, the framework issues its own UUID tokens to MCP clients
+    /// and keeps the real Keycloak tokens server-side.
+    pub token_mode: TokenMode,
 }
 
 impl<F, T> McpApp<F, T>
@@ -145,6 +150,7 @@ where
             tool_call_logger: None,
             persistence: None,
             extra_routes: None,
+            token_mode: None,
         }
     }
 }
@@ -187,6 +193,7 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
     extra_routes: Option<Router>,
+    token_mode: Option<TokenMode>,
 }
 
 impl McpAppBuilder<()> {
@@ -216,6 +223,7 @@ impl McpAppBuilder<()> {
             tool_call_logger: None,
             persistence: None,
             extra_routes: None,
+            token_mode: None,
         }
     }
 }
@@ -248,6 +256,7 @@ impl<F> McpAppBuilder<(), F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            token_mode: self.token_mode,
         }
     }
 }
@@ -359,6 +368,20 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Set the OAuth token mode.
+    ///
+    /// - **Passthrough** (default): Keycloak tokens are forwarded directly to
+    ///   MCP clients.
+    /// - **Opaque**: The framework emits opaque UUID tokens to clients and
+    ///   keeps the real Keycloak tokens server-side.
+    ///
+    /// When not set explicitly, falls back to the `MCP_TOKEN_MODE` env var
+    /// (`passthrough` or `opaque`), defaulting to `Passthrough`.
+    pub fn token_mode(mut self, mode: TokenMode) -> Self {
+        self.token_mode = Some(mode);
+        self
+    }
+
     /// Transfer all non-factory fields into a new builder with a different factory type.
     fn with_factory<G>(self, factory: G) -> McpAppBuilder<T, G> {
         McpAppBuilder {
@@ -375,6 +398,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            token_mode: self.token_mode,
         }
     }
 
@@ -448,6 +472,7 @@ where
     /// Build the [`McpApp`], consuming the builder.
     pub fn build(self) -> anyhow::Result<McpApp<F, T>> {
         self.validate()?;
+        let token_mode = self.token_mode.unwrap_or_else(TokenMode::from_env);
         Ok(McpApp {
             name: self.name,
             auth: self.auth,
@@ -462,6 +487,7 @@ where
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            token_mode,
         })
     }
 
@@ -596,6 +622,7 @@ where
         tool_call_logger: app.tool_call_logger,
         persistence,
         extra_routes: app.extra_routes,
+        token_mode: app.token_mode,
     })
     .await
 }

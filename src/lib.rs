@@ -40,6 +40,7 @@
 //!         tool_call_logger: None,
 //!         persistence: None,
 //!         extra_routes: None,
+//!         token_mode: TokenMode::default(),
 //!     }).await
 //! }
 //! ```
@@ -92,7 +93,7 @@ pub use audit::{
 pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 #[cfg(feature = "redis")]
 pub use persistence::RedisBackend;
-pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
+pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,

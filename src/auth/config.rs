@@ -109,6 +109,32 @@ impl BasicAuthConfig {
     }
 }
 
+/// Controls how OAuth tokens are issued to MCP clients.
+///
+/// - **Passthrough** (default): Keycloak tokens are forwarded directly to the
+///   MCP client. Simple, but the client holds real JWTs and logout on the
+///   platform side immediately kills the MCP session.
+/// - **Opaque**: The framework emits its own opaque UUID tokens to the client
+///   and keeps the real Keycloak tokens server-side. The client never sees a
+///   JWT, and the framework handles refresh internally.
+///
+/// Configurable via `MCP_TOKEN_MODE=passthrough|opaque` (default: `passthrough`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TokenMode {
+    #[default]
+    Passthrough,
+    Opaque,
+}
+
+impl TokenMode {
+    pub fn from_env() -> Self {
+        match std::env::var("MCP_TOKEN_MODE").as_deref() {
+            Ok("opaque") => TokenMode::Opaque,
+            _ => TokenMode::Passthrough,
+        }
+    }
+}
+
 /// Pluggable authentication provider for MCP servers
 #[derive(Clone)]
 pub enum AuthProvider {

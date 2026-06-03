@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use super::{TokenStore, StoredToken, BasicAuthConfig};
+use super::config::TokenMode;
 use crate::constants::{
     AUTHORIZATION_HEADER, BEARER_PREFIX, BEARER_PREFIX_LOWER,
     BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM,
@@ -26,6 +27,7 @@ pub struct AuthMiddlewareState {
     pub resource_url: String,
     pub resource_metadata_url: String,
     pub token_store: TokenStore,
+    pub token_mode: TokenMode,
 }
 
 /// Extension to store the Bearer token for downstream handlers
@@ -34,6 +36,12 @@ pub struct BearerToken(pub String);
 
 /// Middleware that extracts Bearer token from Authorization header
 /// and stores it in request extensions for handlers to use.
+///
+/// In **Passthrough** mode (default): the Bearer token is stored as-is.
+///
+/// In **Opaque** mode: the Bearer token is an opaque UUID issued by this
+/// framework. The middleware resolves it to the real Keycloak token
+/// (auto-refreshing if needed) and injects that for downstream handlers.
 ///
 /// If no token is present, returns 401 with WWW-Authenticate header
 /// pointing to the OAuth protected resource metadata.
@@ -75,28 +83,55 @@ pub async fn bearer_auth_middleware(
         }
     };
 
-    // Get the MCP session ID from headers (if present)
-    let session_id = request
-        .headers()
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
+    if state.token_mode == TokenMode::Opaque {
+        // Opaque mode: resolve opaque UUID → session_id → real Keycloak token
+        let resolved_session = match state.token_store.resolve_opaque_access(&token).await {
+            Some(sid) => sid,
+            None => {
+                tracing::warn!("Auth middleware: opaque token not found, returning 401");
+                return unauthorized_response(&state.resource_metadata_url);
+            }
+        };
 
-    tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
+        // get_token auto-refreshes the Keycloak token if expired
+        match state.token_store.get_token(&resolved_session).await {
+            Some(real_token) => {
+                tracing::debug!(
+                    "Opaque token resolved for session '{}', injecting real token",
+                    resolved_session
+                );
+                request.extensions_mut().insert(BearerToken(real_token.access_token));
+            }
+            None => {
+                tracing::warn!(
+                    "Keycloak token expired and refresh failed for session '{}', returning 401",
+                    resolved_session
+                );
+                state.token_store.remove_opaque_for_session(&resolved_session).await;
+                return unauthorized_response(&state.resource_metadata_url);
+            }
+        }
+    } else {
+        // Passthrough mode: store the bearer token as-is
+        let session_id = request
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
 
-    // Store the token in the token store so tools can access it via session ID
-    let stored_token = StoredToken {
-        access_token: token.clone(),
-        refresh_token: None,
-        expires_at: None, // We don't know expiry from the bearer token alone
-        decoded_claims: None, // decoded by TokenStore::store_token if a claims_decoder is set
-    };
+        tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
 
-    state.token_store.store_token(session_id, stored_token).await;
+        let stored_token = StoredToken {
+            access_token: token.clone(),
+            refresh_token: None,
+            expires_at: None,
+            decoded_claims: None,
+        };
 
-    // Also store in request extensions for direct access
-    request.extensions_mut().insert(BearerToken(token));
+        state.token_store.store_token(session_id, stored_token).await;
+        request.extensions_mut().insert(BearerToken(token));
+    }
 
     // Continue to next handler
     next.run(request).await

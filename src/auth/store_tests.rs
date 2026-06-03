@@ -321,3 +321,141 @@ async fn token_store_no_backend_unchanged() {
     assert!(store.get_token_raw("s1").await.is_some());
     store.load_persisted().await.unwrap();
 }
+
+// === Opaque token mode tests ===
+
+#[tokio::test]
+async fn opaque_store_and_resolve() {
+    let store = TokenStore::new();
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+
+    assert_eq!(store.resolve_opaque_access("oa1").await, Some("s1".to_string()));
+    assert_eq!(store.resolve_opaque_refresh("or1").await, Some("s1".to_string()));
+    assert_eq!(store.resolve_opaque_access("nonexistent").await, None);
+    assert_eq!(store.resolve_opaque_refresh("nonexistent").await, None);
+}
+
+#[tokio::test]
+async fn opaque_rotation_replaces_old() {
+    let store = TokenStore::new();
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+    store.store_opaque_mapping("s1".into(), "oa2".into(), "or2".into()).await;
+
+    // Old tokens no longer resolve
+    assert_eq!(store.resolve_opaque_access("oa1").await, None);
+    assert_eq!(store.resolve_opaque_refresh("or1").await, None);
+
+    // New tokens resolve correctly
+    assert_eq!(store.resolve_opaque_access("oa2").await, Some("s1".to_string()));
+    assert_eq!(store.resolve_opaque_refresh("or2").await, Some("s1".to_string()));
+}
+
+#[tokio::test]
+async fn opaque_remove_for_session() {
+    let store = TokenStore::new();
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+
+    store.remove_opaque_for_session("s1").await;
+
+    assert_eq!(store.resolve_opaque_access("oa1").await, None);
+    assert_eq!(store.resolve_opaque_refresh("or1").await, None);
+}
+
+#[tokio::test]
+async fn opaque_multiple_sessions() {
+    let store = TokenStore::new();
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+    store.store_opaque_mapping("s2".into(), "oa2".into(), "or2".into()).await;
+
+    assert_eq!(store.resolve_opaque_access("oa1").await, Some("s1".to_string()));
+    assert_eq!(store.resolve_opaque_access("oa2").await, Some("s2".to_string()));
+
+    // Removing s1 doesn't affect s2
+    store.remove_opaque_for_session("s1").await;
+    assert_eq!(store.resolve_opaque_access("oa1").await, None);
+    assert_eq!(store.resolve_opaque_access("oa2").await, Some("s2".to_string()));
+}
+
+#[tokio::test]
+async fn opaque_purge_expired_cleans_mappings() {
+    let store = TokenStore::new();
+
+    // Store a token that is already expired
+    store.store_token(
+        "expired".to_string(),
+        test_token("t", None, Some(Instant::now() - Duration::from_secs(1))),
+    ).await;
+    store.store_opaque_mapping("expired".into(), "oa_e".into(), "or_e".into()).await;
+
+    // Store a valid token
+    store.store_token(
+        "valid".to_string(),
+        test_token("t2", None, Some(Instant::now() + Duration::from_secs(3600))),
+    ).await;
+    store.store_opaque_mapping("valid".into(), "oa_v".into(), "or_v".into()).await;
+
+    store.purge_expired().await;
+
+    // Expired session's opaque mapping is gone
+    assert_eq!(store.resolve_opaque_access("oa_e").await, None);
+    // Valid session's opaque mapping remains
+    assert_eq!(store.resolve_opaque_access("oa_v").await, Some("valid".to_string()));
+}
+
+#[tokio::test]
+async fn opaque_remove_token_cleans_opaque_mappings() {
+    let store = TokenStore::new();
+    store.store_token("s1".to_string(), test_token("t", None, None)).await;
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+
+    store.remove_token("s1").await;
+
+    assert_eq!(store.resolve_opaque_access("oa1").await, None);
+    assert_eq!(store.resolve_opaque_refresh("or1").await, None);
+}
+
+#[tokio::test]
+async fn opaque_persistence_roundtrip() {
+    let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+
+    let store = TokenStore::new().with_persistence(backend.clone());
+    store.store_token("s1".to_string(), test_token("kc_token", None, Some(Instant::now() + Duration::from_secs(3600)))).await;
+    store.store_opaque_mapping("s1".into(), "oa1".into(), "or1".into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify persisted to backend
+    assert!(backend.dump().await.contains_key(&("opaque".into(), "s1".into())));
+
+    // Load into a fresh store
+    let store2 = TokenStore::new().with_persistence(backend.clone());
+    store2.load_persisted().await.unwrap();
+
+    assert_eq!(store2.resolve_opaque_access("oa1").await, Some("s1".to_string()));
+    assert_eq!(store2.resolve_opaque_refresh("or1").await, Some("s1".to_string()));
+}
+
+#[tokio::test]
+async fn opaque_persistence_orphan_cleanup() {
+    let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+
+    // Store an opaque mapping but no token — simulates token expiry between restarts
+    let mapping = serde_json::to_vec(&serde_json::json!({
+        "opaque_access": "oa_orphan",
+        "opaque_refresh": "or_orphan",
+    })).unwrap();
+    backend.set("opaque", "orphan_session", &mapping, None).await.unwrap();
+
+    let store = TokenStore::new().with_persistence(backend.clone());
+    store.load_persisted().await.unwrap();
+
+    // Orphaned mapping should not be loaded
+    assert_eq!(store.resolve_opaque_access("oa_orphan").await, None);
+}
+
+#[tokio::test]
+async fn opaque_remove_nonexistent_is_noop() {
+    let store = TokenStore::new();
+    // Should not panic
+    store.remove_opaque_for_session("nonexistent").await;
+    assert_eq!(store.resolve_opaque_access("anything").await, None);
+}

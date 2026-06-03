@@ -9,13 +9,15 @@ use axum::{
     extract::{Query, State},
     http::HeaderMap,
     response::{IntoResponse, Redirect},
+    Json,
 };
 use serde::Deserialize;
 use std::sync::Arc;
 use url::form_urlencoded;
 
 use super::{McpOAuthState, StoredToken};
-use crate::constants::{MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, CONTENT_TYPE_FORM};
+use super::config::TokenMode;
+use crate::constants::{MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, CONTENT_TYPE_FORM, OPAQUE_ACCESS_TTL};
 use crate::http_util::HttpError;
 use std::time::{Duration, Instant};
 
@@ -161,6 +163,18 @@ pub async fn token_handler(
         tracing::info!("  token param: {}={}", k, display_val);
     }
 
+    let grant_type = params
+        .iter()
+        .find(|(k, _)| k == "grant_type")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    // In Opaque mode with grant_type=refresh_token, intercept before forwarding
+    // to resolve the opaque refresh token → real Keycloak refresh token.
+    if state.token_mode == TokenMode::Opaque && grant_type == "refresh_token" {
+        return handle_opaque_refresh(&state, &params).await;
+    }
+
     // Replace client_id with our Keycloak client_id
     for (key, value) in params.iter_mut() {
         if key == "client_id" {
@@ -176,7 +190,7 @@ pub async fn token_handler(
 
     // Rebuild the form body
     let new_body: String = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params)
+        .extend_pairs(&params)
         .finish();
 
     tracing::debug!("Token request to Keycloak: {}", keycloak_token_url);
@@ -197,13 +211,16 @@ pub async fn token_handler(
 
             match response.bytes().await {
                 Ok(body) => {
-                    // Log the token response for debugging
                     let body_str = String::from_utf8_lossy(&body);
                     if status.is_success() {
                         tracing::info!("Token exchange successful, status: {}", status);
                         tracing::debug!("Token response: {}", body_str);
 
-                        // Store token in the token store for auto-refresh support
+                        let session_key = headers
+                            .get(MCP_SESSION_ID_HEADER)
+                            .and_then(|h| h.to_str().ok())
+                            .unwrap_or(DEFAULT_SESSION_ID);
+
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
                             && let Some(access_token) = json["access_token"].as_str() {
                                 let stored = StoredToken {
@@ -212,13 +229,14 @@ pub async fn token_handler(
                                     expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
                                     decoded_claims: None,
                                 };
-                                // Use the real session ID from request headers, fallback to "default"
-                                let session_key = headers
-                                    .get(MCP_SESSION_ID_HEADER)
-                                    .and_then(|h| h.to_str().ok())
-                                    .unwrap_or(DEFAULT_SESSION_ID);
                                 state.token_store.store_token(session_key.to_string(), stored).await;
                                 tracing::debug!("Stored token for session '{}'", session_key);
+
+                                // In Opaque mode, replace the response with opaque tokens
+                                if state.token_mode == TokenMode::Opaque {
+                                    let kc_expires_in = json["expires_in"].as_u64();
+                                    return Ok(build_opaque_response(&state, session_key, kc_expires_in).await);
+                                }
                             }
                     } else {
                         tracing::error!(
@@ -252,4 +270,94 @@ pub async fn token_handler(
             ))
         }
     }
+}
+
+/// Build an opaque token response for the given session.
+///
+/// Generates new opaque UUIDs, stores the mapping, and returns a JSON
+/// response with the opaque tokens. `keycloak_expires_in` is the
+/// `expires_in` from the upstream Keycloak response; the opaque token
+/// uses the minimum of that and `OPAQUE_ACCESS_TTL` so the client
+/// refreshes before the server-side token actually expires.
+async fn build_opaque_response(
+    state: &McpOAuthState,
+    session_key: &str,
+    keycloak_expires_in: Option<u64>,
+) -> axum::response::Response {
+    let opaque_access = uuid::Uuid::new_v4().to_string();
+    let opaque_refresh = uuid::Uuid::new_v4().to_string();
+
+    state
+        .token_store
+        .store_opaque_mapping(
+            session_key.to_string(),
+            opaque_access.clone(),
+            opaque_refresh.clone(),
+        )
+        .await;
+
+    let expires_in = match keycloak_expires_in {
+        Some(kc) => kc.min(OPAQUE_ACCESS_TTL.as_secs()),
+        None => OPAQUE_ACCESS_TTL.as_secs(),
+    };
+
+    tracing::info!("Issued opaque tokens for session '{}' (expires_in={}s)", session_key, expires_in);
+
+    Json(serde_json::json!({
+        "access_token": opaque_access,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+        "refresh_token": opaque_refresh,
+    }))
+    .into_response()
+}
+
+/// Handle `grant_type=refresh_token` in Opaque mode.
+///
+/// 1. Resolve the opaque refresh token → session_id
+/// 2. Check if the Keycloak token needs refreshing
+/// 3. If so, refresh it upstream
+/// 4. Issue new opaque tokens
+async fn handle_opaque_refresh(
+    state: &McpOAuthState,
+    params: &[(String, String)],
+) -> Result<axum::response::Response, HttpError> {
+    let client_refresh_token = params
+        .iter()
+        .find(|(k, _)| k == "refresh_token")
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| HttpError::invalid_request("refresh_token required"))?;
+
+    let session_id = state
+        .token_store
+        .resolve_opaque_refresh(&client_refresh_token)
+        .await
+        .ok_or_else(|| {
+            tracing::warn!("Opaque refresh token not found, forcing re-auth");
+            HttpError::unauthorized("Invalid refresh token")
+        })?;
+
+    tracing::info!("Opaque refresh for session '{}'", session_id);
+
+    // get_token does auto-refresh if the Keycloak token is expired
+    let token = match state.token_store.get_token(&session_id).await {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                "Keycloak token expired and refresh failed for session '{}', forcing re-auth",
+                session_id
+            );
+            state.token_store.remove_opaque_for_session(&session_id).await;
+            return Err(HttpError::unauthorized("Session expired, re-authentication required"));
+        }
+    };
+
+    // Derive the remaining TTL from the real Keycloak token so the client
+    // refreshes before it actually expires.
+    let kc_expires_in = token.expires_at.map(|ea| {
+        let now = Instant::now();
+        if ea > now { (ea - now).as_secs() } else { 0 }
+    });
+
+    Ok(build_opaque_response(state, &session_id, kc_expires_in).await)
 }

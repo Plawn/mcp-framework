@@ -50,6 +50,33 @@ Two modes selected via `--transport` CLI flag:
 
 Key type: `TokenStore` — thread-safe token storage shared between auth middleware and the server handler via the factory closure. Supports automatic token refresh for OAuth mode.
 
+#### Opaque token mode (`TokenMode`)
+
+When using OAuth, the framework supports two token modes controlled by `TokenMode` enum:
+
+- **Passthrough** (default): Keycloak tokens are forwarded directly to the MCP client. Simple, but the client holds real JWTs and a platform logout kills the MCP session.
+- **Opaque**: The framework emits its own opaque UUID tokens to MCP clients and keeps the real Keycloak tokens server-side. The client never sees a JWT. Refresh is handled internally.
+
+Configurable via:
+- Builder API: `.token_mode(TokenMode::Opaque)`
+- Environment variable: `MCP_TOKEN_MODE=opaque` (default: `passthrough`)
+
+**Architecture**: In opaque mode, `token_handler` (`src/auth/proxy.rs`) intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
+
+**Persistence**: Opaque mappings are stored in the `NS_OPAQUE` persistence namespace (keyed by session_id). They survive restarts when a persistence backend (e.g. Redis) is configured.
+
+**Zombie handling**: When a Keycloak refresh fails (e.g. token revoked via platform logout), the opaque mapping is cleaned up and the client receives a 401, forcing re-authentication.
+
+```rust
+McpAppBuilder::new("my-server")
+    .auth(AuthProvider::OAuth(OAuthConfig::from_env().unwrap()))
+    .token_mode(TokenMode::Opaque)
+    .persistence(Arc::new(redis))
+    .server(|| MyServer::new())
+    .run()
+    .await?;
+```
+
 ### Session layer (`src/session/`)
 
 `SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
@@ -297,3 +324,4 @@ If you already have a `redis::aio::ConnectionManager` (e.g. shared with other pa
 | `BASIC_AUTH_USERNAME`, `BASIC_AUTH_PASSWORD` | Basic auth | — |
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth | `openid,profile,email` |
+| `MCP_TOKEN_MODE` | OAuth | `passthrough` |

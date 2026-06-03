@@ -11,7 +11,7 @@ use crate::auth::{
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
     mcp_oauth_router, oauth_router, protected_resource_metadata_handler, AuthMiddlewareState,
     AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig, OAuthState, RefreshConfig,
-    TokenStore, WellKnownState,
+    TokenMode, TokenStore, WellKnownState,
 };
 use crate::audit::ToolCallLogger;
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
@@ -50,6 +50,8 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     ///
     /// Avoid registering `/mcp` here — it will silently shadow the MCP fallback.
     pub extra_routes: Option<Router>,
+    /// Token mode for OAuth (Passthrough or Opaque). Ignored for non-OAuth auth.
+    pub token_mode: TokenMode,
 }
 
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
@@ -58,6 +60,7 @@ fn wrap_auth_middleware(
     auth: &AuthProvider,
     public_url: &str,
     token_store: &TokenStore,
+    token_mode: &TokenMode,
 ) -> Router {
     match auth {
         AuthProvider::None => router,
@@ -79,6 +82,7 @@ fn wrap_auth_middleware(
                     public_url
                 ),
                 token_store: token_store.clone(),
+                token_mode: token_mode.clone(),
             });
             router.layer(axum::middleware::from_fn_with_state(
                 auth_middleware_state,
@@ -94,6 +98,7 @@ fn setup_oauth_routes(
     public_url: &str,
     app_name: &str,
     token_store: &TokenStore,
+    token_mode: &TokenMode,
 ) -> Router {
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -114,6 +119,7 @@ fn setup_oauth_routes(
         keycloak_client_secret: oauth_config.client_secret.clone(),
         http_client: http_client.clone(),
         token_store: token_store.clone(),
+        token_mode: token_mode.clone(),
     };
 
     let oauth_state = OAuthState {
@@ -186,6 +192,7 @@ where
             &config.public_url,
             &config.app_name,
             &token_store,
+            &config.token_mode,
         ));
     }
 
@@ -249,7 +256,7 @@ where
             .extra_routes
             .unwrap_or_default()
             .fallback_service(mcp_service);
-        wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
+        wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store, &config.token_mode)
     };
 
     // Use fallback_service so the MCP handler responds at ANY path (/, /mcp, etc.).
@@ -333,6 +340,7 @@ where
         }
         AuthProvider::OAuth(oauth_config) => {
             tracing::info!("Auth: OAuth with issuer {}", oauth_config.issuer_url);
+            tracing::info!("Token mode: {:?}", config.token_mode);
             tracing::info!(
                 "OAuth discovery: {}/.well-known/oauth-protected-resource",
                 public_url

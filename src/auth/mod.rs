@@ -11,7 +11,7 @@ use axum::{routing::{get, post}, Router};
 use std::sync::Arc;
 use crate::constants::{OAUTH_REGISTER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_TOKEN_PATH};
 
-pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig};
+pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode};
 pub use metadata::{
     authorization_server_metadata_handler, protected_resource_metadata_handler, WellKnownState,
 };
@@ -34,6 +34,7 @@ pub struct McpOAuthState {
     pub keycloak_client_secret: Option<String>,
     pub http_client: reqwest::Client,
     pub token_store: TokenStore,
+    pub token_mode: TokenMode,
 }
 
 /// Create the MCP OAuth router with register, authorize, and token endpoints.

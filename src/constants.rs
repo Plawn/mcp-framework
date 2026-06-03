@@ -28,6 +28,11 @@ pub const OAUTH_STATUS_PATH: &str = "/status";
 pub const NS_TOKENS: &str = "tokens";
 pub const NS_SESSIONS: &str = "sessions";
 pub const NS_CAP_VERSIONS: &str = "cap_versions";
+pub const NS_OPAQUE: &str = "opaque";
+
+// === Opaque token mode ===
+pub const OPAQUE_ACCESS_TTL: Duration = Duration::from_secs(3600);
+pub const OPAQUE_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 
 // === MCP Apps (ext-apps) ===
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";

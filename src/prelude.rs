@@ -10,7 +10,7 @@ pub use crate::audit::{
 pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 #[cfg(feature = "redis")]
 pub use crate::persistence::RedisBackend;
-pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenStore};
+pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, TokenStore};
 pub use crate::capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
