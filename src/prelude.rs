@@ -5,7 +5,12 @@
 //! ```
 
 pub use crate::audit::{
-    NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
+    CompositeLogger, NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource,
+    TracingLogger,
+};
+#[cfg(feature = "metrics")]
+pub use crate::metrics::{
+    MetricsCollector, MetricsConfig, MetricsSnapshot, SessionMetrics, ToolMetrics,
 };
 pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 #[cfg(feature = "redis")]

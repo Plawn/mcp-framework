@@ -64,6 +64,42 @@ pub struct NoopLogger;
 
 impl ToolCallLogger for NoopLogger {}
 
+/// A logger that fans every record out to several inner loggers.
+///
+/// Useful for running audit logging and metrics collection side by side: each
+/// inner logger receives a clone of the record. The framework uses this to
+/// compose [`McpAppBuilder::metrics`](crate::McpAppBuilder::metrics) with any
+/// logger already set via
+/// [`tool_call_logger`](crate::McpAppBuilder::tool_call_logger).
+pub struct CompositeLogger {
+    loggers: Vec<std::sync::Arc<dyn ToolCallLogger>>,
+}
+
+impl CompositeLogger {
+    /// Create a composite from the given loggers.
+    pub fn new(loggers: Vec<std::sync::Arc<dyn ToolCallLogger>>) -> Self {
+        Self { loggers }
+    }
+}
+
+impl ToolCallLogger for CompositeLogger {
+    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        // Drive every inner logger; await them all together so async backends
+        // run concurrently while sync ones complete inline. The last logger
+        // takes the owned record, so we clone only `len - 1` times.
+        let Some((last, rest)) = self.loggers.split_last() else {
+            return Box::pin(std::future::ready(()));
+        };
+        let mut futures: Vec<_> = rest.iter().map(|l| l.log(record.clone())).collect();
+        futures.push(last.log(record));
+        Box::pin(async move {
+            for fut in futures {
+                fut.await;
+            }
+        })
+    }
+}
+
 /// A logger that emits structured `tracing` events at INFO level.
 ///
 /// Each tool call produces a single `tracing::info!` event with fields:

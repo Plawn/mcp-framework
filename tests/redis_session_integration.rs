@@ -172,6 +172,7 @@ async fn start_server(redis: Arc<RedisBackend>) -> TestServer {
         tool_call_logger: None,
         persistence: Some(redis),
         extra_routes: None,
+        public_routes: None,
     };
 
     let (app, _token_store, _registry) = build_app(config);

@@ -50,6 +50,13 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     ///
     /// Avoid registering `/mcp` here — it will silently shadow the MCP fallback.
     pub extra_routes: Option<Router>,
+    /// Public (unauthenticated) routes — health checks, probes, metrics.
+    ///
+    /// Unlike [`extra_routes`](Self::extra_routes), these are merged **outside**
+    /// the auth middleware (like the OAuth discovery routes) so they stay
+    /// reachable without credentials. Set via
+    /// [`McpAppBuilder::public_routes`](crate::McpAppBuilder::public_routes).
+    pub public_routes: Option<Router>,
 }
 
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
@@ -178,6 +185,13 @@ where
     }
 
     let mut app = Router::new();
+
+    // Public routes (health, probes, metrics) — merged outside the auth layer
+    // so they stay reachable without credentials. Take priority over the MCP
+    // fallback for their paths.
+    if let Some(public_routes) = config.public_routes {
+        app = app.merge(public_routes);
+    }
 
     if let AuthProvider::OAuth(oauth_config) = &config.auth {
         app = app.merge(setup_oauth_routes(

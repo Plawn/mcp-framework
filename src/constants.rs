@@ -37,6 +37,16 @@ pub const OPAQUE_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 // === MCP Apps (ext-apps) ===
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 
+// === Metrics (feature "metrics") ===
+pub const DEFAULT_METRICS_PATH: &str = "/metrics";
+pub const DEFAULT_METRICS_NAMESPACE: &str = "mcp";
+pub const DEFAULT_METRICS_MAX_SESSIONS: usize = 10_000;
+pub const DEFAULT_METRICS_MAX_TOOLS: usize = 1_000;
+/// Latency histogram bucket upper bounds in milliseconds.
+pub const DEFAULT_METRICS_LATENCY_BUCKETS_MS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+];
+
 // === Auth ===
 pub const BEARER_PREFIX: &str = "Bearer ";
 pub const BEARER_PREFIX_LOWER: &str = "bearer ";

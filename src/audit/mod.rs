@@ -8,5 +8,5 @@
 mod logger;
 mod record;
 
-pub use logger::{NoopLogger, ToolCallLogger, TracingLogger};
+pub use logger::{CompositeLogger, NoopLogger, ToolCallLogger, TracingLogger};
 pub use record::{ToolCallOutcome, ToolCallRecord, ToolCallSource};

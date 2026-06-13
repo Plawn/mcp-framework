@@ -157,6 +157,41 @@ impl ToolCallLogger for FileLogger {
 
 Then wire it via the builder: `.tool_call_logger(Arc::new(FileLogger { path: "audit.log".into() }))`
 
+### Effectiveness metrics (`src/metrics/`, feature `metrics`)
+
+Opt-in, feature-gated aggregation of tool call effectiveness. Compiled out entirely unless the `metrics` cargo feature is enabled — zero cost (no module, no fields populated) otherwise.
+
+The `MetricsCollector` **is** a `ToolCallLogger`: it consumes the same `ToolCallRecord` stream as audit logging, so there is no new interception point and no added tool-call latency. `.metrics(collector)` composes with any logger already set via `.tool_call_logger()` (both receive every record, via `CompositeLogger`).
+
+What's measured (cumulative since process start):
+- **Per tool**: call frequency, success / `tool_error` / `mcp_error` counts, success & error rates, latency p50/p95/p99 + mean. Percentiles come from a bounded-memory bucketed histogram (`histogram.rs`), interpolated like Prometheus `histogram_quantile` — no per-call sample retention.
+- **Per session**: call count, error rate, per-tool distribution. Cardinality-capped (`max_sessions`).
+
+Exposure (both, answering the ticket's open question):
+- **In-process**: `collector.snapshot() -> MetricsSnapshot` (serde-serializable; per-tool + per-session). Works in stdio mode too.
+- **HTTP endpoint**: served *outside* the auth layer (so a Prometheus scraper needs no credentials) at `MetricsConfig::endpoint_path` (default `/metrics`). Prometheus text by default; `?format=json` returns the snapshot. Per-session data is JSON-only — session ids would explode Prometheus label cardinality, so the exposition emits per-tool series + an `mcp_active_sessions` gauge.
+
+Key types: `MetricsCollector`, `MetricsConfig` (with `Default` and `from_env`), `MetricsSnapshot` / `ToolMetrics` / `SessionMetrics`. The endpoint is mounted via the general `public_routes: Option<Router>` field (the un-authed counterpart to `extra_routes`, threaded through `McpApp` → `HttpAppConfig`); `.metrics()` merges its router there. `public_routes` is a feature-independent type, so there's no `cfg` churn on struct literals, and it doubles as the mounting point for health checks / probes via `McpAppBuilder::public_routes`.
+
+```rust
+use mcp_framework::prelude::*;
+
+let metrics = MetricsCollector::new(MetricsConfig::default());
+
+McpAppBuilder::new("my-server")
+    .metrics(metrics.clone())     // logs records + mounts /metrics
+    .server(|| MyServer::new())
+    .run()
+    .await?;
+
+// query in-process anytime:
+let snap = metrics.snapshot();
+println!("{} calls, p95 of busiest tool: {:?}ms",
+    snap.total_calls, snap.tools.first().map(|t| t.p95_ms));
+```
+
+Enable the feature in `Cargo.toml`: `mcp-framework = { version = "0.1", features = ["metrics"] }`.
+
 ### Access validation (`src/capability/validator.rs`)
 
 Pre-execution authorization for tool calls, prompt access, and resource reads. Unlike `CapabilityFilter` which controls **visibility** (what clients can *see*), `AccessValidator` controls **execution** (what clients can *do*). A tool hidden by the filter can still be called directly if the client knows its name — the access validator closes that gap.
@@ -329,3 +364,8 @@ If you already have a `redis::aio::ConnectionManager` (e.g. shared with other pa
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth | `openid,profile,email` |
 | `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` |
+| `MCP_METRICS_PATH` | `MetricsConfig::from_env()` (feature `metrics`) | `/metrics` (`off`/empty disables) |
+| `MCP_METRICS_NAMESPACE` | `MetricsConfig::from_env()` | `mcp` |
+| `MCP_METRICS_TRACK_SESSIONS` | `MetricsConfig::from_env()` | `true` |
+| `MCP_METRICS_MAX_SESSIONS` | `MetricsConfig::from_env()` | `10000` |
+| `MCP_METRICS_BUCKETS_MS` | `MetricsConfig::from_env()` | `1,5,10,25,50,100,250,500,1000,2500,5000,10000` |

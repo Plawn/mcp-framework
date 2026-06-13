@@ -40,6 +40,7 @@
 //!         tool_call_logger: None,
 //!         persistence: None,
 //!         extra_routes: None,
+//!         public_routes: None,
 //!     }).await
 //! }
 //! ```
@@ -60,6 +61,8 @@ pub mod auth;
 pub mod capability;
 pub mod constants;
 pub mod http_util;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod newtypes;
 pub mod persistence;
 pub mod prelude;
@@ -87,8 +90,11 @@ pub mod transport;
 pub struct EmptyParams {}
 
 pub use audit::{
-    NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource, TracingLogger,
+    CompositeLogger, NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource,
+    TracingLogger,
 };
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsCollector, MetricsConfig, MetricsSnapshot, SessionMetrics, ToolMetrics};
 pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 #[cfg(feature = "redis")]
 pub use persistence::RedisBackend;

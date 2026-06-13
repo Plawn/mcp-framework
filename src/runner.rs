@@ -113,6 +113,14 @@ where
     ///
     /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
     pub extra_routes: Option<Router>,
+    /// Public axum routes mounted **outside** the auth layer (health checks,
+    /// readiness probes, the metrics endpoint, …).
+    ///
+    /// The counterpart to [`extra_routes`](Self::extra_routes): those sit behind
+    /// the auth middleware, these stay reachable without credentials. Set via
+    /// [`McpAppBuilder::public_routes`]; [`McpAppBuilder::metrics`] merges its
+    /// endpoint here too.
+    pub public_routes: Option<Router>,
 }
 
 impl<F, T> McpApp<F, T>
@@ -145,6 +153,7 @@ where
             tool_call_logger: None,
             persistence: None,
             extra_routes: None,
+            public_routes: None,
         }
     }
 }
@@ -187,6 +196,7 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
     extra_routes: Option<Router>,
+    public_routes: Option<Router>,
 }
 
 impl McpAppBuilder<()> {
@@ -216,6 +226,7 @@ impl McpAppBuilder<()> {
             tool_call_logger: None,
             persistence: None,
             extra_routes: None,
+            public_routes: None,
         }
     }
 }
@@ -248,6 +259,7 @@ impl<F> McpAppBuilder<(), F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            public_routes: self.public_routes,
         }
     }
 }
@@ -326,6 +338,45 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Enable effectiveness metrics collection (feature `metrics`).
+    ///
+    /// The collector aggregates per-tool and per-session statistics from the
+    /// tool call stream. This method:
+    /// - registers the collector as a [`ToolCallLogger`], composing with any
+    ///   logger already set via [`tool_call_logger`](Self::tool_call_logger)
+    ///   (both receive every record);
+    /// - mounts the metrics HTTP endpoint into [`public_routes`](Self::public_routes)
+    ///   (unauthenticated) at the path from
+    ///   [`MetricsConfig`](crate::metrics::MetricsConfig), if enabled.
+    ///
+    /// Hold the `Arc` to query [`MetricsCollector::snapshot`](crate::metrics::MetricsCollector::snapshot)
+    /// in-process (works in stdio mode too).
+    ///
+    /// Because it composes with the logger set so far, call `.metrics()` *after*
+    /// any [`tool_call_logger`](Self::tool_call_logger) — a later
+    /// `.tool_call_logger()` overwrites (last-wins) and would drop the collector.
+    ///
+    /// ```rust,ignore
+    /// let metrics = MetricsCollector::new(MetricsConfig::default());
+    /// McpAppBuilder::new("my-server")
+    ///     .metrics(metrics.clone())
+    ///     .server(|| MyServer::new())
+    ///     .run()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn metrics(mut self, collector: Arc<crate::metrics::MetricsCollector>) -> Self {
+        let logger: Arc<dyn ToolCallLogger> = collector.clone();
+        self.tool_call_logger = Some(match self.tool_call_logger.take() {
+            Some(existing) => Arc::new(crate::audit::CompositeLogger::new(vec![existing, logger])),
+            None => logger,
+        });
+        if let Some(route) = crate::metrics::metrics_router(collector) {
+            self = self.public_routes(route);
+        }
+        self
+    }
+
     /// Register additional axum routes that live inside the auth-wrapped MCP router.
     ///
     /// Use this to expose REST endpoints (or any non-MCP HTTP surface) that share
@@ -353,6 +404,26 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Register public axum routes mounted **outside** the auth layer.
+    ///
+    /// The counterpart to [`extra_routes`](Self::extra_routes): use this for
+    /// surfaces that must stay reachable without credentials — health checks,
+    /// readiness probes, a Prometheus scrape endpoint. Like the OAuth discovery
+    /// routes, these are merged before the auth-wrapped MCP fallback, so they
+    /// take priority for their paths and bypass the middleware.
+    ///
+    /// Calls accumulate (routers are merged), so multiple `.public_routes(...)`
+    /// compose rather than overwrite. [`metrics`](Self::metrics) reuses this.
+    ///
+    /// Stdio mode ignores this field (no HTTP surface).
+    pub fn public_routes(mut self, routes: Router) -> Self {
+        self.public_routes = Some(match self.public_routes.take() {
+            Some(existing) => existing.merge(routes),
+            None => routes,
+        });
+        self
+    }
+
     /// Set the persistence backend, shared by `TokenStore` and `SessionStore`.
     pub fn persistence(mut self, backend: Arc<dyn PersistenceBackend>) -> Self {
         self.persistence = Some(backend);
@@ -375,6 +446,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            public_routes: self.public_routes,
         }
     }
 
@@ -462,6 +534,7 @@ where
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             extra_routes: self.extra_routes,
+            public_routes: self.public_routes,
         })
     }
 
@@ -596,6 +669,7 @@ where
         tool_call_logger: app.tool_call_logger,
         persistence,
         extra_routes: app.extra_routes,
+        public_routes: app.public_routes,
     })
     .await
 }

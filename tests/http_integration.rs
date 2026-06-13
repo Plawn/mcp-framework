@@ -166,6 +166,7 @@ async fn start_server() -> std::net::SocketAddr {
         tool_call_logger: None,
         persistence: None,
         extra_routes: None,
+        public_routes: None,
     };
 
     let (app, _token_store, _registry) = build_app(config);
