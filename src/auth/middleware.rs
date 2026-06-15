@@ -112,7 +112,10 @@ pub async fn bearer_auth_middleware(
             }
         }
     } else {
-        // Passthrough mode: store the bearer token as-is
+        // Passthrough mode: track the bearer in the store WITHOUT destroying
+        // the refresh_token / expires_at that the token handler stored at
+        // the initial exchange. If the bearer JWT is expired and we have a
+        // refresh_token, attempt a server-side refresh before giving up.
         let session_id = request
             .headers()
             .get(MCP_SESSION_ID_HEADER)
@@ -120,21 +123,82 @@ pub async fn bearer_auth_middleware(
             .map(|s| s.to_string())
             .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
 
+        let existing = state.token_store.peek_token(&session_id).await;
+        let has_refresh = existing.as_ref().and_then(|t| t.refresh_token.as_ref()).is_some();
+        let bearer_expired = jwt_is_expired(&token).unwrap_or(false);
+
+        if bearer_expired && has_refresh {
+            // Server-side auto-refresh. get_token() drives refresh_token()
+            // which updates the store atomically under the per-session lock.
+            match state.token_store.get_token(&session_id).await {
+                Some(refreshed) => {
+                    tracing::info!(
+                        "Bearer JWT expired, server-side refresh succeeded for session '{}'",
+                        session_id
+                    );
+                    request.extensions_mut().insert(BearerToken(refreshed.access_token));
+                    return next.run(request).await;
+                }
+                None => {
+                    tracing::warn!(
+                        "Bearer JWT expired and refresh failed for session '{}', returning 401",
+                        session_id
+                    );
+                    return unauthorized_response(&state.resource_metadata_url);
+                }
+            }
+        }
+
         tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
 
-        let stored_token = StoredToken {
-            access_token: token.clone(),
-            refresh_token: None,
-            expires_at: None,
-            decoded_claims: None,
+        // Preserve refresh_token + expires_at from any existing entry so that
+        // a later request with an expired bearer can still trigger refresh.
+        // Only write back when something actually changed.
+        let needs_store = match &existing {
+            Some(prev) => prev.access_token != token,
+            None => true,
         };
 
-        state.token_store.store_token(session_id, stored_token).await;
+        if needs_store {
+            let (refresh_token, expires_at) = match existing {
+                Some(prev) => (prev.refresh_token, prev.expires_at),
+                None => (None, None),
+            };
+            let stored_token = StoredToken {
+                access_token: token.clone(),
+                refresh_token,
+                expires_at,
+                decoded_claims: None,
+            };
+            state.token_store.store_token(session_id, stored_token).await;
+        }
+
         request.extensions_mut().insert(BearerToken(token));
     }
 
     // Continue to next handler
     next.run(request).await
+}
+
+/// Decode the JWT payload (without signature verification) and return
+/// whether the `exp` claim is in the past.
+///
+/// Returns `None` when the token is not a parseable JWT or has no `exp`
+/// claim — callers should treat that as "unknown, don't refresh".
+/// The actual signature is validated by the downstream API; the middleware
+/// only needs `exp` to decide whether a server-side refresh is warranted.
+fn jwt_is_expired(token: &str) -> Option<bool> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = json.get("exp")?.as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now >= exp)
 }
 
 /// Returns a 401 response with WWW-Authenticate header for OAuth discovery

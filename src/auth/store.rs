@@ -25,6 +25,22 @@ pub struct StoredToken {
 }
 
 impl StoredToken {
+    /// Build a `StoredToken` from its public fields. `decoded_claims` is
+    /// populated automatically when the token is inserted via
+    /// [`TokenStore::store_token`] (if a claims decoder is configured).
+    pub fn new(
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            expires_at,
+            decoded_claims: None,
+        }
+    }
+
     pub fn from_token_response(response: &BasicTokenResponse) -> Self {
         let expires_at = response.expires_in().map(|d| Instant::now() + d);
 
@@ -384,6 +400,14 @@ impl TokenStore {
     async fn get_token_raw(&self, session_id: &str) -> Option<StoredToken> {
         let tokens = self.tokens.read().await;
         tokens.get(session_id).cloned()
+    }
+
+    /// Read the stored token for a session without triggering a refresh.
+    ///
+    /// Returns the token as-is (even if expired). Use [`get_token`](Self::get_token)
+    /// when you need an auto-refresh on expiry.
+    pub async fn peek_token(&self, session_id: &str) -> Option<StoredToken> {
+        self.get_token_raw(session_id).await
     }
 
     /// Get a token for a session, automatically refreshing if expired.
