@@ -8,7 +8,7 @@ fn summarize_content_empty() {
 #[test]
 fn summarize_content_text_truncation() {
     let long_text = "x".repeat(300);
-    let content = vec![Content::text(long_text)];
+    let content = vec![ContentBlock::text(long_text)];
     let summary = summarize_content(&content).unwrap();
     assert!(summary.len() < 270);
     assert!(summary.ends_with("..."));
@@ -16,7 +16,7 @@ fn summarize_content_text_truncation() {
 
 #[test]
 fn summarize_content_short_text() {
-    let content = vec![Content::text("hello")];
+    let content = vec![ContentBlock::text("hello")];
     let summary = summarize_content(&content).unwrap();
     assert_eq!(summary, "hello");
 }
@@ -24,8 +24,8 @@ fn summarize_content_short_text() {
 #[test]
 fn summarize_content_mixed() {
     let content = vec![
-        Content::text("hello"),
-        Content::image("base64data", "image/png"),
+        ContentBlock::text("hello"),
+        ContentBlock::image("base64data", "image/png"),
     ];
     let summary = summarize_content(&content).unwrap();
     assert_eq!(summary, "hello; <image>");

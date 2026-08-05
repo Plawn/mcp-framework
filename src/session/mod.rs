@@ -30,7 +30,10 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::auth::TokenStore;
-use crate::constants::{NS_SESSIONS, DEFAULT_SESSION_TTL, MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID};
+use crate::constants::{
+    NS_SESSIONS, DEFAULT_SESSION_TTL, MCP_SESSION_ID_HEADER, MCP_FALLBACK_SESSION_HEADER,
+    DEFAULT_SESSION_ID,
+};
 use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
 
 /// Trait alias for the bounds required on session data types.
@@ -123,14 +126,50 @@ impl<T: SessionData> SessionStore<T> {
 
     /// Get the session data for `session_id` if it exists.
     ///
-    /// Updates the last-access timestamp on hit.
+    /// Updates the last-access timestamp on hit. On a memory miss, falls back to
+    /// the persistence backend (read-through) so a request served by an instance
+    /// that did not create the session can still resolve it; the loaded entry is
+    /// written back to the in-memory cache.
     pub async fn get(&self, session_id: &str) -> Option<T> {
+        // Fast path: in-memory hit (no backend round-trip).
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(entry) = sessions.get_mut(session_id) {
+                entry.last_access = Instant::now();
+                return Some(entry.data.clone());
+            }
+        }
+
+        // Slow path: read-through to the persistence backend.
+        let data = self.load_session_from_backend(session_id).await?;
+
         let mut sessions = self.sessions.write().await;
-        if let Some(entry) = sessions.get_mut(session_id) {
-            entry.last_access = Instant::now();
-            Some(entry.data.clone())
-        } else {
-            None
+        let entry = sessions.entry(session_id.to_string()).or_insert_with(|| SessionEntry {
+            data: data.clone(),
+            last_access: Instant::now(),
+        });
+        entry.last_access = Instant::now();
+        Some(entry.data.clone())
+    }
+
+    /// Read a session directly from the persistence backend. Does not touch the
+    /// in-memory cache. Returns `None` if there is no backend, no entry, or the
+    /// entry is corrupted.
+    async fn load_session_from_backend(&self, session_id: &str) -> Option<T> {
+        let backend = self.persistence.as_ref()?;
+        let bytes = match backend.get(NS_SESSIONS, session_id).await {
+            Ok(b) => b?,
+            Err(e) => {
+                tracing::warn!("Read-through get failed for session {session_id}: {e}");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<PersistedSession<T>>(&bytes) {
+            Ok(p) => Some(p.data),
+            Err(e) => {
+                tracing::warn!("Corrupted persisted session {session_id}: {e}");
+                None
+            }
         }
     }
 
@@ -295,20 +334,43 @@ impl<T: SessionData> Default
     }
 }
 
+/// Resolve the session identity carried by an HTTP request.
+///
+/// [`MCP_FALLBACK_SESSION_HEADER`] wins when present, then the protocol session
+/// (`mcp-session-id`), then [`DEFAULT_SESSION_ID`].
+///
+/// The framework header takes precedence because the auth middleware only sets
+/// it where it is the more accurate identity, and it always strips any
+/// client-supplied value first:
+///
+/// - **Sessionless revisions.** MCP 2026-07-28 removed protocol sessions
+///   (SEP-2567), so `mcp-session-id` is absent; the middleware injects a
+///   per-credential id instead of letting every concurrent client share
+///   [`DEFAULT_SESSION_ID`].
+/// - **Opaque token mode.** The grant, not the connection, is the identity: the
+///   opaque token outlives any `mcp-session-id` and is what keys the
+///   `TokenStore`. The middleware injects the resolved grant id so callers and
+///   the token store agree.
+///
+/// Otherwise the header is absent and the protocol session is used unchanged.
+pub fn session_id_from_parts(parts: &http::request::Parts) -> &str {
+    parts
+        .headers
+        .get(MCP_FALLBACK_SESSION_HEADER)
+        .or_else(|| parts.headers.get(MCP_SESSION_ID_HEADER))
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(DEFAULT_SESSION_ID)
+}
+
 /// Extract the MCP session ID from request context extensions.
 ///
-/// Looks for the `mcp-session-id` header in the HTTP request parts
-/// injected by `StreamableHttpService`. Returns `"default"` if no
-/// HTTP parts or header are available (e.g., stdio mode).
+/// Reads the HTTP request parts injected by `StreamableHttpService` and
+/// resolves them via [`session_id_from_parts`]. Returns `"default"` when no
+/// HTTP parts are available (e.g. stdio mode).
 pub fn resolve_session_id(extensions: &Extensions) -> &str {
     extensions
         .get::<http::request::Parts>()
-        .and_then(|parts| {
-            parts
-                .headers
-                .get(MCP_SESSION_ID_HEADER)
-                .and_then(|h| h.to_str().ok())
-        })
+        .map(session_id_from_parts)
         .unwrap_or(DEFAULT_SESSION_ID)
 }
 

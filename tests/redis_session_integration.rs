@@ -51,7 +51,7 @@ impl CounterServer {
     ) -> Result<CallToolResult, McpError> {
         let session = context.session::<CounterSession>();
         let data = session.update(|s| s.counter += 1).await;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             data.counter.to_string(),
         )]))
     }
@@ -64,7 +64,7 @@ impl CounterServer {
     ) -> Result<CallToolResult, McpError> {
         let session = context.session::<CounterSession>();
         let data = session.get_or_create().await;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             data.counter.to_string(),
         )]))
     }
@@ -202,7 +202,7 @@ fn call_tool_result_text(result: &CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content")
 }

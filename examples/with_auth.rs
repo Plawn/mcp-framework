@@ -39,7 +39,7 @@ impl ServerHandler for AuthServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
             if request.name.as_ref() == "whoami" {
                 let session_id = context.session_id();
@@ -49,7 +49,7 @@ impl ServerHandler for AuthServer {
                     "Session: {}\nAuthenticated: {}",
                     session_id, has_token
                 );
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
             } else {
                 Err(McpError::invalid_params("unknown tool", None))
             }

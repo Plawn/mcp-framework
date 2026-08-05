@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use rmcp::model::{Extensions, Prompt, Resource, Tool};
 
 use crate::auth::{StoredToken, TokenStore};
-use crate::constants::{MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID};
+use crate::session::session_id_from_parts;
 
 /// Trait for filtering capabilities based on the session's authentication token.
 ///
@@ -89,9 +89,10 @@ where
 
 /// Attempt to resolve the stored token for the current MCP session.
 ///
-/// Extracts the `mcp-session-id` header from the HTTP request parts
-/// injected by `StreamableHttpService` into the request context extensions,
-/// then looks up the corresponding token in the `TokenStore`.
+/// Resolves the session identity from the HTTP request parts injected by
+/// `StreamableHttpService` into the request context extensions (see
+/// [`session_id_from_parts`]), then looks up the corresponding token in the
+/// `TokenStore`.
 ///
 /// Returns `None` if no HTTP parts are available (e.g. stdio mode) or if
 /// no token is stored for the session.
@@ -100,12 +101,7 @@ pub(crate) async fn resolve_token(
     token_store: &TokenStore,
 ) -> Option<StoredToken> {
     let parts = extensions.get::<http::request::Parts>()?;
-    let session_id = parts
-        .headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or(DEFAULT_SESSION_ID);
-    token_store.get_token(session_id).await
+    token_store.get_token(session_id_from_parts(parts)).await
 }
 
 /// Extract the set of tool names to exclude from the `?filter=` query parameter.

@@ -13,13 +13,86 @@ use axum::{
 use std::sync::Arc;
 
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use super::{TokenStore, StoredToken, BasicAuthConfig};
 use super::config::TokenMode;
 use crate::constants::{
     AUTHORIZATION_HEADER, BEARER_PREFIX, BEARER_PREFIX_LOWER,
     BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM,
-    MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, WWW_AUTHENTICATE_HEADER,
+    MCP_SESSION_ID_HEADER, MCP_FALLBACK_SESSION_HEADER, WWW_AUTHENTICATE_HEADER,
 };
+
+/// Derive a stable session identity from a credential.
+///
+/// The credential is hashed, so the derived id is safe to log and cannot be
+/// reversed into the token it came from. The same credential always maps to the
+/// same id, which is what lets a sessionless client be recognised across
+/// requests and what lets the `/oauth/token` exchange pre-register an entry the
+/// auth middleware will later find (see [`bearer_auth_middleware`]).
+pub(crate) fn credential_session_key(credential: &str) -> String {
+    let digest = Sha256::digest(credential.as_bytes());
+    format!(
+        "cred-{}",
+        digest[..16].iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    )
+}
+
+/// Bind a request to a framework session identity.
+///
+/// Deliberately NOT `mcp-session-id`: writing that header back would make
+/// rmcp's Streamable HTTP transport look up a session that never existed.
+fn set_framework_session_id(request: &mut Request<Body>, session_id: &str) {
+    if let Ok(value) = session_id.parse() {
+        request
+            .headers_mut()
+            .insert(MCP_FALLBACK_SESSION_HEADER, value);
+    }
+}
+
+/// Strip any client-supplied [`MCP_FALLBACK_SESSION_HEADER`] before auth runs.
+///
+/// The header is framework-internal and authoritative for session identity (see
+/// [`session_id_from_parts`]), so a client able to set it could bind its request
+/// to another user's session and read their tokens. Only the auth middleware may
+/// write it, and only after validating the credential it is derived from.
+///
+/// Applied to every request, including under [`AuthProvider::None`] where no
+/// auth middleware runs to overwrite it.
+///
+/// [`session_id_from_parts`]: crate::session::session_id_from_parts
+/// [`AuthProvider::None`]: crate::auth::AuthProvider::None
+pub async fn strip_framework_session_header(mut request: Request<Body>, next: Next) -> Response {
+    request.headers_mut().remove(MCP_FALLBACK_SESSION_HEADER);
+    next.run(request).await
+}
+
+/// Resolve the session identity for a request, deriving one when the protocol
+/// does not supply it.
+///
+/// MCP 2026-07-28 (SEP-2567) removes protocol sessions, so `mcp-session-id` is
+/// absent for clients on that revision. Falling back to a single shared
+/// `"default"` id would make every concurrent client read and overwrite the
+/// same `TokenStore` entry — one user's bearer token served to another. Instead
+/// we derive a stable id from the credential and inject it under
+/// [`MCP_FALLBACK_SESSION_HEADER`] so the rest of the framework
+/// (`resolve_session_id`, `resolve_token`) resolves it uniformly.
+fn resolve_or_derive_session_id(request: &mut Request<Body>, credential: &str) -> String {
+    if let Some(sid) = request
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+    {
+        return sid.to_string();
+    }
+
+    let derived = credential_session_key(credential);
+    set_framework_session_id(request, &derived);
+    derived
+}
 
 /// Shared state for the auth middleware
 #[derive(Clone)]
@@ -100,6 +173,12 @@ pub async fn bearer_auth_middleware(
                     "Opaque token resolved for session '{}', injecting real token",
                     resolved_session
                 );
+                // The grant, not the protocol session, is the identity here:
+                // the opaque token outlives any `mcp-session-id` and is what
+                // keys the token store. Bind the request to it unconditionally
+                // so `ctx.session_id()` and the token store agree, and so a
+                // reconnect lands back on the same session.
+                set_framework_session_id(&mut request, &resolved_session);
                 request.extensions_mut().insert(BearerToken(real_token.access_token));
             }
             None => {
@@ -116,18 +195,44 @@ pub async fn bearer_auth_middleware(
         // the refresh_token / expires_at that the token handler stored at
         // the initial exchange. If the bearer JWT is expired and we have a
         // refresh_token, attempt a server-side refresh before giving up.
-        let session_id = request
-            .headers()
-            .get(MCP_SESSION_ID_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
+        let session_id = resolve_or_derive_session_id(&mut request, &token);
 
-        let existing = state.token_store.peek_token(&session_id).await;
+        // The `/oauth/token` exchange keys its entry by the credential, because
+        // no MCP session exists at that point. Adopt that entry the first time a
+        // protocol session shows up with the same bearer — otherwise the
+        // `refresh_token` it captured is unreachable and server-side refresh can
+        // never fire. When the id was derived from the credential the two keys
+        // coincide and this is a no-op.
+        let grant_key = credential_session_key(&token);
+        let mut existing = state.token_store.peek_token(&session_id).await;
+        let mut adopted = false;
+        if existing.is_none() && grant_key != session_id {
+            existing = state.token_store.peek_token(&grant_key).await;
+            adopted = existing.is_some();
+        }
+
+        // Materialize the entry under `session_id` *before* attempting refresh:
+        // refresh_token() operates on the store keyed by session id. Preserve
+        // refresh_token + expires_at so an expired bearer can still be
+        // refreshed. Only write back when something actually changed.
+        let needs_store = adopted || existing.as_ref().is_none_or(|prev| prev.access_token != token);
+        if needs_store {
+            let (refresh_token, expires_at) = existing
+                .as_ref()
+                .map(|prev| (prev.refresh_token.clone(), prev.expires_at))
+                .unwrap_or((None, None));
+            let stored_token = StoredToken {
+                access_token: token.clone(),
+                refresh_token,
+                expires_at,
+                decoded_claims: None,
+            };
+            state.token_store.store_token(session_id.clone(), stored_token).await;
+        }
+
         let has_refresh = existing.as_ref().and_then(|t| t.refresh_token.as_ref()).is_some();
-        let bearer_expired = jwt_is_expired(&token).unwrap_or(false);
 
-        if bearer_expired && has_refresh {
+        if jwt_is_expired(&token).unwrap_or(false) && has_refresh {
             // Server-side auto-refresh. get_token() drives refresh_token()
             // which updates the store atomically under the per-session lock.
             match state.token_store.get_token(&session_id).await {
@@ -149,29 +254,7 @@ pub async fn bearer_auth_middleware(
             }
         }
 
-        tracing::debug!("Bearer token found for session {}, storing and allowing request", session_id);
-
-        // Preserve refresh_token + expires_at from any existing entry so that
-        // a later request with an expired bearer can still trigger refresh.
-        // Only write back when something actually changed.
-        let needs_store = match &existing {
-            Some(prev) => prev.access_token != token,
-            None => true,
-        };
-
-        if needs_store {
-            let (refresh_token, expires_at) = match existing {
-                Some(prev) => (prev.refresh_token, prev.expires_at),
-                None => (None, None),
-            };
-            let stored_token = StoredToken {
-                access_token: token.clone(),
-                refresh_token,
-                expires_at,
-                decoded_claims: None,
-            };
-            state.token_store.store_token(session_id, stored_token).await;
-        }
+        tracing::debug!("Bearer token found for session {}, allowing request", session_id);
 
         request.extensions_mut().insert(BearerToken(token));
     }
@@ -288,12 +371,7 @@ pub async fn basic_auth_middleware(
         return basic_unauthorized_response();
     }
 
-    let session_id = request
-        .headers()
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
+    let session_id = resolve_or_derive_session_id(&mut request, &password);
 
     tracing::debug!("Basic auth validated for session {}, storing token", session_id);
 
@@ -320,4 +398,70 @@ fn basic_unauthorized_response() -> Response {
         "Unauthorized: Basic credentials required",
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with(headers: &[(&'static str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().uri("/mcp");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn protocol_session_id_wins_and_is_not_overwritten() {
+        let mut request = request_with(&[(MCP_SESSION_ID_HEADER, "sess-abc")]);
+        let resolved = resolve_or_derive_session_id(&mut request, "token-1");
+
+        assert_eq!(resolved, "sess-abc");
+        assert!(request.headers().get(MCP_FALLBACK_SESSION_HEADER).is_none());
+    }
+
+    #[test]
+    fn sessionless_request_derives_a_stable_per_credential_id() {
+        let mut a1 = request_with(&[]);
+        let mut a2 = request_with(&[]);
+        let mut b = request_with(&[]);
+
+        let id_a1 = resolve_or_derive_session_id(&mut a1, "token-a");
+        let id_a2 = resolve_or_derive_session_id(&mut a2, "token-a");
+        let id_b = resolve_or_derive_session_id(&mut b, "token-b");
+
+        // Same credential → same session across requests (stateless HTTP has
+        // no protocol session to carry it), different credentials → isolated.
+        assert_eq!(id_a1, id_a2);
+        assert_ne!(id_a1, id_b);
+        assert!(id_a1.starts_with("cred-"));
+
+        // Never the shared default, and never the credential itself.
+        assert_ne!(id_a1, crate::constants::DEFAULT_SESSION_ID);
+        assert!(!id_a1.contains("token-a"));
+
+        // The cross-module contract `/oauth/token` depends on: the exchange
+        // stores the grant under `credential_session_key(access_token)` before
+        // any MCP session exists, and this is the only reason the middleware can
+        // find it again later from the bearer alone.
+        assert_eq!(id_a1, credential_session_key("token-a"));
+    }
+
+    #[test]
+    fn derived_id_is_injected_under_the_framework_header_only() {
+        let mut request = request_with(&[]);
+        let derived = resolve_or_derive_session_id(&mut request, "token-a");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(MCP_FALLBACK_SESSION_HEADER)
+                .and_then(|h| h.to_str().ok()),
+            Some(derived.as_str()),
+        );
+        // Writing mcp-session-id back would make rmcp look up a session that
+        // never existed and reject the request.
+        assert!(request.headers().get(MCP_SESSION_ID_HEADER).is_none());
+    }
 }

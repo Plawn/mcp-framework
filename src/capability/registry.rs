@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::model::{
-    Annotated, CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Meta, Prompt,
-    RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, Tool,
+    CallToolResult, GetPromptRequestParams, GetPromptResult, JsonObject, Prompt,
+    ReadResourceRequestParams, ReadResourceResult, RequestMetaObject, Resource, ResourceContents,
+    Tool,
 };
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
@@ -35,7 +36,7 @@ impl std::fmt::Display for NotifyKind {
 #[derive(Clone)]
 pub struct ToolCallContext {
     pub peer: Peer<RoleServer>,
-    pub meta: Meta,
+    pub meta: RequestMetaObject,
 }
 
 type StoredHandler = Arc<
@@ -299,7 +300,7 @@ impl CapabilityRegistry {
         H: Fn(ReadResourceRequestParams) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult, McpError>> + Send + 'static,
     {
-        let uri = resource.raw.uri.clone();
+        let uri = resource.uri.clone();
         let handler: ResourceHandler = Arc::new(move |params| Box::pin(handler(params)));
         self.resources.write().await.insert(uri, (resource, handler));
         self.recompute_version().await;
@@ -336,11 +337,8 @@ impl CapabilityRegistry {
     pub async fn register_app_resource(&self, uri: impl Into<String>, html: impl Into<String>) {
         let uri: String = uri.into();
         let html: String = html.into();
-        let resource = Annotated {
-            raw: RawResource::new(&uri, &uri)
-                .with_mime_type(crate::constants::APP_MIME_TYPE),
-            annotations: None,
-        };
+        let resource =
+            Resource::new(&uri, &uri).with_mime_type(crate::constants::APP_MIME_TYPE);
         let uri_clone = uri.clone();
         self.add_resource(resource, move |_params| {
             let uri = uri_clone.clone();

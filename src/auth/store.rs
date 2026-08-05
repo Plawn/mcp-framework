@@ -6,8 +6,12 @@ use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use reqwest::Client as HttpClient;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::constants::{NS_TOKENS, NS_OPAQUE, TOKEN_EXPIRY_BUFFER, PENDING_AUTH_TIMEOUT, OPAQUE_REFRESH_TTL};
-use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
+use crate::constants::{
+    NS_TOKENS, NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH, NS_REFRESH_LOCK,
+    TOKEN_EXPIRY_BUFFER, PENDING_AUTH_TIMEOUT, OPAQUE_REFRESH_TTL,
+    REFRESH_LOCK_TTL, REFRESH_LOCK_WAIT, REFRESH_LOCK_POLL,
+};
+use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist, spawn_persist_raw};
 
 /// A stored OAuth token with expiry tracking and optional decoded claims.
 ///
@@ -163,10 +167,15 @@ struct OpaqueIndex {
 }
 
 impl OpaqueIndex {
-    fn remove_session(&mut self, session_id: &str) {
+    /// Remove all maps for a session, returning the `(opaque_access, opaque_refresh)`
+    /// pair that was removed (so callers can clean up the persisted inverse index).
+    fn remove_session(&mut self, session_id: &str) -> Option<(String, String)> {
         if let Some((oa, or)) = self.session_to_opaques.remove(session_id) {
             self.access_to_session.remove(&oa);
             self.refresh_to_session.remove(&or);
+            Some((oa, or))
+        } else {
+            None
         }
     }
 }
@@ -396,10 +405,52 @@ impl TokenStore {
         }
     }
 
-    /// Get a token for a session (raw, no auto-refresh)
+    /// Get a token for a session (raw, no auto-refresh).
+    ///
+    /// On a memory miss, falls back to the persistence backend (read-through) so
+    /// that a request served by an instance that did not create the session can
+    /// still resolve the token. A token read from the backend is written back to
+    /// the in-memory cache.
     async fn get_token_raw(&self, session_id: &str) -> Option<StoredToken> {
-        let tokens = self.tokens.read().await;
-        tokens.get(session_id).cloned()
+        // Fast path: in-memory hit (no backend round-trip).
+        if let Some(token) = self.tokens.read().await.get(session_id).cloned() {
+            return Some(token);
+        }
+
+        // Slow path: read-through to the persistence backend.
+        let token = self.load_token_from_backend(session_id).await?;
+
+        // Write-back to the cache. If a concurrent task already populated the
+        // entry, keep that one (it may be fresher) and return it.
+        let mut tokens = self.tokens.write().await;
+        let entry = tokens.entry(session_id.to_string()).or_insert(token);
+        Some(entry.clone())
+    }
+
+    /// Read a token directly from the persistence backend, applying the claims
+    /// decoder. Does not touch the in-memory cache. Returns `None` if there is no
+    /// backend, no entry, or the entry is corrupted.
+    async fn load_token_from_backend(&self, session_id: &str) -> Option<StoredToken> {
+        let backend = self.persistence.as_ref()?;
+        let bytes = match backend.get(NS_TOKENS, session_id).await {
+            Ok(b) => b?,
+            Err(e) => {
+                tracing::warn!("Read-through get failed for token {session_id}: {e}");
+                return None;
+            }
+        };
+        let persisted: PersistedToken = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Corrupted persisted token for session {session_id}: {e}");
+                return None;
+            }
+        };
+        let mut token = persisted.into_stored();
+        if let Some(ref decoder) = self.claims_decoder {
+            token.decoded_claims = (decoder)(&token.access_token);
+        }
+        Some(token)
     }
 
     /// Read the stored token for a session without triggering a refresh.
@@ -423,28 +474,105 @@ impl TokenStore {
 
         // Token is expired — attempt refresh if possible
         if token.refresh_token.is_some() && self.refresh_config.read().await.is_some() {
-            // Acquire per-session refresh lock to prevent thundering herd
+            // Acquire per-session refresh lock to prevent intra-process thundering herd
             let lock = self.get_refresh_lock(session_id).await;
             let _guard = lock.lock().await;
 
-            // Double-check: another task may have refreshed while we waited
+            // Double-check: another task (or instance, via read-through) may have
+            // refreshed while we waited.
             if let Some(refreshed) = self.get_token_raw(session_id).await
                 && !refreshed.is_expired() {
                     return Some(refreshed);
                 }
 
-            // Still expired — do the refresh
-            match self.refresh_token(session_id).await {
-                Ok(new_token) => return Some(new_token),
-                Err(e) => {
-                    tracing::warn!("Auto-refresh failed for session {}: {}", session_id, e);
-                    return None; // Don't return expired token
-                }
-            }
+            // Still expired — refresh, coordinating across instances.
+            return self.refresh_with_distributed_lock(session_id).await;
         }
 
         // No refresh_token or no refresh config — expired token is unusable
         None
+    }
+
+    /// Refresh the token while serializing across instances with a distributed
+    /// lock. If a peer instance is already refreshing, wait for its result to
+    /// land in persistence and adopt it instead of issuing a duplicate refresh.
+    ///
+    /// Falls back to a plain local refresh when no persistence backend is
+    /// configured (single-instance) or when the backend does not support
+    /// distributed locking.
+    async fn refresh_with_distributed_lock(&self, session_id: &str) -> Option<StoredToken> {
+        let Some(backend) = self.persistence.clone() else {
+            return self.do_refresh(session_id).await;
+        };
+
+        // Unique token for this acquisition so we only ever release our own lock.
+        let lock_token = uuid::Uuid::new_v4().to_string();
+        let deadline = Instant::now() + REFRESH_LOCK_WAIT;
+        let mut holding = false;
+        loop {
+            match backend.try_acquire_lock(NS_REFRESH_LOCK, session_id, &lock_token, REFRESH_LOCK_TTL).await {
+                Ok(true) => {
+                    holding = true;
+                    break;
+                }
+                Ok(false) => {
+                    // A peer holds the lock — adopt its refreshed token if it has
+                    // already been written back to persistence.
+                    if let Some(fresh) = self.adopt_persisted_token(session_id).await {
+                        return Some(fresh);
+                    }
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            "Distributed refresh lock wait timed out for session {session_id}; refreshing locally"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(REFRESH_LOCK_POLL).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Distributed refresh lock error for session {session_id}: {e}; refreshing locally");
+                    break;
+                }
+            }
+        }
+
+        // Final check before doing the work ourselves: a peer may have written a
+        // fresh token in the window just before we acquired the lock.
+        if let Some(fresh) = self.adopt_persisted_token(session_id).await {
+            if holding {
+                let _ = backend.release_lock(NS_REFRESH_LOCK, session_id, &lock_token).await;
+            }
+            return Some(fresh);
+        }
+
+        let result = self.do_refresh(session_id).await;
+        if holding {
+            let _ = backend.release_lock(NS_REFRESH_LOCK, session_id, &lock_token).await;
+        }
+        result
+    }
+
+    /// Perform a token refresh, logging and swallowing failures into `None`.
+    async fn do_refresh(&self, session_id: &str) -> Option<StoredToken> {
+        match self.refresh_token(session_id).await {
+            Ok(new_token) => Some(new_token),
+            Err(e) => {
+                tracing::warn!("Auto-refresh failed for session {}: {}", session_id, e);
+                None // Don't return expired token
+            }
+        }
+    }
+
+    /// Read the persisted token for a session and, if it is non-expired, adopt it
+    /// into the in-memory cache and return it. Used to pick up a refresh performed
+    /// by a peer instance without re-issuing the refresh.
+    async fn adopt_persisted_token(&self, session_id: &str) -> Option<StoredToken> {
+        let token = self.load_token_from_backend(session_id).await?;
+        if token.is_expired() {
+            return None;
+        }
+        self.tokens.write().await.insert(session_id.to_string(), token.clone());
+        Some(token)
     }
 
     // === Opaque token mode ===
@@ -466,46 +594,130 @@ impl TokenStore {
             opaque_refresh: opaque_refresh.clone(),
         });
 
-        {
+        let old = {
             let mut idx = self.opaque_index.write().await;
-            idx.remove_session(&session_id);
+            let old = idx.remove_session(&session_id);
             idx.access_to_session.insert(opaque_access.clone(), session_id.clone());
             idx.refresh_to_session.insert(opaque_refresh.clone(), session_id.clone());
-            idx.session_to_opaques.insert(session_id.clone(), (opaque_access, opaque_refresh));
-        }
+            idx.session_to_opaques.insert(session_id.clone(), (opaque_access.clone(), opaque_refresh.clone()));
+            old
+        };
 
         if let Some(ref backend) = self.persistence {
-            spawn_persist(backend, NS_OPAQUE, session_id, &persist_mapping.unwrap(), Some(OPAQUE_REFRESH_TTL));
+            // Forward mapping (session_id → opaques), used by load_persisted/cleanup.
+            spawn_persist(backend, NS_OPAQUE, session_id.clone(), &persist_mapping.unwrap(), Some(OPAQUE_REFRESH_TTL));
+            // Inverse index (opaque → session_id), enables cross-instance read-through.
+            spawn_persist_raw(backend, NS_OPAQUE_ACCESS, opaque_access, session_id.clone().into_bytes(), Some(OPAQUE_REFRESH_TTL));
+            spawn_persist_raw(backend, NS_OPAQUE_REFRESH, opaque_refresh, session_id.into_bytes(), Some(OPAQUE_REFRESH_TTL));
+
+            // Drop the previous session's inverse entries (opaque tokens rotated).
+            if let Some((old_access, old_refresh)) = old {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let _ = backend.delete(NS_OPAQUE_ACCESS, &old_access).await;
+                    let _ = backend.delete(NS_OPAQUE_REFRESH, &old_refresh).await;
+                });
+            }
         }
     }
 
     /// Resolve an opaque access token to a session ID.
+    ///
+    /// On a memory miss, falls back to the persisted inverse index
+    /// (`NS_OPAQUE_ACCESS`) so a request served by an instance that did not mint
+    /// the opaque token can still resolve it. The full opaque mapping is then
+    /// hydrated into the in-memory index.
     pub async fn resolve_opaque_access(&self, opaque_access: &str) -> Option<String> {
-        let idx = self.opaque_index.read().await;
-        idx.access_to_session.get(opaque_access).cloned()
+        if let Some(s) = self.opaque_index.read().await.access_to_session.get(opaque_access).cloned() {
+            return Some(s);
+        }
+        let session_id = self.load_inverse(NS_OPAQUE_ACCESS, opaque_access).await?;
+        self.hydrate_opaque(&session_id).await;
+        Some(session_id)
     }
 
-    /// Resolve an opaque refresh token to a session ID.
+    /// Resolve an opaque refresh token to a session ID (read-through, see
+    /// [`resolve_opaque_access`](Self::resolve_opaque_access)).
     pub async fn resolve_opaque_refresh(&self, opaque_refresh: &str) -> Option<String> {
-        let idx = self.opaque_index.read().await;
-        idx.refresh_to_session.get(opaque_refresh).cloned()
+        if let Some(s) = self.opaque_index.read().await.refresh_to_session.get(opaque_refresh).cloned() {
+            return Some(s);
+        }
+        let session_id = self.load_inverse(NS_OPAQUE_REFRESH, opaque_refresh).await?;
+        self.hydrate_opaque(&session_id).await;
+        Some(session_id)
     }
 
-    /// Remove all opaque mappings for a session.
-    pub async fn remove_opaque_for_session(&self, session_id: &str) {
-        {
-            let mut idx = self.opaque_index.write().await;
-            idx.remove_session(session_id);
-        }
-        if let Some(ref backend) = self.persistence {
-            let backend = backend.clone();
-            let key = session_id.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = backend.delete(NS_OPAQUE, &key).await {
-                    tracing::warn!("Failed to delete persisted opaque mapping for {key}: {e}");
+    /// Read an inverse-index entry (`opaque token → session_id`) from persistence.
+    async fn load_inverse(&self, ns: &'static str, token: &str) -> Option<String> {
+        let backend = self.persistence.as_ref()?;
+        let bytes = match backend.get(ns, token).await {
+            Ok(b) => b?,
+            Err(e) => {
+                tracing::warn!("Read-through get failed for {ns}/{token}: {e}");
+                return None;
+            }
+        };
+        String::from_utf8(bytes).ok()
+    }
+
+    /// Reconstruct the full in-memory opaque index for a session from the
+    /// persisted forward mapping (`NS_OPAQUE`). No-op if already present locally
+    /// (don't clobber fresher local state).
+    async fn hydrate_opaque(&self, session_id: &str) {
+        let Some(backend) = self.persistence.as_ref() else { return };
+        let mapping: PersistedOpaqueMapping = match backend.get(NS_OPAQUE, session_id).await {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Corrupted opaque mapping for session {session_id}: {e}");
+                    return;
                 }
-            });
+            },
+            _ => return,
+        };
+
+        let mut idx = self.opaque_index.write().await;
+        if idx.session_to_opaques.contains_key(session_id) {
+            return;
         }
+        idx.access_to_session.insert(mapping.opaque_access.clone(), session_id.to_string());
+        idx.refresh_to_session.insert(mapping.opaque_refresh.clone(), session_id.to_string());
+        idx.session_to_opaques.insert(session_id.to_string(), (mapping.opaque_access, mapping.opaque_refresh));
+    }
+
+    /// Remove all opaque mappings for a session (in memory and persisted,
+    /// including the inverse index).
+    pub async fn remove_opaque_for_session(&self, session_id: &str) {
+        let removed = {
+            let mut idx = self.opaque_index.write().await;
+            idx.remove_session(session_id)
+        };
+
+        let Some(backend) = self.persistence.clone() else { return };
+
+        // Determine the opaque token values to clean up the inverse index. If the
+        // session wasn't in local memory (cross-instance), recover them from the
+        // persisted forward mapping.
+        let opaques = match removed {
+            Some(pair) => Some(pair),
+            None => match backend.get(NS_OPAQUE, session_id).await {
+                Ok(Some(bytes)) => serde_json::from_slice::<PersistedOpaqueMapping>(&bytes)
+                    .ok()
+                    .map(|m| (m.opaque_access, m.opaque_refresh)),
+                _ => None,
+            },
+        };
+
+        let key = session_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = backend.delete(NS_OPAQUE, &key).await {
+                tracing::warn!("Failed to delete persisted opaque mapping for {key}: {e}");
+            }
+            if let Some((oa, or)) = opaques {
+                let _ = backend.delete(NS_OPAQUE_ACCESS, &oa).await;
+                let _ = backend.delete(NS_OPAQUE_REFRESH, &or).await;
+            }
+        });
     }
 
     /// Remove a token for a session
@@ -556,13 +768,15 @@ impl TokenStore {
         drop(tokens);
         drop(locks);
 
-        // Clean up opaque mappings for expired sessions
-        {
+        // Clean up opaque mappings for expired sessions, capturing the opaque
+        // token values so the persisted inverse index can be cleaned too.
+        let removed_opaques: Vec<(String, String)> = {
             let mut idx = self.opaque_index.write().await;
-            for key in &expired_keys {
-                idx.remove_session(key);
-            }
-        }
+            expired_keys
+                .iter()
+                .filter_map(|key| idx.remove_session(key))
+                .collect()
+        };
 
         tracing::debug!("Purged {} expired token(s)", expired_keys.len());
 
@@ -577,6 +791,10 @@ impl TokenStore {
                     if let Err(e) = backend.delete(NS_OPAQUE, key).await {
                         tracing::warn!("Failed to delete persisted opaque mapping {key}: {e}");
                     }
+                }
+                for (oa, or) in &removed_opaques {
+                    let _ = backend.delete(NS_OPAQUE_ACCESS, oa).await;
+                    let _ = backend.delete(NS_OPAQUE_REFRESH, or).await;
                 }
             });
         }
@@ -673,7 +891,11 @@ impl TokenStore {
             };
 
             if !valid_sessions.contains(&session_id) {
+                // Orphaned mapping (token expired) — drop the forward mapping and
+                // its inverse-index entries so they don't leak.
                 let _ = backend.delete(NS_OPAQUE, &session_id).await;
+                let _ = backend.delete(NS_OPAQUE_ACCESS, &mapping.opaque_access).await;
+                let _ = backend.delete(NS_OPAQUE_REFRESH, &mapping.opaque_refresh).await;
                 continue;
             }
 

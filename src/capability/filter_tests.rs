@@ -56,26 +56,18 @@ fn prompt_filter_filters_prompts() {
 
 #[test]
 fn resource_filter_filters_resources() {
-    use rmcp::model::{Annotated, RawResource};
-
     let filter = ResourceFilter(
         |resources: Vec<Resource>, _token: Option<&StoredToken>| -> Vec<Resource> {
             resources
                 .into_iter()
-                .filter(|r| r.raw.uri != "secret://x")
+                .filter(|r| r.uri != "secret://x")
                 .collect()
         },
     );
 
     let resources = vec![
-        Annotated {
-            raw: RawResource::new("public://a", "public"),
-            annotations: None,
-        },
-        Annotated {
-            raw: RawResource::new("secret://x", "secret"),
-            annotations: None,
-        },
+        Resource::new("public://a", "public"),
+        Resource::new("secret://x", "secret"),
     ];
     let filtered = filter.filter_resources(resources, None);
     assert_eq!(filtered.len(), 1);

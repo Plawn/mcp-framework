@@ -91,7 +91,7 @@ impl TestServer {
 impl TestServer {
     #[tool(
         description = "Return a short greeting",
-        output_schema = schema_for_output::<GreetOutput>().unwrap()
+        output_schema = schema_for_output::<GreetOutput>()
     )]
     async fn greet(
         &self,
@@ -99,12 +99,12 @@ impl TestServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let msg = format!("Hello, {}!", params.name);
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
         description = "Return a large JSON payload to test SSE streaming",
-        output_schema = schema_for_output::<LargeResponseOutput>().unwrap()
+        output_schema = schema_for_output::<LargeResponseOutput>()
     )]
     fn large_response(&self, Parameters(params): Parameters<SizeParams>) -> String {
         let size = params.size.unwrap_or(5000);
@@ -133,7 +133,7 @@ impl TestServer {
 
     #[tool(
         description = "Return pong",
-        output_schema = schema_for_output::<PingOutput>().unwrap()
+        output_schema = schema_for_output::<PingOutput>()
     )]
     fn ping(&self, Parameters(_): Parameters<EmptyParams>) -> String {
         "pong".to_string()
@@ -279,7 +279,7 @@ async fn http_call_small_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 
@@ -308,7 +308,7 @@ async fn http_call_large_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 
@@ -338,7 +338,7 @@ async fn http_call_empty_params_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 
@@ -368,7 +368,7 @@ async fn http_multiple_calls_same_session() -> anyhow::Result<()> {
         let text = result
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(|c| c.as_text())
             .map(|t| t.text.as_str())
             .expect("expected text content");
 
@@ -526,7 +526,7 @@ async fn http_sse_priming_causes_client_issues() {
                     let text = result
                         .content
                         .first()
-                        .and_then(|c| c.raw.as_text())
+                        .and_then(|c| c.as_text())
                         .map(|t| t.text.as_str());
                     assert_eq!(text, Some("pong"));
                 }

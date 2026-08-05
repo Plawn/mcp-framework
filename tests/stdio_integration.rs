@@ -67,7 +67,7 @@ async fn call_greet_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 
@@ -97,7 +97,7 @@ async fn call_add_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 
@@ -157,7 +157,7 @@ async fn call_dynamic_ping_tool() -> anyhow::Result<()> {
     let text = result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content");
 

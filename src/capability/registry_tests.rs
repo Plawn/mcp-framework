@@ -1,5 +1,5 @@
 use super::*;
-use rmcp::model::{Annotated, Content, GetPromptResult, RawResource, ReadResourceResult, ResourceContents};
+use rmcp::model::{ContentBlock, GetPromptResult, ReadResourceResult, ResourceContents};
 
 fn make_tool(name: &str) -> Tool {
     Tool::new(name.to_string(), format!("Tool {name}"), serde_json::Map::new())
@@ -10,10 +10,7 @@ fn make_prompt(name: &str) -> Prompt {
 }
 
 fn make_resource(uri: &str) -> Resource {
-    Annotated {
-        raw: RawResource::new(uri, uri),
-        annotations: None,
-    }
+    Resource::new(uri, uri)
 }
 
 // ── Tool tests ───────────────────────────────────────────────────
@@ -24,7 +21,7 @@ async fn add_and_list_tools() {
     assert!(reg.tools().await.is_empty());
 
     reg.add_tool(make_tool("alpha"), |_args| async {
-        Ok(CallToolResult::success(vec![Content::text("ok")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("ok")]))
     })
     .await;
 
@@ -50,7 +47,7 @@ async fn remove_tool_returns_true_if_existed() {
 async fn try_call_tool_dispatches_to_handler() {
     let reg = CapabilityRegistry::new();
     reg.add_tool(make_tool("echo"), |_args| async {
-        Ok(CallToolResult::success(vec![Content::text("hello")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("hello")]))
     })
     .await;
 
@@ -72,7 +69,7 @@ async fn try_call_tool_returns_none_for_unknown() {
 async fn call_tool_dispatches_to_handler() {
     let reg = CapabilityRegistry::new();
     reg.add_tool(make_tool("echo"), |_args| async {
-        Ok(CallToolResult::success(vec![Content::text("hello")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("hello")]))
     })
     .await;
 
@@ -87,7 +84,7 @@ async fn call_tool_dispatches_to_handler() {
 async fn call_tool_accepts_none_args() {
     let reg = CapabilityRegistry::new();
     reg.add_tool(make_tool("ping"), |_args| async {
-        Ok(CallToolResult::success(vec![Content::text("pong")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("pong")]))
     })
     .await;
 
@@ -99,7 +96,7 @@ async fn call_tool_accepts_none_args() {
 async fn call_tool_accepts_null_args() {
     let reg = CapabilityRegistry::new();
     reg.add_tool(make_tool("ping"), |_args| async {
-        Ok(CallToolResult::success(vec![Content::text("pong")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("pong")]))
     })
     .await;
 
@@ -187,7 +184,7 @@ async fn add_and_list_resources() {
 
     let resources = reg.resources().await;
     assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0].raw.uri, "file:///a.txt");
+    assert_eq!(resources[0].uri, "file:///a.txt");
 }
 
 #[tokio::test]
@@ -393,7 +390,7 @@ async fn version_shared_across_clones() {
 async fn call_tool_returns_error_for_context_tool() {
     let reg = CapabilityRegistry::new();
     reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
-        Ok(CallToolResult::success(vec![Content::text("with context")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("with context")]))
     })
     .await;
 
@@ -405,7 +402,7 @@ async fn call_tool_returns_error_for_context_tool() {
 async fn try_call_tool_returns_error_for_context_tool_without_context() {
     let reg = CapabilityRegistry::new();
     reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
-        Ok(CallToolResult::success(vec![Content::text("ok")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("ok")]))
     })
     .await;
 
@@ -452,9 +449,9 @@ async fn register_app_resource_listed_with_correct_mime() {
 
     let resources = reg.resources().await;
     assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0].raw.uri, "ui://test/chart");
+    assert_eq!(resources[0].uri, "ui://test/chart");
     assert_eq!(
-        resources[0].raw.mime_type.as_deref(),
+        resources[0].mime_type.as_deref(),
         Some(crate::constants::APP_MIME_TYPE)
     );
 }
@@ -495,7 +492,7 @@ async fn app_tool_injects_meta_ui() {
 #[tokio::test]
 async fn app_tool_preserves_existing_meta() {
     let mut tool = make_tool("get_nps");
-    let mut meta = rmcp::model::Meta::new();
+    let mut meta = rmcp::model::MetaObject::default();
     meta.0.insert("existing".to_string(), serde_json::json!("value"));
     tool.meta = Some(meta);
 

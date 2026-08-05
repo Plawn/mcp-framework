@@ -43,7 +43,7 @@ impl ServerHandler for SessionServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         async move {
             let session = context.session::<MySession>();
 
@@ -51,11 +51,12 @@ impl ServerHandler for SessionServer {
             let data = session.update(|s| s.call_count += 1).await;
 
             if request.name.as_ref() == "stats" {
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Session '{}': {} tool call(s) so far.",
                     session.id(),
                     data.call_count
-                ))]))
+                ))])
+                .into())
             } else {
                 Err(McpError::invalid_params("unknown tool", None))
             }

@@ -265,3 +265,24 @@ async fn session_store_skips_corrupted() {
     assert!(store.get("bad").await.is_none());
     assert_eq!(store.get("good").await.unwrap().counter, 1);
 }
+
+#[tokio::test]
+async fn session_read_through_cross_instance() {
+    // Two stores sharing one backend simulate two replicas behind a non-sticky LB.
+    let backend = Arc::new(crate::persistence::InMemoryBackend::new());
+    let store_a = SessionStore::<TestSession>::new(Duration::from_secs(60))
+        .with_persistence(backend.clone());
+    let store_b = SessionStore::<TestSession>::new(Duration::from_secs(60))
+        .with_persistence(backend.clone());
+
+    // Session created on instance A.
+    store_a.update("s1", |s| s.counter = 7).await;
+    tokio::time::sleep(Duration::from_millis(50)).await; // let fire-and-forget persist land
+
+    // Instance B never saw it in RAM — resolves via read-through.
+    let data = store_b.get("s1").await.expect("B should read session through Redis");
+    assert_eq!(data.counter, 7);
+
+    // Now cached in B.
+    assert_eq!(store_b.len().await, 1);
+}

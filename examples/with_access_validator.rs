@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     registry
         .add_tool(
             Tool::new("public_ping", "Returns pong", serde_json::Map::new()),
-            |_args| async { Ok(CallToolResult::success(vec![Content::text("pong")])) },
+            |_args| async { Ok(CallToolResult::success(vec![ContentBlock::text("pong")])) },
         )
         .await;
 
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::Map::new(),
             ),
             |_args| async {
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     "Server reset!",
                 )]))
             },

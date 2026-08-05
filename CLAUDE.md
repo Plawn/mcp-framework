@@ -35,6 +35,15 @@ mcp_framework::run(McpApp {
 
 `run()` (`src/runner.rs`) handles `.env` loading, CLI parsing (clap), tracing setup, and dispatches to the chosen transport.
 
+### rmcp version & the MRTR response types
+
+Pinned to **rmcp 3.1**. Two upstream changes shape every consumer `ServerHandler`:
+
+- **MRTR (SEP-2322)** — `call_tool` / `get_prompt` / `read_resource` return `CallToolResponse` / `GetPromptResponse` / `ReadResourceResponse` (enums) instead of the `*Result` structs. A handler that produces a plain result appends `.into()`; `DynamicHandler` matches on `CallToolResponse::Complete` for audit and treats the non-terminal variants (`InputRequired`, `Task`) as successful dispatches.
+- **Flat content model (rmcp 2.0)** — `Content` / `RawContent` / `Annotated<T>` collapsed into `ContentBlock`, and `Annotated<RawResource>` into a flat `Resource`. `prelude::Content` remains as a `#[deprecated]` alias of `ContentBlock`. Most wire types are `#[non_exhaustive]`, so build them with `Type::new(..).with_*(..)` rather than struct literals — and match them with a wildcard arm.
+
+`DynamicHandler` also forwards the 3.x additions to the inner handler so wrapping stays transparent: `discover` (the 2026-07-28 replacement for `initialize` — it gets the same registry capability augmentation), `supported_protocol_versions`, `accepted_subscription_filter` / `listen`, `on_custom_request` / `on_custom_notification`, and the Tasks extension (`get_task` / `update_task` / `cancel_task`). The legacy `set_level` / `subscribe` / `unsubscribe` delegations are kept behind `#[allow(deprecated)]` because they still serve clients on older revisions.
+
 ### Transport layer (`src/transport/`)
 
 Two modes selected via `--transport` CLI flag:
@@ -65,7 +74,12 @@ Configurable via:
 
 **Architecture**: The `token_handler` (`src/auth/proxy.rs`) dispatches to either `passthrough_token_handler` or `opaque_token_handler` based on the configured `TokenMode`. In opaque mode, the handler intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
 
-**Persistence**: Opaque mappings are stored in the `NS_OPAQUE` persistence namespace (keyed by session_id). They survive restarts when a persistence backend (e.g. Redis) is configured.
+**Session key at token exchange**: no MCP session exists yet when `/oauth/token` runs, so `mcp-session-id` is never present — reading it collapsed every grant, for every user, onto `"default"`. Each mode uses the key it can actually resolve later:
+
+- **Passthrough** keys by `credential_session_key(access_token)`, the same derivation `bearer_auth_middleware` applies to the bearer it receives. When a protocol session id shows up later, the middleware **adopts** that entry under the session key — carrying over `refresh_token` / `expires_at`, and writing it *before* attempting refresh, since `get_token` operates on the session key.
+- **Opaque** mints a fresh per-grant UUID. It cannot be derived from a credential: the client never sees the Keycloak token, and the opaque tokens it does see rotate on every refresh while this key must stay put. It is resolved from the opaque token instead, via `TokenStore::resolve_opaque_access`. The middleware then binds the request to that grant id via `MCP_FALLBACK_SESSION_HEADER`, so `ctx.session_id()` and the token store agree and a reconnect lands back on the same session.
+
+**Persistence**: The forward opaque mapping is stored in the `NS_OPAQUE` namespace (keyed by session_id). To support multi-instance read-through (resolving an opaque token on an instance that did not mint it), two inverse indexes are also persisted: `NS_OPAQUE_ACCESS` (`opaque_access → session_id`) and `NS_OPAQUE_REFRESH` (`opaque_refresh → session_id`). All survive restarts when a persistence backend (e.g. Redis) is configured. `resolve_opaque_access`/`resolve_opaque_refresh` fall back to the inverse index on a memory miss and then hydrate the full in-memory index from the forward mapping.
 
 **Zombie handling**: When a Keycloak refresh fails (e.g. token revoked via platform logout), the opaque mapping is cleaned up and the client receives a 401, forcing re-authentication.
 
@@ -85,7 +99,19 @@ McpAppBuilder::new("my-server")
 
 `SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
 
-Helper function `resolve_session_id(extensions)` extracts the `mcp-session-id` header from MCP request context extensions, falling back to `"default"` for stdio mode.
+Helper function `resolve_session_id(extensions)` extracts the session identity from MCP request context extensions, falling back to `"default"` for stdio mode. It delegates to `session_id_from_parts(&Parts)`, shared with `resolve_token` in `src/capability/filter.rs` so both resolve identity identically.
+
+#### Sessionless protocol revisions (MCP 2026-07-28 / SEP-2567)
+
+MCP 2026-07-28 removes protocol-level sessions, so `mcp-session-id` is absent for clients negotiating that revision — and rmcp serves those requests statelessly regardless of `legacy_session_mode`. Since this framework keys `TokenStore`, `SessionStore<T>`, and the opaque-token mappings by session id, collapsing every such client onto `"default"` would let concurrent users read and overwrite each other's tokens.
+
+The auth middleware therefore derives a stable per-credential identity when the protocol supplies none: `credential_session_key(cred)` = `cred-{sha256(credential)[..16]}`, injected under `MCP_FALLBACK_SESSION_HEADER` (`x-mcp-framework-session`). The framework header is deliberately distinct from `mcp-session-id` — writing that one back onto the request would make rmcp's Streamable HTTP transport look up a session that never existed and reject it.
+
+**Precedence.** `session_id_from_parts` reads `MCP_FALLBACK_SESSION_HEADER` **first**, then `mcp-session-id`, then `DEFAULT_SESSION_ID`. The framework header wins because the middleware only writes it where it is the more accurate identity — either the protocol supplied nothing, or opaque mode resolved the grant (see below). On 2025-11-25 and earlier the middleware returns `mcp-session-id` untouched and never writes the framework header, so behaviour there is unchanged.
+
+**Anti-spoofing.** Because the framework header is authoritative, `strip_framework_session_header` is layered outermost in `wrap_auth_middleware` and removes any client-supplied value before auth runs. It is applied to *every* request, including under `AuthProvider::None` where no auth middleware runs to overwrite it. Without it a client could send `x-mcp-framework-session: <victim-id>` and bind its request to another user's tokens.
+
+Covered by `tests/session_identity.rs`, which drives the real `build_app` router (strip layer + auth middleware) through an `extra_routes` handler that echoes `session_id_from_parts`.
 
 ### Audit logging (`src/audit/`)
 
@@ -309,7 +335,12 @@ The HTML bundle runs in an isolated iframe — it does not receive the tool call
 
 - **Write-through**: mutations (`store_token`, `update`, `remove`, `purge_expired`) are written to the backend asynchronously (fire-and-forget via `tokio::spawn`)
 - **Load-at-startup**: `load_persisted()` reads all keys from the backend and populates the in-memory store. Called automatically during `run()` before the listener starts
+- **Read-through**: on a memory miss, the read paths (`TokenStore::get_token_raw`, `TokenStore::resolve_opaque_*`, `SessionStore::get`) fall back to the backend, deserialize, and write-back into the in-memory cache. This is what makes **multi-instance / horizontal scaling without sticky sessions** work: a request that lands on an instance which did not create the session still resolves the token/opaque-mapping/session from Redis instead of returning a 401. A memory hit never touches the backend (zero overhead on the hot path).
 - **No backend = current behavior**: zero overhead, no serialization
+
+**Distributed refresh lock**: the `PersistenceBackend` trait exposes `try_acquire_lock(ns, key, token, ttl)`/`release_lock(ns, key, token)` (default: no-op that always acquires; `RedisBackend` overrides with atomic `SET key token NX PX`, `InMemoryBackend` with an in-process lock map). The caller passes a unique per-acquisition `token` (a fresh UUID); `release_lock` is **compare-and-delete** (Redis: a Lua `GET==token then DEL` script) so a late release after TTL expiry cannot drop a lock a peer has since re-acquired. On token expiry, `TokenStore::get_token` first takes the process-local per-session lock, then the distributed lock (`NS_REFRESH_LOCK`) before refreshing — serializing refresh across instances so Keycloak refresh-token rotation isn't broken by concurrent refreshes (distributed thundering herd). While a peer holds the lock, the waiter polls persistence and **adopts** the peer's refreshed token instead of issuing a duplicate refresh. `REFRESH_LOCK_TTL` auto-expires a crashed holder's lock, and `REFRESH_LOCK_WAIT` is kept above it so a waiter eventually acquires rather than racing.
+
+**Consistency caveat**: read-through resolves the "never seen on this instance" case. A value that was *updated* on a peer after being cached locally can still be served stale until it expires (read-through only fires on a miss, by design — to keep zero overhead on hits). For tokens this is bounded: on expiry the refresh path re-reads persistence and adopts a peer's fresh token. For session data, callers needing strict cross-instance freshness should not rely on the local cache for mutable shared state.
 
 The trait uses `Pin<Box<dyn Future>>` returns for object safety (`Arc<dyn PersistenceBackend>`). `InMemoryBackend` is shipped for testing. `Instant` fields are serialized as seconds-remaining and reconstructed on load. `StoredToken::decoded_claims` is not serialized — it is re-decoded via the existing `claims_decoder`.
 

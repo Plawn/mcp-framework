@@ -17,7 +17,8 @@ use url::form_urlencoded;
 
 use super::{McpOAuthState, StoredToken};
 use super::config::TokenMode;
-use crate::constants::{MCP_SESSION_ID_HEADER, DEFAULT_SESSION_ID, CONTENT_TYPE_FORM, OPAQUE_ACCESS_TTL};
+use super::middleware::credential_session_key;
+use crate::constants::{CONTENT_TYPE_FORM, OPAQUE_ACCESS_TTL};
 use crate::http_util::HttpError;
 use std::time::{Duration, Instant};
 
@@ -231,20 +232,23 @@ async fn passthrough_token_handler(
         tracing::info!("Token exchange successful, status: {}", status);
         tracing::debug!("Token response: {}", body_str);
 
-        let session_key = headers
-            .get(MCP_SESSION_ID_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or(DEFAULT_SESSION_ID);
-
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
             && let Some(access_token) = json["access_token"].as_str() {
+                // Key by the credential, not by `mcp-session-id`: the MCP
+                // session does not exist yet at token-exchange time, so that
+                // header is never present and every grant would land on the
+                // shared `"default"` slot — each user overwriting the previous
+                // one. The credential-derived key is what `bearer_auth_middleware`
+                // recomputes from the bearer it receives, so it can adopt the
+                // `refresh_token` captured here.
+                let session_key = credential_session_key(access_token);
                 let stored = StoredToken {
                     access_token: access_token.to_string(),
                     refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
                     expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
                     decoded_claims: None,
                 };
-                state.token_store.store_token(session_key.to_string(), stored).await;
+                state.token_store.store_token(session_key.clone(), stored).await;
                 tracing::debug!("Stored token for session '{}'", session_key);
             }
     } else {
@@ -279,24 +283,31 @@ async fn opaque_token_handler(
         tracing::info!("Token exchange successful, status: {}", status);
         tracing::debug!("Token response: {}", body_str);
 
-        let session_key = headers
-            .get(MCP_SESSION_ID_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or(DEFAULT_SESSION_ID);
-
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
             && let Some(access_token) = json["access_token"].as_str() {
+                // Mint a fresh key per grant. `mcp-session-id` is never present
+                // on a token exchange (the MCP session does not exist yet), so
+                // reading it collapsed every user onto `"default"`: each new
+                // login overwrote the previous user's Keycloak token *and*
+                // revoked their opaque tokens via `store_opaque_mapping`.
+                //
+                // Unlike passthrough, this cannot be derived from the credential:
+                // in opaque mode the client never sees the Keycloak token, and
+                // the opaque tokens it does see rotate on every refresh while
+                // this key must stay put. It is resolved from the opaque token
+                // instead, by `TokenStore::resolve_opaque_access`.
+                let session_key = uuid::Uuid::new_v4().to_string();
                 let stored = StoredToken {
                     access_token: access_token.to_string(),
                     refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
                     expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
                     decoded_claims: None,
                 };
-                state.token_store.store_token(session_key.to_string(), stored).await;
+                state.token_store.store_token(session_key.clone(), stored).await;
                 tracing::debug!("Stored token for session '{}'", session_key);
 
                 let kc_expires_in = json["expires_in"].as_u64();
-                return Ok(build_opaque_response(&state, session_key, kc_expires_in).await);
+                return Ok(build_opaque_response(&state, &session_key, kc_expires_in).await);
             }
     } else {
         tracing::error!("Token exchange failed, status: {}, body: {}", status, body_str);

@@ -9,9 +9,9 @@ use rmcp::ServerHandler;
 
 use crate::auth::{
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
-    mcp_oauth_router, oauth_router, protected_resource_metadata_handler, AuthMiddlewareState,
-    AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig, OAuthState, RefreshConfig,
-    TokenStore, WellKnownState,
+    mcp_oauth_router, oauth_router, protected_resource_metadata_handler,
+    strip_framework_session_header, AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState,
+    McpOAuthState, OAuthConfig, OAuthState, RefreshConfig, TokenStore, WellKnownState,
 };
 use crate::audit::ToolCallLogger;
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
@@ -66,7 +66,7 @@ fn wrap_auth_middleware(
     public_url: &str,
     token_store: &TokenStore,
 ) -> Router {
-    match auth {
+    let router = match auth {
         AuthProvider::None => router,
         AuthProvider::Basic(basic_config) => {
             let basic_state = Arc::new(BasicAuthMiddlewareState {
@@ -93,7 +93,13 @@ fn wrap_auth_middleware(
                 bearer_auth_middleware,
             ))
         }
-    }
+    };
+
+    // Added last, so it runs first — before any auth middleware can consult or
+    // write the header. Without it a client could set the framework session
+    // header itself and bind its request to another user's session; under
+    // `AuthProvider::None` no auth middleware runs to overwrite it at all.
+    router.layer(axum::middleware::from_fn(strip_framework_session_header))
 }
 
 /// Build OAuth discovery and authorization routes.

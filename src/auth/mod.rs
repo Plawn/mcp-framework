@@ -21,8 +21,8 @@ pub use store::{ClaimsDecoderFn, RefreshConfig, StoredToken, TokenStore};
 // Re-export middleware
 #[allow(unused_imports)]
 pub use middleware::{
-    basic_auth_middleware, bearer_auth_middleware, AuthMiddlewareState, BasicAuthMiddlewareState,
-    BearerToken,
+    basic_auth_middleware, bearer_auth_middleware, strip_framework_session_header,
+    AuthMiddlewareState, BasicAuthMiddlewareState, BearerToken,
 };
 
 /// State for MCP OAuth endpoints

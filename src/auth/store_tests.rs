@@ -459,3 +459,247 @@ async fn opaque_remove_nonexistent_is_noop() {
     store.remove_opaque_for_session("nonexistent").await;
     assert_eq!(store.resolve_opaque_access("anything").await, None);
 }
+
+// === Read-through (multi-instance, no sticky sessions) ===
+
+use crate::persistence::{BoxFuture, InMemoryBackend, PersistenceBackend};
+
+/// Backend wrapper that counts `get` calls, to assert that an in-memory hit does
+/// not touch the backend (no Redis overhead on the hot path).
+struct CountingBackend {
+    inner: InMemoryBackend,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PersistenceBackend for CountingBackend {
+    fn get(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> BoxFuture<'_, Option<Vec<u8>>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(ns, key)
+    }
+    fn set(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'_, ()> {
+        self.inner.set(ns, key, value, ttl)
+    }
+    fn delete(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> BoxFuture<'_, ()> {
+        self.inner.delete(ns, key)
+    }
+    fn keys(
+        &self,
+        ns: &str,
+    ) -> BoxFuture<'_, Vec<String>> {
+        self.inner.keys(ns)
+    }
+    fn try_acquire_lock(
+        &self,
+        ns: &str,
+        key: &str,
+        token: &str,
+        ttl: Duration,
+    ) -> BoxFuture<'_, bool> {
+        self.inner.try_acquire_lock(ns, key, token, ttl)
+    }
+    fn release_lock(
+        &self,
+        ns: &str,
+        key: &str,
+        token: &str,
+    ) -> BoxFuture<'_, ()> {
+        self.inner.release_lock(ns, key, token)
+    }
+}
+
+#[tokio::test]
+async fn token_read_through_cross_instance() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let store_a = TokenStore::new().with_persistence(backend.clone());
+    let store_b = TokenStore::new().with_persistence(backend.clone());
+
+    // Session created on instance A.
+    store_a
+        .store_token(
+            "s1".into(),
+            test_token("acc", Some("ref"), Some(Instant::now() + Duration::from_secs(3600))),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await; // let fire-and-forget persist land
+
+    // Instance B never saw this session in RAM — must resolve via read-through.
+    let t = store_b.peek_token("s1").await.expect("B should read token through Redis");
+    assert_eq!(t.access_token, "acc");
+
+    // And it is now cached in B (subsequent calls hit RAM).
+    assert!(store_b.has_valid_token("s1").await);
+}
+
+#[tokio::test]
+async fn opaque_read_through_cross_instance() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let store_a = TokenStore::new().with_persistence(backend.clone());
+    let store_b = TokenStore::new().with_persistence(backend.clone());
+
+    store_a
+        .store_token(
+            "s1".into(),
+            test_token("kc", Some("r"), Some(Instant::now() + Duration::from_secs(3600))),
+        )
+        .await;
+    store_a.store_opaque_mapping("s1".into(), "oa".into(), "or".into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Opaque access resolved on B (the "wrong" instance) — no 401.
+    assert_eq!(store_b.resolve_opaque_access("oa").await, Some("s1".to_string()));
+    // Refresh opaque now hits the hydrated in-memory index.
+    assert_eq!(store_b.resolve_opaque_refresh("or").await, Some("s1".to_string()));
+}
+
+#[tokio::test]
+async fn read_through_no_overhead_on_memory_hit() {
+    let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = Arc::new(CountingBackend {
+        inner: InMemoryBackend::new(),
+        gets: gets.clone(),
+    });
+    let store = TokenStore::new().with_persistence(backend.clone());
+
+    store
+        .store_token(
+            "s1".into(),
+            test_token("acc", None, Some(Instant::now() + Duration::from_secs(3600))),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let before = gets.load(std::sync::atomic::Ordering::SeqCst);
+    // In-memory hit — must not touch the backend.
+    let _ = store.peek_token("s1").await;
+    let after = gets.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(before, after, "memory hit should not read through to backend");
+}
+
+#[tokio::test]
+async fn opaque_rotation_cleans_inverse_index() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let store_a = TokenStore::new().with_persistence(backend.clone());
+    let store_b = TokenStore::new().with_persistence(backend.clone());
+
+    store_a.store_opaque_mapping("s1".into(), "oa_old".into(), "or_old".into()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    store_a.store_opaque_mapping("s1".into(), "oa_new".into(), "or_new".into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // New mapping resolves cross-instance.
+    assert_eq!(store_b.resolve_opaque_access("oa_new").await, Some("s1".to_string()));
+    // Old opaque token no longer resolves anywhere.
+    let store_c = TokenStore::new().with_persistence(backend.clone());
+    assert_eq!(store_c.resolve_opaque_access("oa_old").await, None);
+}
+
+#[tokio::test]
+async fn opaque_remove_cross_instance_cleans_inverse() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let store_a = TokenStore::new().with_persistence(backend.clone());
+    let store_b = TokenStore::new().with_persistence(backend.clone());
+
+    store_a.store_opaque_mapping("s1".into(), "oa".into(), "or".into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // B removes the session it never saw in RAM (recovers opaques from Redis).
+    store_b.remove_opaque_for_session("s1").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let store_c = TokenStore::new().with_persistence(backend.clone());
+    assert_eq!(store_c.resolve_opaque_access("oa").await, None);
+    assert_eq!(store_c.resolve_opaque_refresh("or").await, None);
+}
+
+// === Distributed refresh lock ===
+
+#[tokio::test]
+async fn inmemory_lock_is_exclusive() {
+    let b = InMemoryBackend::new();
+    assert!(b.try_acquire_lock("refresh_lock", "s1", "tok1", Duration::from_secs(10)).await.unwrap());
+    assert!(!b.try_acquire_lock("refresh_lock", "s1", "tok2", Duration::from_secs(10)).await.unwrap());
+    b.release_lock("refresh_lock", "s1", "tok1").await.unwrap();
+    assert!(b.try_acquire_lock("refresh_lock", "s1", "tok3", Duration::from_secs(10)).await.unwrap());
+}
+
+#[tokio::test]
+async fn inmemory_lock_auto_expires() {
+    let b = InMemoryBackend::new();
+    assert!(b.try_acquire_lock("ns", "k", "t", Duration::from_millis(40)).await.unwrap());
+    assert!(!b.try_acquire_lock("ns", "k", "t", Duration::from_millis(40)).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert!(b.try_acquire_lock("ns", "k", "t", Duration::from_millis(40)).await.unwrap());
+}
+
+#[tokio::test]
+async fn inmemory_lock_release_is_compare_and_delete() {
+    // The classic race: holder A's lock TTL expires, peer B re-acquires, then A's
+    // late release must NOT drop B's lock.
+    let b = InMemoryBackend::new();
+
+    // A acquires with a short TTL.
+    assert!(b.try_acquire_lock("refresh_lock", "s1", "token_A", Duration::from_millis(30)).await.unwrap());
+
+    // A's lock expires; B re-acquires under its own token.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(b.try_acquire_lock("refresh_lock", "s1", "token_B", Duration::from_secs(10)).await.unwrap());
+
+    // A's late release targets its own (now-expired) token → must be a no-op.
+    b.release_lock("refresh_lock", "s1", "token_A").await.unwrap();
+
+    // B still holds the lock — a third party cannot acquire it.
+    assert!(!b.try_acquire_lock("refresh_lock", "s1", "token_C", Duration::from_secs(10)).await.unwrap());
+
+    // Only B's own release frees it.
+    b.release_lock("refresh_lock", "s1", "token_B").await.unwrap();
+    assert!(b.try_acquire_lock("refresh_lock", "s1", "token_C", Duration::from_secs(10)).await.unwrap());
+}
+
+#[tokio::test]
+async fn get_token_adopts_peer_refreshed_token() {
+    // Backend holds a fresh token written by a peer instance; local RAM holds an
+    // expired one. get_token must adopt the peer's token rather than refreshing
+    // (the refresh URL is unreachable, so a real refresh would fail).
+    let backend = Arc::new(InMemoryBackend::new());
+    let mut store = TokenStore::with_refresh_config(RefreshConfig {
+        client_id: "c".into(),
+        client_secret: None,
+        token_url: "http://127.0.0.1:1/nonexistent".into(),
+    });
+    store.set_persistence(backend.clone());
+
+    // Seed local RAM with an expired token (also persisted to the backend).
+    store
+        .store_token(
+            "s1".into(),
+            test_token("expired", Some("r"), Some(Instant::now() - Duration::from_secs(60))),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Simulate a peer refresh: overwrite the backend entry with a fresh token.
+    let fresh = serde_json::to_vec(&PersistedToken::from_stored(&test_token(
+        "fresh_acc",
+        Some("r2"),
+        Some(Instant::now() + Duration::from_secs(3600)),
+    )))
+    .unwrap();
+    backend.set("tokens", "s1", &fresh, None).await.unwrap();
+
+    let got = store.get_token("s1").await.expect("should adopt peer token");
+    assert_eq!(got.access_token, "fresh_acc");
+}

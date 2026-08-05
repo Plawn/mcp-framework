@@ -3,7 +3,7 @@ use std::time::{Instant, SystemTime};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
-use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext};
 use rmcp::ErrorData as McpError;
 
 use crate::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
@@ -76,6 +76,23 @@ impl<S, T: SessionData> DynamicHandler<S, T> {
         extensions.insert(self.context.token_store.clone());
         extensions.insert(self.context.session_store.clone());
     }
+
+    /// Advertise the capabilities backed by the registry when the inner
+    /// handler doesn't declare them itself.
+    ///
+    /// Shared by `initialize` (2025-11-25 and earlier) and `discover`
+    /// (2026-07-28, which has no initialize handshake).
+    async fn augment_capabilities(&self, capabilities: &mut ServerCapabilities) {
+        if capabilities.tools.is_none() && self.registry.has_tools().await {
+            capabilities.tools = Some(ToolsCapability::default());
+        }
+        if capabilities.prompts.is_none() && self.registry.has_prompts().await {
+            capabilities.prompts = Some(PromptsCapability::default());
+        }
+        if capabilities.resources.is_none() && self.registry.has_resources().await {
+            capabilities.resources = Some(ResourcesCapability::default());
+        }
+    }
 }
 
 impl<S: ServerHandler, T: SessionData> ServerHandler
@@ -91,18 +108,29 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.enrich_extensions(&mut context.extensions);
         self.registry.register_peer(context.peer.clone()).await;
         let mut result = self.inner.initialize(request, context).await?;
-
-        if result.capabilities.tools.is_none() && self.registry.has_tools().await {
-            result.capabilities.tools = Some(ToolsCapability::default());
-        }
-        if result.capabilities.prompts.is_none() && self.registry.has_prompts().await {
-            result.capabilities.prompts = Some(PromptsCapability::default());
-        }
-        if result.capabilities.resources.is_none() && self.registry.has_resources().await {
-            result.capabilities.resources = Some(ResourcesCapability::default());
-        }
-
+        self.augment_capabilities(&mut result.capabilities).await;
         Ok(result)
+    }
+
+    // ── discover: the 2026-07-28 replacement for initialize ──────────
+
+    /// SEP-2567 removed the `initialize` handshake for protocol version
+    /// 2026-07-28, so `discover` is the only place capabilities are
+    /// advertised there. Delegate to the inner handler (so a custom
+    /// `discover`/`get_info` still wins) and apply the same registry
+    /// augmentation as `initialize`.
+    async fn discover(
+        &self,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        self.enrich_extensions(&mut context.extensions);
+        let mut result = self.inner.discover(context).await?;
+        self.augment_capabilities(&mut result.capabilities).await;
+        Ok(result)
+    }
+
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        self.inner.supported_protocol_versions()
     }
 
     // ── list_tools: merge + filter ───────────────────────────────────
@@ -176,7 +204,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         merge_registry_items(
             &mut inner_result.resources,
             self.registry.resources().await,
-            |a, b| a.raw.uri == b.raw.uri,
+            |a, b| a.uri == b.uri,
         );
 
         if let Some(ref filter) = self.context.filter {
@@ -193,7 +221,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         &self,
         request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         self.enrich_extensions(&mut context.extensions);
 
         if let Some(ref validator) = self.context.access_validator {
@@ -244,7 +272,11 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         };
 
         let (result, source, audit_args) = if let Some(reg_result) = reg_result {
-            (reg_result, ToolCallSource::Registry, request.arguments)
+            (
+                reg_result.map(CallToolResponse::from),
+                ToolCallSource::Registry,
+                request.arguments,
+            )
         } else {
             let audit_args = if has_logger { request.arguments.clone() } else { None };
             (
@@ -259,9 +291,24 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         {
             let duration = start_instant.elapsed();
             let outcome = match &result {
-                Ok(call_result) => ToolCallOutcome::Success {
+                Ok(CallToolResponse::Complete(call_result)) => ToolCallOutcome::Success {
                     is_error: call_result.is_error.unwrap_or(false),
                     content_summary: summarize_content(&call_result.content),
+                },
+                // MRTR (SEP-2322) and the Tasks extension let a tool answer
+                // without a final result. The dispatch itself succeeded, so
+                // record it as a non-error success tagged with the response
+                // kind rather than dropping the row.
+                Ok(other) => ToolCallOutcome::Success {
+                    is_error: false,
+                    content_summary: Some(
+                        match other {
+                            CallToolResponse::InputRequired(_) => "<input_required>",
+                            CallToolResponse::Task(_) => "<task>",
+                            _ => "<pending>",
+                        }
+                        .to_string(),
+                    ),
                 },
                 Err(mcp_err) => ToolCallOutcome::McpError {
                     code: mcp_err.code.0,
@@ -297,7 +344,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         &self,
         request: GetPromptRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         self.enrich_extensions(&mut context.extensions);
 
         if let Some(ref validator) = self.context.access_validator {
@@ -320,7 +367,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         }
 
         if let Some(result) = self.registry.get_prompt(&request).await {
-            return result;
+            return result.map(GetPromptResponse::from);
         }
         self.inner.get_prompt(request, context).await
     }
@@ -331,7 +378,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         &self,
         request: ReadResourceRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         self.enrich_extensions(&mut context.extensions);
 
         if let Some(ref validator) = self.context.access_validator {
@@ -353,7 +400,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         }
 
         if let Some(result) = self.registry.read_resource(&request).await {
-            return result;
+            return result.map(ReadResourceResponse::from);
         }
         self.inner.read_resource(request, context).await
     }
@@ -389,6 +436,9 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.inner.complete(request, context)
     }
 
+    // `logging/setLevel` is deprecated by SEP-2577 but still served to
+    // clients on older protocol revisions, so keep delegating it.
+    #[allow(deprecated)]
     fn set_level(
         &self,
         request: SetLevelRequestParams,
@@ -408,6 +458,27 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.inner.list_resource_templates(request, context)
     }
 
+    // ── subscriptions ────────────────────────────────────────────────
+    //
+    // 2026-07-28 replaces resources/subscribe with the long-lived
+    // `subscriptions/listen` request. Both paths are delegated so the
+    // inner handler decides; legacy clients keep working unchanged.
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        self.inner.accepted_subscription_filter(requested)
+    }
+
+    fn listen(
+        &self,
+        context: SubscriptionContext,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.inner.listen(context)
+    }
+
+    #[allow(deprecated)]
     fn subscribe(
         &self,
         request: SubscribeRequestParams,
@@ -417,6 +488,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.inner.subscribe(request, context)
     }
 
+    #[allow(deprecated)]
     fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
@@ -463,13 +535,63 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.enrich_extensions(&mut context.extensions);
         self.inner.on_roots_list_changed(context)
     }
+
+    fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        mut context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CustomResult, McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
+        self.inner.on_custom_request(request, context)
+    }
+
+    fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        mut context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
+        self.inner.on_custom_notification(notification, context)
+    }
+
+    // ── Tasks extension (SEP-2663) ───────────────────────────────────
+    //
+    // A tool may answer with `CallToolResponse::Task`; the follow-up
+    // tasks/* requests must reach the same handler that created it.
+
+    fn get_task(
+        &self,
+        request: GetTaskParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
+        self.inner.get_task(request, context)
+    }
+
+    fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
+        self.inner.update_task(request, context)
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.enrich_extensions(&mut context.extensions);
+        self.inner.cancel_task(request, context)
+    }
 }
 
 /// Produce a short summary of tool call content for audit logging.
 ///
 /// Text is truncated to 256 characters. Binary content is replaced with type
 /// tags (`<image>`, `<audio>`, `<resource>`, `<resource_link>`).
-fn summarize_content(content: &[Content]) -> Option<String> {
+fn summarize_content(content: &[ContentBlock]) -> Option<String> {
     if content.is_empty() {
         return None;
     }
@@ -479,8 +601,8 @@ fn summarize_content(content: &[Content]) -> Option<String> {
         if i > 0 {
             buf.push_str("; ");
         }
-        match &item.raw {
-            RawContent::Text(tc) => {
+        match item {
+            ContentBlock::Text(tc) => {
                 if tc.text.len() > 256 {
                     let end = tc.text.floor_char_boundary(256);
                     buf.push_str(&tc.text[..end]);
@@ -489,10 +611,12 @@ fn summarize_content(content: &[Content]) -> Option<String> {
                     buf.push_str(&tc.text);
                 }
             }
-            RawContent::Image(_) => buf.push_str("<image>"),
-            RawContent::Resource(_) => buf.push_str("<resource>"),
-            RawContent::Audio(_) => buf.push_str("<audio>"),
-            RawContent::ResourceLink(_) => buf.push_str("<resource_link>"),
+            ContentBlock::Image(_) => buf.push_str("<image>"),
+            ContentBlock::Resource(_) => buf.push_str("<resource>"),
+            ContentBlock::Audio(_) => buf.push_str("<audio>"),
+            ContentBlock::ResourceLink(_) => buf.push_str("<resource_link>"),
+            // `ContentBlock` is `#[non_exhaustive]` upstream.
+            _ => buf.push_str("<content>"),
         }
     }
     Some(buf)

@@ -92,7 +92,7 @@ impl DebugServer {
 impl DebugServer {
     #[tool(
         description = "Return a short greeting",
-        output_schema = schema_for_output::<GreetOutput>().unwrap()
+        output_schema = schema_for_output::<GreetOutput>()
     )]
     async fn greet(
         &self,
@@ -107,7 +107,7 @@ impl DebugServer {
 
     #[tool(
         description = "Return a large JSON payload to test SSE streaming",
-        output_schema = schema_for_output::<LargeResponseOutput>().unwrap()
+        output_schema = schema_for_output::<LargeResponseOutput>()
     )]
     async fn large_response(
         &self,
@@ -145,7 +145,7 @@ impl DebugServer {
 
     #[tool(
         description = "Return pong",
-        output_schema = schema_for_output::<PingOutput>().unwrap()
+        output_schema = schema_for_output::<PingOutput>()
     )]
     async fn ping(
         &self,
