@@ -2,12 +2,34 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::RwLock;
 
 pub type PersistenceError = Box<dyn std::error::Error + Send + Sync + 'static>;
+type DataKey = (String, String);
+type LockEntry = (String, Instant);
+
+/// Convert a monotonic in-process deadline into a portable Unix timestamp.
+pub(crate) fn instant_to_unix_millis(deadline: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.saturating_add(remaining)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Return the remaining duration until a persisted Unix timestamp.
+pub(crate) fn remaining_until_unix_millis(deadline_ms: u64) -> Duration {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Duration::from_millis(deadline_ms.saturating_sub(now_ms.min(u64::MAX as u128) as u64))
+}
 
 /// Object-safe boxed future returned by [`PersistenceBackend`] methods.
 ///
@@ -27,30 +49,13 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PersistenceErr
 /// Methods return `Pin<Box<dyn Future>>` so the trait is object-safe and can be
 /// stored as `Arc<dyn PersistenceBackend>`.
 pub trait PersistenceBackend: Send + Sync + 'static {
-    fn get(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, Option<Vec<u8>>>;
+    fn get(&self, ns: &str, key: &str) -> BoxFuture<'_, Option<Vec<u8>>>;
 
-    fn set(
-        &self,
-        ns: &str,
-        key: &str,
-        value: &[u8],
-        ttl: Option<Duration>,
-    ) -> BoxFuture<'_, ()>;
+    fn set(&self, ns: &str, key: &str, value: &[u8], ttl: Option<Duration>) -> BoxFuture<'_, ()>;
 
-    fn delete(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, ()>;
+    fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()>;
 
-    fn keys(
-        &self,
-        ns: &str,
-    ) -> BoxFuture<'_, Vec<String>>;
+    fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>>;
 
     /// Atomically acquire a distributed lock for `key` within `ns`, held for at
     /// most `ttl` (after which it auto-expires so a crashed holder can't deadlock
@@ -90,12 +95,7 @@ pub trait PersistenceBackend: Send + Sync + 'static {
     /// another holder.
     ///
     /// The default is a no-op (paired with the default `try_acquire_lock`).
-    fn release_lock(
-        &self,
-        ns: &str,
-        key: &str,
-        token: &str,
-    ) -> BoxFuture<'_, ()> {
+    fn release_lock(&self, ns: &str, key: &str, token: &str) -> BoxFuture<'_, ()> {
         let _ = (ns, key, token);
         Box::pin(async { Ok(()) })
     }
@@ -107,12 +107,12 @@ pub trait PersistenceBackend: Send + Sync + 'static {
 /// persist until explicitly deleted or overwritten. A real backend (e.g. Redis)
 /// may auto-expire entries based on TTL; keep this in mind when writing tests.
 pub struct InMemoryBackend {
-    data: Arc<RwLock<HashMap<(String, String), Vec<u8>>>>,
+    data: Arc<RwLock<HashMap<DataKey, Vec<u8>>>>,
     /// Held locks keyed by (ns, key) with their `(token, expiry)`. Provides real
     /// atomic mutual exclusion within a process (atomicity from the `RwLock`),
     /// so multi-instance behaviour can be exercised in tests. The token enables
     /// compare-and-delete on release.
-    locks: Arc<RwLock<HashMap<(String, String), (String, Instant)>>>,
+    locks: Arc<RwLock<HashMap<DataKey, LockEntry>>>,
 }
 
 impl InMemoryBackend {
@@ -135,11 +135,7 @@ impl Default for InMemoryBackend {
 }
 
 impl PersistenceBackend for InMemoryBackend {
-    fn get(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, Option<Vec<u8>>> {
+    fn get(&self, ns: &str, key: &str) -> BoxFuture<'_, Option<Vec<u8>>> {
         let ns = ns.to_string();
         let key = key.to_string();
         Box::pin(async move {
@@ -148,13 +144,7 @@ impl PersistenceBackend for InMemoryBackend {
         })
     }
 
-    fn set(
-        &self,
-        ns: &str,
-        key: &str,
-        value: &[u8],
-        _ttl: Option<Duration>,
-    ) -> BoxFuture<'_, ()> {
+    fn set(&self, ns: &str, key: &str, value: &[u8], _ttl: Option<Duration>) -> BoxFuture<'_, ()> {
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -165,11 +155,7 @@ impl PersistenceBackend for InMemoryBackend {
         })
     }
 
-    fn delete(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, ()> {
+    fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()> {
         let ns = ns.to_string();
         let key = key.to_string();
         Box::pin(async move {
@@ -179,10 +165,7 @@ impl PersistenceBackend for InMemoryBackend {
         })
     }
 
-    fn keys(
-        &self,
-        ns: &str,
-    ) -> BoxFuture<'_, Vec<String>> {
+    fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>> {
         let ns = ns.to_string();
         Box::pin(async move {
             let data = self.data.read().await;
@@ -217,55 +200,53 @@ impl PersistenceBackend for InMemoryBackend {
         })
     }
 
-    fn release_lock(
-        &self,
-        ns: &str,
-        key: &str,
-        token: &str,
-    ) -> BoxFuture<'_, ()> {
+    fn release_lock(&self, ns: &str, key: &str, token: &str) -> BoxFuture<'_, ()> {
         let k = (ns.to_string(), key.to_string());
         let token = token.to_string();
         Box::pin(async move {
             let mut locks = self.locks.write().await;
             // Compare-and-delete: only release if we still hold it under our token.
             if let Some((held, _)) = locks.get(&k)
-                && *held == token {
-                    locks.remove(&k);
-                }
+                && *held == token
+            {
+                locks.remove(&k);
+            }
             Ok(())
         })
     }
 }
 
-pub(crate) fn spawn_persist<T: Serialize>(
+/// Serialize and persist a value before returning.
+///
+/// Store-level mutation locks are responsible for ordering calls that target
+/// the same logical record. Keeping the I/O awaited here avoids detached writes
+/// surviving past a later update or deletion.
+pub(crate) async fn persist<T: Serialize>(
     backend: &Arc<dyn PersistenceBackend>,
     ns: &'static str,
-    key: String,
+    key: &str,
     value: &T,
     ttl: Option<Duration>,
 ) {
     match serde_json::to_vec(value) {
-        Ok(bytes) => spawn_persist_raw(backend, ns, key, bytes, ttl),
+        Ok(bytes) => persist_raw(backend, ns, key, &bytes, ttl).await,
         Err(e) => {
             tracing::warn!("Failed to serialize {ns}/{key}: {e}");
         }
     }
 }
 
-/// Fire-and-forget write of an already-serialized value (raw bytes).
-pub(crate) fn spawn_persist_raw(
+/// Persist already-serialized bytes before returning.
+pub(crate) async fn persist_raw(
     backend: &Arc<dyn PersistenceBackend>,
     ns: &'static str,
-    key: String,
-    value: Vec<u8>,
+    key: &str,
+    value: &[u8],
     ttl: Option<Duration>,
 ) {
-    let backend = backend.clone();
-    tokio::spawn(async move {
-        if let Err(e) = backend.set(ns, &key, &value, ttl).await {
-            tracing::warn!("Failed to persist {ns}/{key}: {e}");
-        }
-    });
+    if let Err(e) = backend.set(ns, key, value, ttl).await {
+        tracing::warn!("Failed to persist {ns}/{key}: {e}");
+    }
 }
 
 #[cfg(feature = "redis")]

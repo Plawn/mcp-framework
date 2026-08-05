@@ -22,37 +22,32 @@ impl ServerHandler for AuthServer {
             .with_instructions("An MCP server protected by HTTP Basic auth.")
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_
-    {
-        async move {
-            Ok(ListToolsResult::with_all_items(vec![
-                Tool::new("whoami", "Returns info about the current authenticated session", serde_json::Map::new()),
-            ]))
-        }
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(vec![
+            Tool::new("whoami", "Returns info about the current authenticated session", serde_json::Map::new()),
+        ]))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
-        async move {
-            if request.name.as_ref() == "whoami" {
-                let session_id = context.session_id();
-                let token_store = context.token_store();
-                let has_token = token_store.has_valid_token(session_id).await;
-                let msg = format!(
-                    "Session: {}\nAuthenticated: {}",
-                    session_id, has_token
-                );
-                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
-            } else {
-                Err(McpError::invalid_params("unknown tool", None))
-            }
+    ) -> Result<CallToolResponse, McpError> {
+        if request.name.as_ref() == "whoami" {
+            let session_id = context.session_id();
+            let token_store = context.token_store();
+            let has_token = token_store.has_valid_token(session_id).await;
+            let msg = format!(
+                "Session: {}\nAuthenticated: {}",
+                session_id, has_token
+            );
+            Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
+        } else {
+            Err(McpError::invalid_params("unknown tool", None))
         }
     }
 }

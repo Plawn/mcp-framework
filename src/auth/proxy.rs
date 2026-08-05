@@ -5,19 +5,19 @@
 //! - `/oauth/token` - Proxies token exchange to Keycloak
 
 use axum::{
+    Json,
     body::Body,
     extract::{Query, State},
     http::HeaderMap,
     response::{IntoResponse, Redirect},
-    Json,
 };
 use serde::Deserialize;
 use std::sync::Arc;
 use url::form_urlencoded;
 
-use super::{McpOAuthState, StoredToken};
 use super::config::TokenMode;
 use super::middleware::credential_session_key;
+use super::{McpOAuthState, StoredToken};
 use crate::constants::{CONTENT_TYPE_FORM, OPAQUE_ACCESS_TTL};
 use crate::http_util::HttpError;
 use std::time::{Duration, Instant};
@@ -84,7 +84,10 @@ pub async fn authorize_handler(
 }
 
 /// Parse the token request body into a list of key-value parameters.
-fn parse_token_params(content_type: &str, body_str: &str) -> Result<Vec<(String, String)>, HttpError> {
+fn parse_token_params(
+    content_type: &str,
+    body_str: &str,
+) -> Result<Vec<(String, String)>, HttpError> {
     // Always try form-urlencoded first (OAuth 2.1 spec requires it).
     // Some clients send Content-Type: application/json but still use form-urlencoded body.
     let params: Vec<(String, String)> = form_urlencoded::parse(body_str.as_bytes())
@@ -119,7 +122,10 @@ fn parse_token_params(content_type: &str, body_str: &str) -> Result<Vec<(String,
         }
     }
 
-    tracing::info!("Parsed {} params from form body (no grant_type found)", params.len());
+    tracing::info!(
+        "Parsed {} params from form body (no grant_type found)",
+        params.len()
+    );
     Ok(params)
 }
 
@@ -132,9 +138,18 @@ fn inject_keycloak_credentials(params: &mut Vec<(String, String)>, state: &McpOA
     }
 
     if let Some(ref secret) = state.keycloak_client_secret
-        && !params.iter().any(|(k, _)| k == "client_secret") {
-            params.push(("client_secret".to_string(), secret.clone()));
-        }
+        && !params.iter().any(|(k, _)| k == "client_secret")
+    {
+        params.push(("client_secret".to_string(), secret.clone()));
+    }
+}
+
+fn token_param_for_log(key: &str, value: &str) -> String {
+    match key {
+        "client_secret" | "client_assertion" | "code" | "code_verifier" | "password"
+        | "refresh_token" => "***".to_string(),
+        _ => value.to_string(),
+    }
 }
 
 /// Forward a token request to Keycloak and return the raw response.
@@ -142,17 +157,17 @@ async fn forward_to_keycloak(
     state: &McpOAuthState,
     params: &[(String, String)],
 ) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), HttpError> {
-    let keycloak_token_url = format!(
-        "{}/protocol/openid-connect/token",
-        state.keycloak_realm_url
-    );
+    let keycloak_token_url = format!("{}/protocol/openid-connect/token", state.keycloak_realm_url);
 
     let new_body: String = form_urlencoded::Serializer::new(String::new())
         .extend_pairs(params)
         .finish();
 
     tracing::debug!("Token request to Keycloak: {}", keycloak_token_url);
-    tracing::debug!("Forwarded body: {}", new_body);
+    tracing::debug!(
+        body_len = new_body.len(),
+        "Forwarding redacted OAuth token request"
+    );
 
     let result = state
         .http_client
@@ -176,7 +191,9 @@ async fn forward_to_keycloak(
         }
         Err(e) => {
             tracing::error!("Failed to contact Keycloak for token: {}", e);
-            Err(HttpError::server_error("Failed to contact authorization server"))
+            Err(HttpError::server_error(
+                "Failed to contact authorization server",
+            ))
         }
     }
 }
@@ -187,16 +204,13 @@ fn build_passthrough_response(
     response_headers: &HeaderMap,
     body: &[u8],
 ) -> axum::response::Response {
-    let mut builder = axum::response::Response::builder()
-        .status(status.as_u16());
+    let mut builder = axum::response::Response::builder().status(status.as_u16());
 
     if let Some(ct) = response_headers.get("content-type") {
         builder = builder.header("content-type", ct);
     }
 
-    builder
-        .body(axum::body::Body::from(body.to_vec()))
-        .unwrap()
+    builder.body(axum::body::Body::from(body.to_vec())).unwrap()
 }
 
 /// Handler for `/oauth/token` — proxies to Keycloak.
@@ -230,32 +244,45 @@ async fn passthrough_token_handler(
 
     if status.is_success() {
         tracing::info!("Token exchange successful, status: {}", status);
-        tracing::debug!("Token response: {}", body_str);
+        tracing::debug!(
+            body_len = response_body.len(),
+            "Received OAuth token response"
+        );
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
-            && let Some(access_token) = json["access_token"].as_str() {
-                // Key by the credential, not by `mcp-session-id`: the MCP
-                // session does not exist yet at token-exchange time, so that
-                // header is never present and every grant would land on the
-                // shared `"default"` slot — each user overwriting the previous
-                // one. The credential-derived key is what `bearer_auth_middleware`
-                // recomputes from the bearer it receives, so it can adopt the
-                // `refresh_token` captured here.
-                let session_key = credential_session_key(access_token);
-                let stored = StoredToken {
-                    access_token: access_token.to_string(),
-                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
-                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
-                    decoded_claims: None,
-                };
-                state.token_store.store_token(session_key.clone(), stored).await;
-                tracing::debug!("Stored token for session '{}'", session_key);
-            }
+            && let Some(access_token) = json["access_token"].as_str()
+        {
+            // Key by the credential, not by `mcp-session-id`: the MCP
+            // session does not exist yet at token-exchange time, so that
+            // header is never present and every grant would land on the
+            // shared `"default"` slot — each user overwriting the previous
+            // one. The credential-derived key is what `bearer_auth_middleware`
+            // recomputes from the bearer it receives, so it can adopt the
+            // `refresh_token` captured here.
+            let session_key = credential_session_key(access_token);
+            let stored = StoredToken {
+                access_token: access_token.to_string(),
+                refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                expires_at: json["expires_in"]
+                    .as_u64()
+                    .map(|secs| Instant::now() + Duration::from_secs(secs)),
+                decoded_claims: None,
+            };
+            state
+                .token_store
+                .store_token(session_key.clone(), stored)
+                .await;
+            tracing::debug!("Stored token for session '{}'", session_key);
+        }
     } else {
-        tracing::error!("Token exchange failed, status: {}, body: {}", status, body_str);
+        tracing::error!("Token exchange failed with status: {}", status);
     }
 
-    Ok(build_passthrough_response(status, &response_headers, &response_body))
+    Ok(build_passthrough_response(
+        status,
+        &response_headers,
+        &response_body,
+    ))
 }
 
 /// Opaque token handler: wraps [`passthrough_token_handler`]-style Keycloak
@@ -281,40 +308,53 @@ async fn opaque_token_handler(
 
     if status.is_success() {
         tracing::info!("Token exchange successful, status: {}", status);
-        tracing::debug!("Token response: {}", body_str);
+        tracing::debug!(
+            body_len = response_body.len(),
+            "Received OAuth token response"
+        );
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str)
-            && let Some(access_token) = json["access_token"].as_str() {
-                // Mint a fresh key per grant. `mcp-session-id` is never present
-                // on a token exchange (the MCP session does not exist yet), so
-                // reading it collapsed every user onto `"default"`: each new
-                // login overwrote the previous user's Keycloak token *and*
-                // revoked their opaque tokens via `store_opaque_mapping`.
-                //
-                // Unlike passthrough, this cannot be derived from the credential:
-                // in opaque mode the client never sees the Keycloak token, and
-                // the opaque tokens it does see rotate on every refresh while
-                // this key must stay put. It is resolved from the opaque token
-                // instead, by `TokenStore::resolve_opaque_access`.
-                let session_key = uuid::Uuid::new_v4().to_string();
-                let stored = StoredToken {
-                    access_token: access_token.to_string(),
-                    refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
-                    expires_at: json["expires_in"].as_u64().map(|secs| Instant::now() + Duration::from_secs(secs)),
-                    decoded_claims: None,
-                };
-                state.token_store.store_token(session_key.clone(), stored).await;
-                tracing::debug!("Stored token for session '{}'", session_key);
+            && let Some(access_token) = json["access_token"].as_str()
+        {
+            // Mint a fresh key per grant. `mcp-session-id` is never present
+            // on a token exchange (the MCP session does not exist yet), so
+            // reading it collapsed every user onto `"default"`: each new
+            // login overwrote the previous user's Keycloak token *and*
+            // revoked their opaque tokens via `store_opaque_mapping`.
+            //
+            // Unlike passthrough, this cannot be derived from the credential:
+            // in opaque mode the client never sees the Keycloak token, and
+            // the opaque tokens it does see rotate on every refresh while
+            // this key must stay put. It is resolved from the opaque token
+            // instead, by `TokenStore::resolve_opaque_access`.
+            let session_key = uuid::Uuid::new_v4().to_string();
+            let stored = StoredToken {
+                access_token: access_token.to_string(),
+                refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                expires_at: json["expires_in"]
+                    .as_u64()
+                    .map(|secs| Instant::now() + Duration::from_secs(secs)),
+                decoded_claims: None,
+            };
+            state
+                .token_store
+                .store_token(session_key.clone(), stored)
+                .await;
+            tracing::debug!("Stored token for session '{}'", session_key);
 
-                let kc_expires_in = json["expires_in"].as_u64();
-                return Ok(build_opaque_response(&state, &session_key, kc_expires_in).await);
-            }
+            let kc_expires_in = json["expires_in"].as_u64();
+            return Ok(build_opaque_response(&state, &session_key, kc_expires_in).await);
+        }
     } else {
-        tracing::error!("Token exchange failed, status: {}, body: {}", status, body_str);
+        tracing::error!("Token exchange failed with status: {}", status);
     }
 
     // Keycloak error or unparseable success — forward as-is
-    Ok(build_passthrough_response(status, &response_headers, &response_body))
+    Ok(build_passthrough_response(
+        status,
+        &response_headers,
+        &response_body,
+    ))
 }
 
 /// Read the request body, parse parameters, and extract the grant_type.
@@ -337,19 +377,15 @@ async fn read_token_request(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     tracing::info!(
-        "Token request received: content-type={}, body_len={}, body={}",
         content_type,
-        body_bytes.len(),
-        body_str
+        body_len = body_bytes.len(),
+        "OAuth token request received (body redacted)"
     );
 
     let params = parse_token_params(content_type, &body_str)?;
 
     for (k, v) in &params {
-        let display_val = match k.as_str() {
-            "client_secret" | "code" | "code_verifier" | "refresh_token" => "***".to_string(),
-            _ => v.clone(),
-        };
+        let display_val = token_param_for_log(k, v);
         tracing::info!("  token param: {}={}", k, display_val);
     }
 
@@ -377,21 +413,26 @@ async fn build_opaque_response(
     let opaque_access = uuid::Uuid::new_v4().to_string();
     let opaque_refresh = uuid::Uuid::new_v4().to_string();
 
-    state
-        .token_store
-        .store_opaque_mapping(
-            session_key.to_string(),
-            opaque_access.clone(),
-            opaque_refresh.clone(),
-        )
-        .await;
-
     let expires_in = match keycloak_expires_in {
         Some(kc) => kc.min(OPAQUE_ACCESS_TTL.as_secs()),
         None => OPAQUE_ACCESS_TTL.as_secs(),
     };
 
-    tracing::info!("Issued opaque tokens for session '{}' (expires_in={}s)", session_key, expires_in);
+    state
+        .token_store
+        .store_opaque_mapping_with_access_ttl(
+            session_key.to_string(),
+            opaque_access.clone(),
+            opaque_refresh.clone(),
+            Duration::from_secs(expires_in),
+        )
+        .await;
+
+    tracing::info!(
+        "Issued opaque tokens for session '{}' (expires_in={}s)",
+        session_key,
+        expires_in
+    );
 
     Json(serde_json::json!({
         "access_token": opaque_access,
@@ -437,8 +478,13 @@ async fn handle_opaque_refresh(
                 "Keycloak token expired and refresh failed for session '{}', forcing re-auth",
                 session_id
             );
-            state.token_store.remove_opaque_for_session(&session_id).await;
-            return Err(HttpError::unauthorized("Session expired, re-authentication required"));
+            state
+                .token_store
+                .remove_opaque_for_session(&session_id)
+                .await;
+            return Err(HttpError::unauthorized(
+                "Session expired, re-authentication required",
+            ));
         }
     };
 
@@ -451,3 +497,7 @@ async fn handle_opaque_refresh(
 
     Ok(build_opaque_response(state, &session_id, kc_expires_in).await)
 }
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod tests;

@@ -26,22 +26,28 @@ use std::time::{Duration, Instant};
 use rmcp::model::Extensions;
 use rmcp::service::{RequestContext, RoleServer};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::auth::TokenStore;
 use crate::constants::{
-    NS_SESSIONS, DEFAULT_SESSION_TTL, MCP_SESSION_ID_HEADER, MCP_FALLBACK_SESSION_HEADER,
-    DEFAULT_SESSION_ID,
+    DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL, MCP_FALLBACK_SESSION_HEADER, MCP_SESSION_ID_HEADER,
+    NS_SESSION_LOCK, NS_SESSIONS, SESSION_LOCK_POLL, SESSION_LOCK_TTL, SESSION_LOCK_WAIT,
 };
-use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
+use crate::persistence::{
+    PersistenceBackend, PersistenceError, instant_to_unix_millis, persist,
+    remaining_until_unix_millis,
+};
 
 /// Trait alias for the bounds required on session data types.
 ///
 /// Any type that is `Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static`
 /// automatically implements `SessionData`. Use this as a bound instead of
 /// spelling out the full trait list.
-pub trait SessionData: Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static {}
+pub trait SessionData:
+    Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static
+{
+}
 impl<T: Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static> SessionData for T {}
 
 /// Internal entry wrapping session data with a last-access timestamp.
@@ -53,7 +59,11 @@ struct SessionEntry<T> {
 #[derive(Serialize, serde::Deserialize)]
 struct PersistedSession<T> {
     data: T,
-    remaining_ttl_secs: u64,
+    #[serde(default)]
+    expires_at_unix_ms: Option<u64>,
+    /// Legacy format written before absolute deadlines were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remaining_ttl_secs: Option<u64>,
 }
 
 /// A generic, thread-safe session store keyed by session ID.
@@ -68,6 +78,8 @@ pub struct SessionStore<T: Send + Sync + 'static> {
     sessions: Arc<RwLock<HashMap<String, SessionEntry<T>>>>,
     ttl: Duration,
     persistence: Option<Arc<dyn PersistenceBackend>>,
+    /// Orders in-memory mutations with their persistence side effects.
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl<T: SessionData> SessionStore<T> {
@@ -77,6 +89,7 @@ impl<T: SessionData> SessionStore<T> {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             ttl,
             persistence: None,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -91,13 +104,59 @@ impl<T: SessionData> SessionStore<T> {
         self.persistence = Some(backend);
     }
 
-    fn persist_entry(&self, session_id: &str, data: &T) {
+    async fn persist_entry(&self, session_id: &str, data: &T) {
         if let Some(ref backend) = self.persistence {
             let persisted = PersistedSession {
                 data: data.clone(),
-                remaining_ttl_secs: self.ttl.as_secs(),
+                expires_at_unix_ms: Some(instant_to_unix_millis(Instant::now() + self.ttl)),
+                remaining_ttl_secs: None,
             };
-            spawn_persist(backend, NS_SESSIONS, session_id.to_string(), &persisted, Some(self.ttl));
+            persist(backend, NS_SESSIONS, session_id, &persisted, Some(self.ttl)).await;
+        }
+    }
+
+    /// Acquire the persistence-backed per-session lock used by every operation
+    /// that can write a session record. Clones already share `mutation_lock`;
+    /// this second layer orders independent server replicas.
+    async fn acquire_persistence_lock(
+        &self,
+        session_id: &str,
+    ) -> Option<(Arc<dyn PersistenceBackend>, String)> {
+        let backend = self.persistence.clone()?;
+        let owner = uuid::Uuid::new_v4().to_string();
+        let deadline = Instant::now() + SESSION_LOCK_WAIT;
+
+        loop {
+            match backend
+                .try_acquire_lock(NS_SESSION_LOCK, session_id, &owner, SESSION_LOCK_TTL)
+                .await
+            {
+                Ok(true) => return Some((backend, owner)),
+                Ok(false) if Instant::now() < deadline => {
+                    tokio::time::sleep(SESSION_LOCK_POLL).await;
+                }
+                Ok(false) => {
+                    tracing::warn!("Timed out waiting for session lock {session_id}");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to acquire session lock {session_id}: {e}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    async fn release_persistence_lock(
+        lock: Option<(Arc<dyn PersistenceBackend>, String)>,
+        session_id: &str,
+    ) {
+        if let Some((backend, owner)) = lock
+            && let Err(e) = backend
+                .release_lock(NS_SESSION_LOCK, session_id, &owner)
+                .await
+        {
+            tracing::warn!("Failed to release session lock {session_id}: {e}");
         }
     }
 
@@ -105,21 +164,38 @@ impl<T: SessionData> SessionStore<T> {
     ///
     /// Updates the last-access timestamp.
     pub async fn get_or_create(&self, session_id: &str) -> T {
+        let _mutation = self.mutation_lock.lock().await;
+
+        let distributed_lock = self.acquire_persistence_lock(session_id).await;
+        let loaded = self.load_session_from_backend(session_id).await;
+        let locally_cached = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.data.clone());
+        let is_new = loaded.is_none() && locally_cached.is_none();
+
         let mut sessions = self.sessions.write().await;
-        let is_new = !sessions.contains_key(session_id);
         let entry = sessions
             .entry(session_id.to_string())
             .or_insert_with(|| SessionEntry {
                 data: T::default(),
                 last_access: Instant::now(),
             });
+        if let Some(authoritative) = loaded {
+            entry.data = authoritative;
+        }
         entry.last_access = Instant::now();
         let data = entry.data.clone();
         drop(sessions);
 
-        if is_new {
-            self.persist_entry(session_id, &data);
+        // Touch the persisted record while holding the distributed lock. This
+        // extends the sliding TTL without writing a stale replica cache.
+        if self.persistence.is_some() || is_new {
+            self.persist_entry(session_id, &data).await;
         }
+        Self::release_persistence_lock(distributed_lock, session_id).await;
 
         data
     }
@@ -131,25 +207,38 @@ impl<T: SessionData> SessionStore<T> {
     /// that did not create the session can still resolve it; the loaded entry is
     /// written back to the in-memory cache.
     pub async fn get(&self, session_id: &str) -> Option<T> {
-        // Fast path: in-memory hit (no backend round-trip).
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(entry) = sessions.get_mut(session_id) {
-                entry.last_access = Instant::now();
-                return Some(entry.data.clone());
-            }
-        }
+        let _mutation = self.mutation_lock.lock().await;
 
-        // Slow path: read-through to the persistence backend.
-        let data = self.load_session_from_backend(session_id).await?;
+        let distributed_lock = self.acquire_persistence_lock(session_id).await;
+        let persisted = self.load_session_from_backend(session_id).await;
+        let cached = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.data.clone());
+        let data = persisted.or(cached);
+        let Some(data) = data else {
+            Self::release_persistence_lock(distributed_lock, session_id).await;
+            return None;
+        };
 
         let mut sessions = self.sessions.write().await;
-        let entry = sessions.entry(session_id.to_string()).or_insert_with(|| SessionEntry {
-            data: data.clone(),
-            last_access: Instant::now(),
-        });
+        let entry = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionEntry {
+                data: data.clone(),
+                last_access: Instant::now(),
+            });
+        entry.data = data;
         entry.last_access = Instant::now();
-        Some(entry.data.clone())
+        let data = entry.data.clone();
+        drop(sessions);
+        if self.persistence.is_some() {
+            self.persist_entry(session_id, &data).await;
+        }
+        Self::release_persistence_lock(distributed_lock, session_id).await;
+        Some(data)
     }
 
     /// Read a session directly from the persistence backend. Does not touch the
@@ -165,7 +254,19 @@ impl<T: SessionData> SessionStore<T> {
             }
         };
         match serde_json::from_slice::<PersistedSession<T>>(&bytes) {
-            Ok(p) => Some(p.data),
+            Ok(p) => {
+                let expired = p
+                    .expires_at_unix_ms
+                    .is_some_and(|deadline| remaining_until_unix_millis(deadline).is_zero());
+                if expired {
+                    if let Err(e) = backend.delete(NS_SESSIONS, session_id).await {
+                        tracing::warn!("Failed to delete expired session {session_id}: {e}");
+                    }
+                    None
+                } else {
+                    Some(p.data)
+                }
+            }
             Err(e) => {
                 tracing::warn!("Corrupted persisted session {session_id}: {e}");
                 None
@@ -181,6 +282,11 @@ impl<T: SessionData> SessionStore<T> {
     where
         F: FnOnce(&mut T),
     {
+        let _mutation = self.mutation_lock.lock().await;
+
+        let distributed_lock = self.acquire_persistence_lock(session_id).await;
+        let loaded = self.load_session_from_backend(session_id).await;
+
         let mut sessions = self.sessions.write().await;
         let entry = sessions
             .entry(session_id.to_string())
@@ -188,38 +294,43 @@ impl<T: SessionData> SessionStore<T> {
                 data: T::default(),
                 last_access: Instant::now(),
             });
+        if let Some(authoritative) = loaded {
+            entry.data = authoritative;
+        }
         f(&mut entry.data);
         entry.last_access = Instant::now();
         let data = entry.data.clone();
         drop(sessions);
 
-        self.persist_entry(session_id, &data);
+        self.persist_entry(session_id, &data).await;
+        Self::release_persistence_lock(distributed_lock, session_id).await;
         data
     }
 
     /// Remove the session for `session_id`, returning the data if it existed.
     pub async fn remove(&self, session_id: &str) -> Option<T> {
+        let _mutation = self.mutation_lock.lock().await;
+        let distributed_lock = self.acquire_persistence_lock(session_id).await;
+        let persisted = self.load_session_from_backend(session_id).await;
         let mut sessions = self.sessions.write().await;
-        let removed = sessions.remove(session_id).map(|e| e.data);
+        let cached = sessions.remove(session_id).map(|e| e.data);
+        let removed = persisted.or(cached);
         drop(sessions);
 
-        if removed.is_some() {
-            if let Some(ref backend) = self.persistence {
-                let backend = backend.clone();
-                let key = session_id.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = backend.delete(NS_SESSIONS, &key).await {
-                        tracing::warn!("Failed to delete persisted session {key}: {e}");
-                    }
-                });
-            }
+        if removed.is_some()
+            && let Some(ref backend) = self.persistence
+            && let Err(e) = backend.delete(NS_SESSIONS, session_id).await
+        {
+            tracing::warn!("Failed to delete persisted session {session_id}: {e}");
         }
+        Self::release_persistence_lock(distributed_lock, session_id).await;
 
         removed
     }
 
     /// Purge all sessions whose last access is older than the TTL.
     pub async fn purge_expired(&self) {
+        let _mutation = self.mutation_lock.lock().await;
         let mut sessions = self.sessions.write().await;
         let now = Instant::now();
         let ttl = self.ttl;
@@ -235,18 +346,12 @@ impl<T: SessionData> SessionStore<T> {
         }
         drop(sessions);
 
-        if !expired_keys.is_empty() {
-            if let Some(ref backend) = self.persistence {
-                let backend = backend.clone();
-                let keys = expired_keys;
-                tokio::spawn(async move {
-                    for key in &keys {
-                        if let Err(e) = backend.delete(NS_SESSIONS, key).await {
-                            tracing::warn!("Failed to delete persisted session {key}: {e}");
-                        }
-                    }
-                });
-            }
+        // Do not delete a record merely because this replica's cache is old: a
+        // peer may have touched or updated the authoritative persisted entry.
+        for key in &expired_keys {
+            let distributed_lock = self.acquire_persistence_lock(key).await;
+            let _ = self.load_session_from_backend(key).await;
+            Self::release_persistence_lock(distributed_lock, key).await;
         }
     }
 
@@ -254,6 +359,7 @@ impl<T: SessionData> SessionStore<T> {
     ///
     /// Entries that fail to deserialize are skipped with a warning.
     pub async fn load_persisted(&self) -> Result<(), PersistenceError> {
+        let _mutation = self.mutation_lock.lock().await;
         let backend = match &self.persistence {
             Some(b) => b,
             None => return Ok(()),
@@ -276,13 +382,26 @@ impl<T: SessionData> SessionStore<T> {
                 }
             };
 
-            let last_access = Instant::now()
-                - (self.ttl.saturating_sub(Duration::from_secs(persisted.remaining_ttl_secs)));
+            let remaining = persisted
+                .expires_at_unix_ms
+                .map(remaining_until_unix_millis)
+                .unwrap_or_else(|| {
+                    Duration::from_secs(persisted.remaining_ttl_secs.unwrap_or_default())
+                });
+            if remaining.is_zero() {
+                backend.delete(NS_SESSIONS, &key).await?;
+                continue;
+            }
+            let remaining = remaining.min(self.ttl);
+            let last_access = Instant::now() - self.ttl.saturating_sub(remaining);
 
-            entries.push((key, SessionEntry {
-                data: persisted.data,
-                last_access,
-            }));
+            entries.push((
+                key,
+                SessionEntry {
+                    data: persisted.data,
+                    last_access,
+                },
+            ));
         }
 
         if !entries.is_empty() {
@@ -303,7 +422,7 @@ impl<T: SessionData> SessionStore<T> {
     /// [`JoinHandle`] is aborted or the runtime shuts down.
     pub fn start_cleanup_task(&self) -> JoinHandle<()> {
         let store = self.clone();
-        let interval = self.ttl / 2;
+        let interval = (self.ttl / 2).max(Duration::from_millis(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
@@ -326,9 +445,7 @@ impl<T: SessionData> SessionStore<T> {
 
 // DEFAULT_SESSION_TTL is re-exported from crate::constants
 
-impl<T: SessionData> Default
-    for SessionStore<T>
-{
+impl<T: SessionData> Default for SessionStore<T> {
     fn default() -> Self {
         Self::new(DEFAULT_SESSION_TTL)
     }
@@ -383,9 +500,7 @@ pub struct Session<'a, T: SessionData> {
     session_id: &'a str,
 }
 
-impl<'a, T: SessionData>
-    Session<'a, T>
-{
+impl<'a, T: SessionData> Session<'a, T> {
     /// Return the session ID.
     pub fn id(&self) -> &str {
         self.session_id
@@ -435,9 +550,7 @@ pub trait RequestContextExt {
     ///
     /// Panics if `SessionStore<T>` was not injected into the context.
     /// This happens when `with_sessions::<T>()` was not called on the builder.
-    fn session<T: SessionData>(
-        &self,
-    ) -> Session<'_, T>;
+    fn session<T: SessionData>(&self) -> Session<'_, T>;
 
     /// Get the MCP session ID (falls back to `"default"` in stdio mode).
     fn session_id(&self) -> &str;
@@ -451,9 +564,7 @@ pub trait RequestContextExt {
 }
 
 impl RequestContextExt for RequestContext<RoleServer> {
-    fn session<T: SessionData>(
-        &self,
-    ) -> Session<'_, T> {
+    fn session<T: SessionData>(&self) -> Session<'_, T> {
         let store = self
             .extensions
             .get::<SessionStore<T>>()
@@ -474,5 +585,17 @@ impl RequestContextExt for RequestContext<RoleServer> {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "store_tests.rs"]
+mod store_tests;
+
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
+#[path = "handle_tests.rs"]
+mod handle_tests;
+
+#[cfg(test)]
+#[path = "persistence_tests.rs"]
+mod persistence_tests;

@@ -49,6 +49,8 @@ pub const NS_OPAQUE_ACCESS: &str = "opaque_access";
 pub const NS_OPAQUE_REFRESH: &str = "opaque_refresh";
 /// Distributed refresh locks (SETNX) to serialize token refresh across instances.
 pub const NS_REFRESH_LOCK: &str = "refresh_lock";
+/// Distributed session mutation locks used to serialize replicas.
+pub const NS_SESSION_LOCK: &str = "session_lock";
 
 // === Opaque token mode ===
 pub const OPAQUE_ACCESS_TTL: Duration = Duration::from_secs(3600);
@@ -64,6 +66,10 @@ pub const REFRESH_LOCK_TTL: Duration = Duration::from_secs(15);
 pub const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for a peer's refresh to land in persistence.
 pub const REFRESH_LOCK_POLL: Duration = Duration::from_millis(100);
+/// Session records use the same crash-safe lock timing as token refreshes.
+pub const SESSION_LOCK_TTL: Duration = REFRESH_LOCK_TTL;
+pub const SESSION_LOCK_WAIT: Duration = REFRESH_LOCK_WAIT;
+pub const SESSION_LOCK_POLL: Duration = REFRESH_LOCK_POLL;
 
 // === MCP Apps (ext-apps) ===
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";

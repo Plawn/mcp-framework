@@ -12,7 +12,7 @@ use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
 use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::persistence::PersistenceBackend;
-use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_TTL};
+use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL};
 use crate::session::{SessionData, SessionStore};
 use crate::transport::{run_http, run_stdio, HttpAppConfig};
 
@@ -191,7 +191,7 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     capability_registry: Option<CapabilityRegistry>,
     capability_filter: Option<Arc<dyn CapabilityFilter>>,
     access_validator: Option<Arc<dyn AccessValidator>>,
-    claims_decoder: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>>,
+    claims_decoder: Option<ClaimsDecoderFn>,
     session_store: Option<SessionStore<T>>,
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
@@ -696,7 +696,7 @@ where
         if let Ok(t) = std::env::var(env_var) {
             token_store
                 .store_token(
-                    "stdio".to_string(),
+                    DEFAULT_SESSION_ID.to_string(),
                     StoredToken {
                         access_token: t,
                         refresh_token: None,

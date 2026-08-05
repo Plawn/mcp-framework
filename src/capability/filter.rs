@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use rmcp::model::{Extensions, Prompt, Resource, Tool};
 
 use crate::auth::{StoredToken, TokenStore};
-use crate::session::session_id_from_parts;
+use crate::session::resolve_session_id;
 
 /// Trait for filtering capabilities based on the session's authentication token.
 ///
@@ -94,14 +94,13 @@ where
 /// [`session_id_from_parts`]), then looks up the corresponding token in the
 /// `TokenStore`.
 ///
-/// Returns `None` if no HTTP parts are available (e.g. stdio mode) or if
-/// no token is stored for the session.
+/// In stdio mode, resolves the shared [`DEFAULT_SESSION_ID`](crate::constants::DEFAULT_SESSION_ID)
+/// used by `stdio_token_env`.
 pub(crate) async fn resolve_token(
     extensions: &Extensions,
     token_store: &TokenStore,
 ) -> Option<StoredToken> {
-    let parts = extensions.get::<http::request::Parts>()?;
-    token_store.get_token(session_id_from_parts(parts)).await
+    token_store.get_token(resolve_session_id(extensions)).await
 }
 
 /// Extract the set of tool names to exclude from the `?filter=` query parameter.

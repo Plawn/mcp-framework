@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::constants::NS_CAP_VERSIONS;
-use crate::persistence::{PersistenceBackend, PersistenceError, spawn_persist};
+use crate::persistence::{PersistenceBackend, PersistenceError, persist};
 
 enum NotifyKind {
     Tools,
@@ -184,7 +184,7 @@ impl CapabilityRegistry {
 
         if should_notify {
             if let Some(ref backend) = self.persistence {
-                spawn_persist(backend, NS_CAP_VERSIONS, session_id.to_string(), &current, None);
+                persist(backend, NS_CAP_VERSIONS, session_id, &current, None).await;
             }
 
             if let Err(e) = peer.notify_tool_list_changed().await {
@@ -194,7 +194,9 @@ impl CapabilityRegistry {
                 tracing::warn!("Failed to notify session {session_id} of prompt list change: {e}");
             }
             if let Err(e) = peer.notify_resource_list_changed().await {
-                tracing::warn!("Failed to notify session {session_id} of resource list change: {e}");
+                tracing::warn!(
+                    "Failed to notify session {session_id} of resource list change: {e}"
+                );
             }
         }
     }
@@ -302,7 +304,10 @@ impl CapabilityRegistry {
     {
         let uri = resource.uri.clone();
         let handler: ResourceHandler = Arc::new(move |params| Box::pin(handler(params)));
-        self.resources.write().await.insert(uri, (resource, handler));
+        self.resources
+            .write()
+            .await
+            .insert(uri, (resource, handler));
         self.recompute_version().await;
         self.notify_peers(NotifyKind::Resources).await;
     }
@@ -337,8 +342,7 @@ impl CapabilityRegistry {
     pub async fn register_app_resource(&self, uri: impl Into<String>, html: impl Into<String>) {
         let uri: String = uri.into();
         let html: String = html.into();
-        let resource =
-            Resource::new(&uri, &uri).with_mime_type(crate::constants::APP_MIME_TYPE);
+        let resource = Resource::new(&uri, &uri).with_mime_type(crate::constants::APP_MIME_TYPE);
         let uri_clone = uri.clone();
         self.add_resource(resource, move |_params| {
             let uri = uri_clone.clone();
@@ -443,7 +447,7 @@ impl CapabilityRegistry {
                 return Err(McpError::invalid_request(
                     format!("tool '{}' not found in registry", name),
                     None,
-                ))
+                ));
             }
         };
         drop(guard);
@@ -470,7 +474,7 @@ impl CapabilityRegistry {
                 return Err(McpError::invalid_request(
                     format!("tool '{}' not found in registry", name),
                     None,
-                ))
+                ));
             }
         };
         drop(guard);

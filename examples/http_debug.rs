@@ -174,7 +174,7 @@ impl ServerHandler for DebugServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     McpAppBuilder::new("http-debug")
-        .server(|| DebugServer::new())
+        .server(DebugServer::new)
         .run()
         .await
 }

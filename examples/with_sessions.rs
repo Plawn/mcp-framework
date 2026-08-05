@@ -27,39 +27,35 @@ impl ServerHandler for SessionServer {
             .with_instructions("Tracks per-session call counts.")
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move {
-            Ok(ListToolsResult::with_all_items(vec![
-                Tool::new("stats", "Show how many times you've called tools in this session", serde_json::Map::new()),
-            ]))
-        }
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(vec![
+            Tool::new("stats", "Show how many times you've called tools in this session", serde_json::Map::new()),
+        ]))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
-        async move {
-            let session = context.session::<MySession>();
+    ) -> Result<CallToolResponse, McpError> {
+        let session = context.session::<MySession>();
 
-            // Increment the call counter
-            let data = session.update(|s| s.call_count += 1).await;
+        // Increment the call counter
+        let data = session.update(|s| s.call_count += 1).await;
 
-            if request.name.as_ref() == "stats" {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Session '{}': {} tool call(s) so far.",
-                    session.id(),
-                    data.call_count
-                ))])
-                .into())
-            } else {
-                Err(McpError::invalid_params("unknown tool", None))
-            }
+        if request.name.as_ref() == "stats" {
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Session '{}': {} tool call(s) so far.",
+                session.id(),
+                data.call_count
+            ))])
+            .into())
+        } else {
+            Err(McpError::invalid_params("unknown tool", None))
         }
     }
 }

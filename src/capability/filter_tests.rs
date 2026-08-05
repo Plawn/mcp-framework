@@ -84,6 +84,26 @@ async fn resolve_token_empty_extensions_returns_none() {
 }
 
 #[tokio::test]
+async fn resolve_token_without_http_context_uses_default_session() {
+    let extensions = Extensions::new();
+    let store = TokenStore::new();
+    store
+        .store_token(
+            crate::constants::DEFAULT_SESSION_ID.to_string(),
+            StoredToken {
+                access_token: "stdio-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                decoded_claims: None,
+            },
+        )
+        .await;
+
+    let token = resolve_token(&extensions, &store).await.expect("stdio token");
+    assert_eq!(token.access_token, "stdio-token");
+}
+
+#[tokio::test]
 async fn resolve_token_with_session_id() {
     let mut extensions = Extensions::new();
 

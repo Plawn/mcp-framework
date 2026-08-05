@@ -69,7 +69,7 @@ impl ServerHandler for ToolServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     McpAppBuilder::new("tools-example")
-        .server(|| ToolServer::new())
+        .server(ToolServer::new)
         .run()
         .await
 }

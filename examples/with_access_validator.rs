@@ -50,7 +50,7 @@ impl ServerHandler for MyServer {
 fn is_admin(token: Option<&StoredToken>) -> bool {
     token
         .and_then(|t| t.claims::<Claims>())
-        .map_or(false, |c| c.roles.iter().any(|r| r == "admin"))
+        .is_some_and(|c| c.roles.iter().any(|r| r == "admin"))
 }
 
 // ── Main ────────────────────────────────────────────────────────────

@@ -12,15 +12,15 @@ use axum::{
 };
 use std::sync::Arc;
 
+use super::config::TokenMode;
+use super::{BasicAuthConfig, StoredToken, TokenStore};
+use crate::constants::{
+    AUTHORIZATION_HEADER, BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM, BEARER_PREFIX,
+    BEARER_PREFIX_LOWER, MCP_FALLBACK_SESSION_HEADER, MCP_SESSION_ID_HEADER,
+    WWW_AUTHENTICATE_HEADER,
+};
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use super::{TokenStore, StoredToken, BasicAuthConfig};
-use super::config::TokenMode;
-use crate::constants::{
-    AUTHORIZATION_HEADER, BEARER_PREFIX, BEARER_PREFIX_LOWER,
-    BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM,
-    MCP_SESSION_ID_HEADER, MCP_FALLBACK_SESSION_HEADER, WWW_AUTHENTICATE_HEADER,
-};
 
 /// Derive a stable session identity from a credential.
 ///
@@ -126,7 +126,11 @@ pub async fn bearer_auth_middleware(
     // Extract Authorization header
     let auth_header = request.headers().get(AUTHORIZATION_HEADER);
 
-    tracing::info!("Auth middleware: checking request {} {}", request.method(), request.uri());
+    tracing::info!(
+        "Auth middleware: checking request {} {}",
+        request.method(),
+        request.uri()
+    );
 
     let token = match auth_header {
         Some(header) => {
@@ -142,10 +146,16 @@ pub async fn bearer_auth_middleware(
                 tracing::info!("Auth middleware: found Bearer token (len={})", token.len());
                 token.to_string()
             } else if let Some(token) = header_str.strip_prefix(BEARER_PREFIX_LOWER) {
-                tracing::info!("Auth middleware: found bearer token lowercase (len={})", token.len());
+                tracing::info!(
+                    "Auth middleware: found bearer token lowercase (len={})",
+                    token.len()
+                );
                 token.to_string()
             } else {
-                tracing::warn!("Auth middleware: authorization header not Bearer type: {}", &header_str[..header_str.len().min(20)]);
+                tracing::warn!(
+                    "Auth middleware: authorization header not Bearer type: {}",
+                    &header_str[..header_str.len().min(20)]
+                );
                 return unauthorized_response(&state.resource_metadata_url);
             }
         }
@@ -179,14 +189,19 @@ pub async fn bearer_auth_middleware(
                 // so `ctx.session_id()` and the token store agree, and so a
                 // reconnect lands back on the same session.
                 set_framework_session_id(&mut request, &resolved_session);
-                request.extensions_mut().insert(BearerToken(real_token.access_token));
+                request
+                    .extensions_mut()
+                    .insert(BearerToken(real_token.access_token));
             }
             None => {
                 tracing::warn!(
                     "Keycloak token expired and refresh failed for session '{}', returning 401",
                     resolved_session
                 );
-                state.token_store.remove_opaque_for_session(&resolved_session).await;
+                state
+                    .token_store
+                    .remove_opaque_for_session(&resolved_session)
+                    .await;
                 return unauthorized_response(&state.resource_metadata_url);
             }
         }
@@ -204,20 +219,47 @@ pub async fn bearer_auth_middleware(
         // never fire. When the id was derived from the credential the two keys
         // coincide and this is a no-op.
         let grant_key = credential_session_key(&token);
-        let mut existing = state.token_store.peek_token(&session_id).await;
-        let mut adopted = false;
-        if existing.is_none() && grant_key != session_id {
-            existing = state.token_store.peek_token(&grant_key).await;
-            adopted = existing.is_some();
+        let session_token = state.token_store.peek_token(&session_id).await;
+        let matching_session_token = session_token
+            .as_ref()
+            .filter(|stored| stored.access_token == token)
+            .cloned();
+        let matching_grant_token = if matching_session_token.is_none() && grant_key != session_id {
+            state
+                .token_store
+                .peek_token(&grant_key)
+                .await
+                .filter(|stored| stored.access_token == token)
+        } else {
+            None
+        };
+
+        // Never combine a new bearer with refresh material belonging to the
+        // credential previously bound to this protocol session. A legitimate
+        // rotation is accepted when `/oauth/token` already registered the exact
+        // new bearer under its credential-derived grant key.
+        if session_token.is_some()
+            && matching_session_token.is_none()
+            && matching_grant_token.is_none()
+        {
+            tracing::warn!(
+                "Bearer credential does not match the credential bound to session '{}', returning 401",
+                session_id
+            );
+            return unauthorized_response(&state.resource_metadata_url);
         }
+
+        let matching_token = matching_session_token.or(matching_grant_token);
 
         // Materialize the entry under `session_id` *before* attempting refresh:
         // refresh_token() operates on the store keyed by session id. Preserve
         // refresh_token + expires_at so an expired bearer can still be
         // refreshed. Only write back when something actually changed.
-        let needs_store = adopted || existing.as_ref().is_none_or(|prev| prev.access_token != token);
+        let needs_store = session_token
+            .as_ref()
+            .is_none_or(|previous| previous.access_token != token);
         if needs_store {
-            let (refresh_token, expires_at) = existing
+            let (refresh_token, expires_at) = matching_token
                 .as_ref()
                 .map(|prev| (prev.refresh_token.clone(), prev.expires_at))
                 .unwrap_or((None, None));
@@ -227,10 +269,16 @@ pub async fn bearer_auth_middleware(
                 expires_at,
                 decoded_claims: None,
             };
-            state.token_store.store_token(session_id.clone(), stored_token).await;
+            state
+                .token_store
+                .store_token(session_id.clone(), stored_token)
+                .await;
         }
 
-        let has_refresh = existing.as_ref().and_then(|t| t.refresh_token.as_ref()).is_some();
+        let has_refresh = matching_token
+            .as_ref()
+            .and_then(|stored| stored.refresh_token.as_ref())
+            .is_some();
 
         if jwt_is_expired(&token).unwrap_or(false) && has_refresh {
             // Server-side auto-refresh. get_token() drives refresh_token()
@@ -241,7 +289,9 @@ pub async fn bearer_auth_middleware(
                         "Bearer JWT expired, server-side refresh succeeded for session '{}'",
                         session_id
                     );
-                    request.extensions_mut().insert(BearerToken(refreshed.access_token));
+                    request
+                        .extensions_mut()
+                        .insert(BearerToken(refreshed.access_token));
                     return next.run(request).await;
                 }
                 None => {
@@ -254,7 +304,10 @@ pub async fn bearer_auth_middleware(
             }
         }
 
-        tracing::debug!("Bearer token found for session {}, allowing request", session_id);
+        tracing::debug!(
+            "Bearer token found for session {}, allowing request",
+            session_id
+        );
 
         request.extensions_mut().insert(BearerToken(token));
     }
@@ -315,7 +368,10 @@ pub async fn basic_auth_middleware(
 ) -> Response {
     let auth_header = request.headers().get(AUTHORIZATION_HEADER);
 
-    tracing::debug!("Basic auth middleware: checking request to {}", request.uri());
+    tracing::debug!(
+        "Basic auth middleware: checking request to {}",
+        request.uri()
+    );
 
     let (username, password) = match auth_header {
         Some(header) => {
@@ -327,7 +383,10 @@ pub async fn basic_auth_middleware(
                 }
             };
 
-            let encoded = match header_str.strip_prefix(BASIC_PREFIX).or_else(|| header_str.strip_prefix(BASIC_PREFIX_LOWER)) {
+            let encoded = match header_str
+                .strip_prefix(BASIC_PREFIX)
+                .or_else(|| header_str.strip_prefix(BASIC_PREFIX_LOWER))
+            {
                 Some(e) => e,
                 None => {
                     tracing::debug!("Basic auth middleware: authorization header not Basic type");
@@ -367,13 +426,19 @@ pub async fn basic_auth_middleware(
 
     // Validate credentials
     if username != state.config.username || password != state.config.password {
-        tracing::debug!("Basic auth middleware: invalid credentials for user '{}'", username);
+        tracing::debug!(
+            "Basic auth middleware: invalid credentials for user '{}'",
+            username
+        );
         return basic_unauthorized_response();
     }
 
     let session_id = resolve_or_derive_session_id(&mut request, &password);
 
-    tracing::debug!("Basic auth validated for session {}, storing token", session_id);
+    tracing::debug!(
+        "Basic auth validated for session {}, storing token",
+        session_id
+    );
 
     // Store the password as access_token so tools work identically to Bearer mode
     let stored_token = StoredToken {
@@ -383,7 +448,10 @@ pub async fn basic_auth_middleware(
         decoded_claims: None,
     };
 
-    state.token_store.store_token(session_id, stored_token).await;
+    state
+        .token_store
+        .store_token(session_id, stored_token)
+        .await;
 
     request.extensions_mut().insert(BearerToken(password));
 
