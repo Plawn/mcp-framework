@@ -44,6 +44,8 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 # `ServiceExt::oneshot` — drive the axum router in-process, without a listener.
 tower = { version = "0.5", features = ["util"] }
+# Build signed-shaped JWTs (payload only, no verification) for auth tests.
+base64 = "0.22"
 
 [profile.release]
 strip = true

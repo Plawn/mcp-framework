@@ -234,19 +234,39 @@ pub async fn bearer_auth_middleware(
             None
         };
 
-        // Never combine a new bearer with refresh material belonging to the
-        // credential previously bound to this protocol session. A legitimate
-        // rotation is accepted when `/oauth/token` already registered the exact
-        // new bearer under its credential-derived grant key.
+        // A new bearer on a session that already carries one is rejected only
+        // when it belongs to a *different* principal. Passthrough never verifies
+        // the bearer signature (the downstream API does), so the concern here is
+        // not authentication but session integrity: a bearer for another `sub`
+        // must not overwrite this session's entry or wipe its refresh material.
+        //
+        // A legitimate "bring your own token" client rotates its access token —
+        // Keycloak hands back a fresh JWT for the same user on every exchange, so
+        // the `sub` is stable even though the bytes differ. That rotation is
+        // accepted, but never combines the new bearer with refresh material
+        // belonging to the previous one: `matching_token` stays `None` here, so
+        // the store below falls back to `(None, None)`. A rotation already
+        // pre-registered by `/oauth/token` is caught earlier by
+        // `matching_grant_token` and keeps its captured refresh_token.
         if session_token.is_some()
             && matching_session_token.is_none()
             && matching_grant_token.is_none()
         {
-            tracing::warn!(
-                "Bearer credential does not match the credential bound to session '{}', returning 401",
-                session_id
-            );
-            return unauthorized_response(&state.resource_metadata_url);
+            let same_principal = jwt_subject(&token)
+                .zip(
+                    session_token
+                        .as_ref()
+                        .and_then(|stored| jwt_subject(&stored.access_token)),
+                )
+                .is_some_and(|(new_sub, prev_sub)| new_sub == prev_sub);
+
+            if !same_principal {
+                tracing::warn!(
+                    "Bearer principal does not match the principal bound to session '{}', returning 401",
+                    session_id
+                );
+                return unauthorized_response(&state.resource_metadata_url);
+            }
         }
 
         let matching_token = matching_session_token.or(matching_grant_token);
@@ -335,6 +355,23 @@ fn jwt_is_expired(token: &str) -> Option<bool> {
         .ok()?
         .as_secs();
     Some(now >= exp)
+}
+
+/// Decode the JWT payload (without signature verification) and return the
+/// `sub` (subject) claim.
+///
+/// Returns `None` when the token is not a parseable JWT or carries no string
+/// `sub`. Like [`jwt_is_expired`], this reads the payload directly rather than
+/// going through the consumer's `claims_decoder`, so the middleware stays
+/// agnostic of the concrete claims type while still able to compare principals
+/// across a bearer rotation.
+fn jwt_subject(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("sub")?.as_str().map(str::to_string)
 }
 
 /// Returns a 401 response with WWW-Authenticate header for OAuth discovery
