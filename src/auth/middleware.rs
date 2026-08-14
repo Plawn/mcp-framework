@@ -13,6 +13,7 @@ use axum::{
 use std::sync::Arc;
 
 use super::config::TokenMode;
+use super::store::TokenIntrospection;
 use super::{BasicAuthConfig, StoredToken, TokenStore};
 use crate::constants::{
     AUTHORIZATION_HEADER, BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM, BEARER_PREFIX,
@@ -110,7 +111,11 @@ pub struct BearerToken(pub String);
 /// Middleware that extracts Bearer token from Authorization header
 /// and stores it in request extensions for handlers to use.
 ///
-/// In **Passthrough** mode (default): the Bearer token is stored as-is.
+/// In **Passthrough** mode (default): tokens issued through this framework's
+/// OAuth proxy are checked against the token store and their recorded expiry.
+/// Unknown tokens are introspected with the authorization server before being
+/// stored, which keeps bring-your-own-token clients working without trusting an
+/// arbitrary non-empty header.
 ///
 /// In **Opaque** mode: the Bearer token is an opaque UUID issued by this
 /// framework. The middleware resolves it to the real Keycloak token
@@ -165,6 +170,11 @@ pub async fn bearer_auth_middleware(
             return unauthorized_response(&state.resource_metadata_url);
         }
     };
+
+    if token.is_empty() {
+        tracing::warn!("Auth middleware: empty Bearer token, returning 401");
+        return unauthorized_response(&state.resource_metadata_url);
+    }
 
     if state.token_mode == TokenMode::Opaque {
         // Opaque mode: resolve opaque UUID → session_id → real Keycloak token
@@ -234,11 +244,10 @@ pub async fn bearer_auth_middleware(
             None
         };
 
-        // A new bearer on a session that already carries one is rejected only
-        // when it belongs to a *different* principal. Passthrough never verifies
-        // the bearer signature (the downstream API does), so the concern here is
-        // not authentication but session integrity: a bearer for another `sub`
-        // must not overwrite this session's entry or wipe its refresh material.
+        // A new bearer on a session that already carries one is rejected when it
+        // belongs to a different principal. Unknown credentials are introspected
+        // below before any session state is mutated, so reading `sub` without
+        // verifying the signature here is only used for the identity comparison.
         //
         // A legitimate "bring your own token" client rotates its access token —
         // Keycloak hands back a fresh JWT for the same user on every exchange, so
@@ -271,6 +280,36 @@ pub async fn bearer_auth_middleware(
 
         let matching_token = matching_session_token.or(matching_grant_token);
 
+        // A token captured by `/oauth/token` is already trusted and carries the
+        // authorization server's expiry in the store. A bring-your-own token is
+        // unknown to the store, so validate it with Keycloak before allowing it
+        // to create or replace a session entry. This is the boundary that rejects
+        // arbitrary bearer strings and JWTs with invalid signatures.
+        let introspected_expiry = if matching_token.is_none() {
+            match state.token_store.introspect_access_token(&token).await {
+                TokenIntrospection::Active { expires_at } => expires_at,
+                TokenIntrospection::Inactive => {
+                    tracing::warn!("Bearer token is inactive or invalid, returning 401");
+                    return unauthorized_response(&state.resource_metadata_url);
+                }
+            }
+        } else {
+            None
+        };
+
+        let candidate = matching_token
+            .clone()
+            .unwrap_or_else(|| StoredToken::new(token.clone(), None, introspected_expiry));
+        let token_is_expired = candidate.is_expired() || jwt_is_expired(&token).unwrap_or(false);
+        let has_refresh = candidate.refresh_token.is_some();
+
+        // Expired credentials are never passed to the MCP handler. They may only
+        // continue after the framework has successfully refreshed them.
+        if token_is_expired && !has_refresh {
+            tracing::warn!("Bearer token expired and cannot be refreshed, returning 401");
+            return unauthorized_response(&state.resource_metadata_url);
+        }
+
         // Materialize the entry under `session_id` *before* attempting refresh:
         // refresh_token() operates on the store keyed by session id. Preserve
         // refresh_token + expires_at so an expired bearer can still be
@@ -282,7 +321,7 @@ pub async fn bearer_auth_middleware(
             let (refresh_token, expires_at) = matching_token
                 .as_ref()
                 .map(|prev| (prev.refresh_token.clone(), prev.expires_at))
-                .unwrap_or((None, None));
+                .unwrap_or((None, introspected_expiry));
             let stored_token = StoredToken {
                 access_token: token.clone(),
                 refresh_token,
@@ -295,12 +334,7 @@ pub async fn bearer_auth_middleware(
                 .await;
         }
 
-        let has_refresh = matching_token
-            .as_ref()
-            .and_then(|stored| stored.refresh_token.as_ref())
-            .is_some();
-
-        if jwt_is_expired(&token).unwrap_or(false) && has_refresh {
+        if token_is_expired {
             // Server-side auto-refresh. get_token() drives refresh_token()
             // which updates the store atomically under the per-session lock.
             match state.token_store.get_token(&session_id).await {

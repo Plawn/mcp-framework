@@ -171,6 +171,13 @@ pub struct RefreshConfig {
     pub token_url: String,
 }
 
+/// Result of asking the OAuth authorization server whether an access token is
+/// currently active.
+pub(super) enum TokenIntrospection {
+    Active { expires_at: Option<Instant> },
+    Inactive,
+}
+
 /// Type-erased claims decoder function.
 pub type ClaimsDecoderFn = Arc<dyn Fn(&str) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>;
 
@@ -417,6 +424,83 @@ impl TokenStore {
 
         // Return the stored version which has decoded claims applied
         Ok(self.get_token_raw(session_id).await.expect("just stored"))
+    }
+
+    /// Validate an access token that was not issued through this framework's
+    /// `/oauth/token` proxy.
+    ///
+    /// Tokens emitted by the proxy are already present in the store, together
+    /// with their expiry. An unknown token may still be legitimate (for example
+    /// a bring-your-own-token client), but it must be checked with the
+    /// authorization server before it is allowed to seed a framework session.
+    pub(super) async fn introspect_access_token(&self, token: &str) -> TokenIntrospection {
+        let Some(config) = self.refresh_config.read().await.clone() else {
+            tracing::warn!("Cannot introspect bearer token: OAuth configuration unavailable");
+            return TokenIntrospection::Inactive;
+        };
+
+        let introspection_url = format!("{}/introspect", config.token_url.trim_end_matches('/'));
+        let mut params = vec![
+            ("token", token.to_string()),
+            ("token_type_hint", "access_token".to_string()),
+            ("client_id", config.client_id),
+        ];
+        if let Some(secret) = config.client_secret {
+            params.push(("client_secret", secret));
+        }
+
+        let response = match self
+            .http_client
+            .post(introspection_url)
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("OAuth token introspection request failed: {error}");
+                return TokenIntrospection::Inactive;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                "OAuth token introspection was rejected"
+            );
+            return TokenIntrospection::Inactive;
+        }
+
+        let payload: serde_json::Value = match response.json().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!("Invalid OAuth token introspection response: {error}");
+                return TokenIntrospection::Inactive;
+            }
+        };
+
+        if payload.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
+            return TokenIntrospection::Inactive;
+        }
+
+        let expires_at = match payload.get("exp").and_then(serde_json::Value::as_u64) {
+            Some(exp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let Some(remaining) = exp.checked_sub(now) else {
+                    return TokenIntrospection::Inactive;
+                };
+                if remaining == 0 {
+                    return TokenIntrospection::Inactive;
+                }
+                Some(Instant::now() + Duration::from_secs(remaining))
+            }
+            None => None,
+        };
+
+        TokenIntrospection::Active { expires_at }
     }
 
     /// Store a pending authorization (before redirect to Keycloak)

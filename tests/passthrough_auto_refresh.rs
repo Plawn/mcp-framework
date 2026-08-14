@@ -175,8 +175,8 @@ async fn passthrough_preserves_refresh_token_across_requests() {
 #[tokio::test]
 async fn passthrough_returns_401_when_expired_and_no_refresh_token() {
     // No refresh_token in store → expired bearer cannot be rescued.
-    // Today we'd silently pass it through; covering the new path:
-    // without refresh material we keep prior behavior (pass through).
+    // It must be rejected at the transport boundary so an MCP client can
+    // restart OAuth instead of receiving a tool-level session error.
     let token_store = TokenStore::new();
     let session_id = "sess-no-rt".to_string();
     let expired_jwt = make_jwt(-60);
@@ -196,7 +196,11 @@ async fn passthrough_returns_401_when_expired_and_no_refresh_token() {
         .send()
         .await
         .expect("request");
-    // No refresh material → middleware passes the bearer through; the
-    // downstream API (not under test) is responsible for rejecting it.
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer resource_metadata=\"http://test/.well-known\"")
+    );
 }

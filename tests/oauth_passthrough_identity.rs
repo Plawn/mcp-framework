@@ -2,16 +2,35 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::{Json, Router, http::StatusCode, routing::post};
 use common::{app_with, whoami_request};
 use mcp_framework::auth::{AuthProvider, OAuthConfig, StoredToken, TokenMode};
 use mcp_framework::constants::MCP_SESSION_ID_HEADER;
 
-fn oauth() -> AuthProvider {
+async fn oauth() -> AuthProvider {
+    async fn introspect() -> Json<serde_json::Value> {
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        Json(serde_json::json!({ "active": true, "exp": exp }))
+    }
+
+    let app = Router::new().route(
+        "/realms/test/protocol/openid-connect/token/introspect",
+        post(introspect),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
     AuthProvider::OAuth(OAuthConfig {
         client_id: "test-client".to_string(),
         client_secret: Some("test-secret".to_string()),
-        issuer_url: "http://localhost:8080/realms/test".to_string(),
+        issuer_url: format!("http://{addr}/realms/test"),
         redirect_url: "http://localhost/oauth/callback".to_string(),
         scopes: vec!["openid".to_string()],
         token_mode: TokenMode::Passthrough,
@@ -20,7 +39,7 @@ fn oauth() -> AuthProvider {
 
 #[tokio::test]
 async fn concurrent_sessionless_bearers_are_isolated() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
 
     let (status_a, id_a) = whoami_request(&app, &[("authorization", "Bearer token-alice")]).await;
     let (status_b, id_b) = whoami_request(&app, &[("authorization", "Bearer token-bob")]).await;
@@ -43,7 +62,7 @@ async fn concurrent_sessionless_bearers_are_isolated() {
 
 #[tokio::test]
 async fn passthrough_adopts_the_refresh_token_captured_at_the_exchange() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
 
     // Stand in for `/oauth/token`: it keys by credential because no MCP session
     // exists yet, and it is the only place the refresh_token is ever seen.
@@ -79,10 +98,10 @@ async fn passthrough_adopts_the_refresh_token_captured_at_the_exchange() {
 }
 
 /// Build a JWT-shaped token (`header.payload.sig`) carrying `sub`. The payload
-/// is real base64url JSON so `jwt_subject` can decode it; the signature is
-/// irrelevant — passthrough never verifies it. `nonce` makes two tokens for the
-/// same principal differ byte-for-byte, mimicking Keycloak re-issuing a fresh
-/// JWT on every token-exchange.
+/// is real base64url JSON so `jwt_subject` can decode it. The mock introspection
+/// endpoint above stands in for signature validation. `nonce` makes two tokens
+/// for the same principal differ byte-for-byte, mimicking Keycloak re-issuing a
+/// fresh JWT on every token-exchange.
 fn jwt_with_sub(sub: &str, nonce: &str) -> String {
     use base64::Engine as _;
     let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -93,7 +112,7 @@ fn jwt_with_sub(sub: &str, nonce: &str) -> String {
 
 #[tokio::test]
 async fn passthrough_accepts_a_rotated_bearer_for_the_same_principal() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
 
     // A bring-your-own-token client: it obtained its own Keycloak JWT (never via
     // `/oauth/token`) and re-mints it on every request. First request seeds the
@@ -125,16 +144,16 @@ async fn passthrough_accepts_a_rotated_bearer_for_the_same_principal() {
 
     assert_eq!(status2, StatusCode::OK);
     // The rotated bearer replaced the stored one and never inherited refresh
-    // material (there was none here, and there must never be any carried over).
+    // material. Its expiry comes from the successful introspection response.
     let stored = token_store.peek_token("sess-alice").await.expect("stored");
     assert_eq!(stored.access_token, t2);
     assert_eq!(stored.refresh_token, None);
-    assert_eq!(stored.expires_at, None);
+    assert!(stored.expires_at.is_some());
 }
 
 #[tokio::test]
 async fn passthrough_rotation_never_inherits_previous_refresh_material() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
 
     // Seed the session with a JWT that *does* carry refresh material, as if the
     // grant had been adopted from `/oauth/token`.
@@ -166,7 +185,7 @@ async fn passthrough_rotation_never_inherits_previous_refresh_material() {
 
 #[tokio::test]
 async fn passthrough_rejects_a_different_principal_for_an_existing_session() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
     let alice = jwt_with_sub("alice", "one");
     token_store
         .store_token(
@@ -195,7 +214,7 @@ async fn passthrough_rejects_a_different_principal_for_an_existing_session() {
 
 #[tokio::test]
 async fn passthrough_rejects_a_different_bearer_for_an_existing_session() {
-    let (app, token_store) = app_with(oauth());
+    let (app, token_store) = app_with(oauth().await);
     token_store
         .store_token(
             "sess-alice".to_string(),
