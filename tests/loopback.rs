@@ -80,13 +80,13 @@ async fn test_registry() -> CapabilityRegistry {
     registry
         .add_tool(
             Tool::new("ping", "Returns pong", serde_json::Map::new()),
-            |_args| async { Ok(CallToolResult::success(vec![Content::text("pong")])) },
+            |_args| async { Ok(CallToolResult::success(vec![ContentBlock::text("pong")])) },
         )
         .await;
     registry
         .add_tool(
             Tool::new("admin_reset", "Admin only", serde_json::Map::new()),
-            |_args| async { Ok(CallToolResult::success(vec![Content::text("reset")])) },
+            |_args| async { Ok(CallToolResult::success(vec![ContentBlock::text("reset")])) },
         )
         .await;
     registry

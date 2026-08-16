@@ -166,8 +166,17 @@ pub enum LoopbackConnectError {
     #[error("loopback cannot resolve the credential presented for session '{session_id}': {reason}")]
     UnresolvableCredential { session_id: String, reason: &'static str },
     /// The MCP `initialize` handshake failed.
+    ///
+    /// Boxed: rmcp's error is several hundred bytes, and it is the rarest variant of the three —
+    /// unboxed it would set the size of every `Result` this module returns.
     #[error(transparent)]
-    Initialize(#[from] rmcp::service::ClientInitializeError),
+    Initialize(Box<rmcp::service::ClientInitializeError>),
+}
+
+impl From<rmcp::service::ClientInitializeError> for LoopbackConnectError {
+    fn from(e: rmcp::service::ClientInitializeError) -> Self {
+        Self::Initialize(Box::new(e))
+    }
 }
 
 /// A live in-process client session, plus the task serving the other end of it.
