@@ -9,10 +9,13 @@
 //! only, and nothing in the code says so.
 //!
 //! A loopback endpoint removes the shortcut. The in-process caller becomes a real MCP client:
-//! same [`DynamicHandler`], same registry, same filter, same logger, same session and token
-//! stores — only the socket is missing, replaced by a pair of typed channels. Messages move as
-//! `JsonRpcMessage` values, never as bytes, so the isolation costs a channel hop rather than a
-//! serialization round-trip.
+//! same [`DynamicHandler`], same registry, same filter, same logger — only the socket is missing,
+//! replaced by a pair of typed channels. Messages move as `JsonRpcMessage` values, never as bytes,
+//! so the isolation costs a channel hop rather than a serialization round-trip.
+//!
+//! What is deliberately *not* shared is the pair of identity stores: an endpoint keeps its own
+//! [`TokenStore`] and [`SessionStore`], because both are keyed by session id and an in-process
+//! caller names its own sessions. See [`LoopbackEndpoint`].
 //!
 //! ```rust,ignore
 //! let builder = McpAppBuilder::new("engine").server(|| server.clone()) /* … */;
@@ -24,16 +27,18 @@
 //! ```
 
 use std::future::Future;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::channel::mpsc;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{QuitReason, RoleClient, RunningService};
 use rmcp::ServiceExt;
+use tokio::task::JoinHandle;
 
-use crate::auth::{StoredToken, TokenStore};
+use crate::auth::{StoredToken, TokenMode, TokenStore};
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::capability::AccessValidator;
 use crate::audit::ToolCallLogger;
@@ -148,9 +153,85 @@ pub enum LoopbackConnectError {
     /// [`LoopbackIdentity::validate`].
     #[error("loopback identity cannot be carried by the protocol: {0}")]
     InvalidIdentity(String),
+    /// A bearer was presented that this endpoint cannot turn into a usable credential.
+    ///
+    /// Raised in [`TokenMode::Opaque`], where the bearer a caller holds is a UUID issued by the
+    /// framework and the real token lives server-side, indexed by the **HTTP** transport's
+    /// [`TokenStore`]. A loopback endpoint has its own store on purpose, so it cannot resolve
+    /// that UUID; storing it as-is would hand filters, validators and forwarded backends a
+    /// credential that looks real and authenticates nothing.
+    ///
+    /// A caller that gets this can retry anonymously — a de-escalation, safe by construction —
+    /// as long as it says so in its logs.
+    #[error("loopback cannot resolve the credential presented for session '{session_id}': {reason}")]
+    UnresolvableCredential { session_id: String, reason: &'static str },
     /// The MCP `initialize` handshake failed.
     #[error(transparent)]
     Initialize(#[from] rmcp::service::ClientInitializeError),
+}
+
+/// A live in-process client session, plus the task serving the other end of it.
+///
+/// [`RunningService`] cancels itself on drop, so the *client* half needs no help. The server half
+/// runs in a task of its own, and a task whose [`JoinHandle`] has been dropped cannot be reached
+/// again: if its serve loop ever failed to notice the transport closing, it would stay alive for
+/// the life of the process with nothing left to talk to. Keeping the handle turns that from a leak
+/// into a guarantee — [`cancel`](Self::cancel) and `Drop` both end it.
+///
+/// Aborting the task drops the server-side `RunningService`, whose own drop guard cancels rmcp's
+/// cancellation token; per-request handler tasks hold child tokens of it, so they are cancelled
+/// too rather than orphaned.
+///
+/// Derefs to the client, so `session.peer()`, `session.call_tool(…)` and `session.list_all_tools()`
+/// read exactly as they would on a `RunningService`.
+pub struct LoopbackSession {
+    /// `Option` only so [`cancel`](Self::cancel) can take the client by value out of a type that
+    /// implements `Drop`. Never `None` outside that call.
+    client: Option<RunningService<RoleClient, ()>>,
+    server: JoinHandle<()>,
+}
+
+impl LoopbackSession {
+    /// Close the session: cancel the client, then end the task serving it.
+    ///
+    /// The abort follows the client's cancellation rather than racing it, and nothing observable
+    /// is truncated — the peer that would have received an answer is already gone.
+    pub async fn cancel(mut self) -> Result<QuitReason, tokio::task::JoinError> {
+        // Safe: only `cancel` takes the client out, and it consumes `self`.
+        let reason = match self.client.take() {
+            Some(client) => client.cancel().await,
+            None => Ok(QuitReason::Closed),
+        };
+        self.server.abort();
+        reason
+    }
+}
+
+impl std::fmt::Debug for LoopbackSession {
+    /// Opaque on purpose: a session holds a live client and a running task, neither of which has
+    /// anything printable that is still true by the time it is read. The impl exists so a
+    /// `Result<LoopbackSession, _>` can be asserted on with `expect_err`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopbackSession").finish_non_exhaustive()
+    }
+}
+
+impl Deref for LoopbackSession {
+    type Target = RunningService<RoleClient, ()>;
+
+    fn deref(&self) -> &Self::Target {
+        self.client
+            .as_ref()
+            .expect("the loopback client is only taken out by `cancel`, which consumes the session")
+    }
+}
+
+impl Drop for LoopbackSession {
+    fn drop(&mut self) {
+        // The client's own drop guard closes the conversation; this ends the server task even in
+        // the case where it did not notice.
+        self.server.abort();
+    }
 }
 
 /// A factory for in-process clients of an [`McpApp`](crate::McpApp).
@@ -159,9 +240,12 @@ pub enum LoopbackConnectError {
 /// is consumed by `run()`, so one application can serve a network transport and hand out loopback
 /// sessions at the same time. Cheap to clone: everything it holds is an `Arc` or a handle.
 ///
-/// The endpoint owns its own [`TokenStore`], distinct from the one the HTTP transport builds:
-/// in-process callers are not HTTP sessions and their credentials have no reason to collide with
-/// (or be readable from) a network client's.
+/// The endpoint owns its own [`TokenStore`] **and** [`SessionStore`], distinct from the ones the
+/// HTTP transport builds. Both stores are keyed by session id alone, and a loopback session id is
+/// chosen by the in-process caller — often from data it received from outside. Sharing either
+/// store would let a caller that names its session after a network client's read and write that
+/// client's state. See [`McpAppBuilder::loopback`](crate::McpAppBuilder::loopback) for what that
+/// costs (in-process sessions are not persisted).
 pub struct LoopbackEndpoint<T: SessionData, F> {
     server_factory: F,
     registry: CapabilityRegistry,
@@ -170,6 +254,10 @@ pub struct LoopbackEndpoint<T: SessionData, F> {
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     token_store: TokenStore,
     session_store: SessionStore<T>,
+    /// How the application issues tokens to its network clients — which decides whether a bearer
+    /// handed to [`connect`](Self::connect) means anything here. See
+    /// [`LoopbackConnectError::UnresolvableCredential`].
+    token_mode: TokenMode,
 }
 
 impl<T: SessionData, F: Clone> Clone for LoopbackEndpoint<T, F> {
@@ -182,6 +270,7 @@ impl<T: SessionData, F: Clone> Clone for LoopbackEndpoint<T, F> {
             tool_call_logger: self.tool_call_logger.clone(),
             token_store: self.token_store.clone(),
             session_store: self.session_store.clone(),
+            token_mode: self.token_mode.clone(),
         }
     }
 }
@@ -196,6 +285,7 @@ impl<T: SessionData, F> LoopbackEndpoint<T, F> {
         tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
         token_store: TokenStore,
         session_store: SessionStore<T>,
+        token_mode: TokenMode,
     ) -> Self {
         Self {
             server_factory,
@@ -205,6 +295,7 @@ impl<T: SessionData, F> LoopbackEndpoint<T, F> {
             tool_call_logger,
             token_store,
             session_store,
+            token_mode,
         }
     }
 }
@@ -217,14 +308,25 @@ where
 {
     /// Open a client session onto this application.
     ///
-    /// The returned service has completed the `initialize` handshake and is ready to issue
-    /// requests. It owns a spawned task serving the other end; dropping it, or calling
-    /// [`RunningService::cancel`], closes the session and ends that task.
+    /// The returned session has completed the `initialize` handshake and is ready to issue
+    /// requests. It owns the task serving the other end; dropping it, or calling
+    /// [`LoopbackSession::cancel`], closes the session and ends that task.
     pub async fn connect(
         &self,
         identity: LoopbackIdentity,
-    ) -> Result<RunningService<RoleClient, ()>, LoopbackConnectError> {
+    ) -> Result<LoopbackSession, LoopbackConnectError> {
         identity.validate()?;
+
+        // In Opaque mode the bearer a caller holds is a UUID this endpoint cannot resolve — see
+        // `UnresolvableCredential`. Refusing here rather than storing it keeps the failure at the
+        // one place that can name it; a caller is free to retry anonymously, which de-escalates.
+        if self.token_mode == TokenMode::Opaque && identity.bearer_token.is_some() {
+            return Err(LoopbackConnectError::UnresolvableCredential {
+                session_id: identity.session_id.clone(),
+                reason: "the application issues opaque tokens, which only the HTTP transport's \
+                         token store can resolve",
+            });
+        }
 
         // The credentials presented at connect **replace** whatever the store held for this
         // session id, in both directions. Storing on `Some` and doing nothing on `None` would
@@ -265,8 +367,9 @@ where
 
         let session_id = identity.session_id.clone();
         // The server side must already be listening when the client sends `initialize`, so it is
-        // spawned first and never awaited here.
-        tokio::spawn(async move {
+        // spawned first and never awaited here. The handle travels with the session rather than
+        // being dropped: see [`LoopbackSession`].
+        let server = tokio::spawn(async move {
             match handler.serve((to_client, from_client)).await {
                 Ok(running) => {
                     if let Err(e) = running.waiting().await {
@@ -279,7 +382,15 @@ where
             }
         });
 
-        Ok(().serve((to_server, from_server)).await?)
+        let client = match ().serve((to_server, from_server)).await {
+            Ok(client) => client,
+            // The handshake failed, so nothing will ever close the transport from this side.
+            Err(e) => {
+                server.abort();
+                return Err(e.into());
+            }
+        };
+        Ok(LoopbackSession { client: Some(client), server })
     }
 
     /// Drop everything this endpoint holds for `session_id`.
@@ -290,8 +401,8 @@ where
     /// the next caller who happens to reuse the name. A caller that owns the lifecycle of its
     /// sessions (a chat thread, a job) calls this when one ends.
     ///
-    /// The session store is shared with the network transport by design, so a loopback caller
-    /// must not name a session after an HTTP one: forgetting it here would forget it there too.
+    /// Both stores this touches belong to the endpoint alone, so nothing a network client owns is
+    /// reachable from here — the name of a session is not a way to reach across transports.
     pub async fn forget_session(&self, session_id: &str) {
         self.token_store.remove_token(session_id).await;
         // deliberate: le `Option<T>` rendu est l'état qu'on jette — c'est le but de l'appel.
@@ -310,7 +421,7 @@ pub trait DynLoopback: Send + Sync {
         identity: LoopbackIdentity,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<RunningService<RoleClient, ()>, LoopbackConnectError>>
+            dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>>
                 + Send
                 + '_,
         >,
@@ -334,7 +445,7 @@ where
         identity: LoopbackIdentity,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<RunningService<RoleClient, ()>, LoopbackConnectError>>
+            dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>>
                 + Send
                 + '_,
         >,

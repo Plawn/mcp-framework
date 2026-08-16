@@ -10,9 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_framework::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
-use mcp_framework::auth::StoredToken;
+use mcp_framework::auth::{
+    AuthProvider, OAuthConfig, StoredToken, TokenMode, UnknownTokenValidation,
+};
 use mcp_framework::prelude::*;
-use mcp_framework::transport::{LoopbackEndpoint, LoopbackIdentity};
+use mcp_framework::session::SessionStore;
+use mcp_framework::transport::{LoopbackConnectError, LoopbackEndpoint, LoopbackIdentity};
 use rmcp::model::CallToolRequestParams;
 use tokio::sync::mpsc;
 
@@ -87,6 +90,24 @@ async fn test_registry() -> CapabilityRegistry {
         )
         .await;
     registry
+}
+
+/// A syntactically valid OAuth config — `validate()` rejects empty fields, and nothing here ever
+/// talks to a Keycloak.
+fn oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: "loopback-test".to_string(),
+        client_secret: None,
+        issuer_url: "https://keycloak.invalid/realms/test".to_string(),
+        redirect_url: "http://127.0.0.1:4000/oauth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+        token_mode: TokenMode::Passthrough,
+        // `Reject` parce que ces tests n'ont pas d'autorité à joindre : l'issuer est
+        // `.invalid`, et toute autre politique ferait partir une requête réseau depuis un
+        // test qui n'a rien à valider à distance.
+        unknown_token_validation: UnknownTokenValidation::Reject,
+        expected_audiences: vec![],
+    }
 }
 
 /// Hides `admin_` tools from sessions that present no token.
@@ -283,6 +304,98 @@ async fn an_identity_the_protocol_cannot_carry_is_refused() -> anyhow::Result<()
         matches!(err, mcp_framework::transport::LoopbackConnectError::InvalidIdentity(_)),
         "unexpected error: {err}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_opaque_bearer_is_refused_rather_than_stored() -> anyhow::Result<()> {
+    // In Opaque mode the bearer a caller holds is a UUID the framework issued; the real token
+    // lives in the HTTP transport's store, which this endpoint deliberately does not share.
+    // Storing the UUID would produce a `StoredToken` that reads as a credential to every filter
+    // and validator and authenticates nothing downstream — the worst of both.
+    let oauth = OAuthConfig {
+        token_mode: TokenMode::Opaque,
+        ..oauth_config()
+    };
+    let mut builder = McpAppBuilder::new("loopback-opaque")
+        .auth(AuthProvider::OAuth(oauth))
+        .server(InnerServer::new)
+        .capability_registry(test_registry().await)
+        .capability_filter(admin_filter());
+    let endpoint = builder.loopback();
+
+    let err = endpoint
+        .connect(LoopbackIdentity::new("thread-a").with_bearer_token("f81d4fae-opaque"))
+        .await
+        .expect_err("an opaque bearer should be refused");
+    assert!(
+        matches!(err, LoopbackConnectError::UnresolvableCredential { .. }),
+        "unexpected error: {err}"
+    );
+
+    // Retrying anonymously is the sanctioned fallback: it de-escalates, so it is always safe.
+    let anon = endpoint.connect(LoopbackIdentity::new("thread-a")).await?;
+    let names: Vec<String> = anon
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !names.contains(&"admin_reset".to_string()),
+        "the refused bearer still reached the filter: {names:?}"
+    );
+
+    anon.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_loopback_session_does_not_reach_a_network_client_state() -> anyhow::Result<()> {
+    // The session id of a loopback caller is chosen by that caller — in engine it comes from a
+    // request body. If the two transports shared a session store, naming a thread after an HTTP
+    // session id would be enough to read and write that client's state from outside.
+    let builder = McpAppBuilder::new("loopback-stores")
+        .with_sessions::<u32>()
+        .server(InnerServer::new)
+        .capability_registry(test_registry().await);
+    let http_store: SessionStore<u32> = SessionStore::new(Duration::from_secs(60));
+    let mut builder = builder.session_store(http_store.clone());
+    let endpoint = builder.loopback();
+
+    // What a network client left behind, under a session id an in-process caller can guess.
+    http_store.update("victim", |n| *n = 42).await;
+
+    let client = endpoint.connect(LoopbackIdentity::new("victim")).await?;
+    client.call_tool(CallToolRequestParams::new("ping")).await?;
+    client.cancel().await?;
+
+    assert_eq!(
+        http_store.get("victim").await,
+        Some(42),
+        "a loopback session reached into the network transport's session store"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuring_the_builder_after_loopback_is_refused_at_build() -> anyhow::Result<()> {
+    // The endpoint is a snapshot. A filter set afterwards would apply to network clients only —
+    // half the traffic, silently — so the builder refuses rather than letting the paths diverge.
+    let mut builder = McpAppBuilder::new("loopback-divergence")
+        .server(InnerServer::new)
+        .capability_registry(test_registry().await);
+    let _endpoint = builder.loopback();
+
+    let err = builder
+        .capability_filter(admin_filter())
+        .build()
+        // `.err()` rather than `expect_err`: a built `McpApp` is not `Debug`, and giving it that
+        // impl for the sake of one assertion would be the tail wagging the dog.
+        .err()
+        .expect("a filter set after `loopback()` should be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("capability_filter"), "the error must name the field: {msg}");
     Ok(())
 }
 
