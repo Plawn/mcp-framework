@@ -285,6 +285,10 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
             let tool_ctx = crate::capability::registry::ToolCallContext {
                 peer: context.peer.clone(),
                 meta: context.meta.clone(),
+                // Resolved again rather than reusing the audit copy above: that one only exists
+                // when a logger is configured, and a tool's behaviour must not depend on whether
+                // the application happens to be auditing.
+                session_id: resolve_session_id(&context.extensions).to_string(),
             };
             self.registry
                 .try_call_tool(&request.name, request.arguments.clone(), Some(tool_ctx))

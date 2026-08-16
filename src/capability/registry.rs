@@ -37,6 +37,14 @@ impl std::fmt::Display for NotifyKind {
 pub struct ToolCallContext {
     pub peer: Peer<RoleServer>,
     pub meta: RequestMetaObject,
+    /// Which session issued the call — the same value the audit record carries, resolved from the
+    /// request's `mcp-session-id` header (`DEFAULT_SESSION_ID` when there is none).
+    ///
+    /// A tool that keeps per-caller state, or that attributes what it does to whoever asked, needs
+    /// this and had no way to get it: the peer identifies the *connection*, not the session, and
+    /// a tool reaching around the framework to find out ends up inventing a second identity
+    /// mechanism. Handing it over costs one `String` on calls that already clone `Meta`.
+    pub session_id: String,
 }
 
 type StoredHandler = Arc<
