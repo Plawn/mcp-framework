@@ -261,6 +261,7 @@ where
                     token_store: token_store_clone.clone(),
                     session_store: session_store.clone(),
                     tool_call_logger: tool_call_logger.clone(),
+                    loopback_identity: None,
                 },
             ))
         },

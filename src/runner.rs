@@ -16,7 +16,7 @@ use crate::capability::{
 use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL};
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
-use crate::transport::{HttpAppConfig, run_http, run_stdio};
+use crate::transport::{HttpAppConfig, LoopbackEndpoint, run_http, run_stdio};
 
 /// Transport mode for the MCP server.
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -514,6 +514,50 @@ where
         Ok(())
     }
 
+    /// A factory for in-process clients of this application.
+    ///
+    /// An in-process caller — an agent loop, a scheduler — that reaches into the
+    /// [`CapabilityRegistry`] directly takes a path no network client takes, and so slips past
+    /// the capability filter, the access validator and the tool-call logger. A loopback client
+    /// takes the same path as everyone else, minus the socket.
+    ///
+    /// Does **not** consume the builder: the application can serve its network transport and
+    /// hand out loopback sessions at once. The registry and the session store are materialized
+    /// here if unset, so both sides share one of each rather than drifting apart.
+    ///
+    /// The endpoint keeps its own [`TokenStore`]: an in-process caller is not an HTTP session,
+    /// and its credentials have no reason to be readable from one.
+    pub fn loopback(&mut self) -> LoopbackEndpoint<T, F> {
+        let registry = self
+            .capability_registry
+            .get_or_insert_with(CapabilityRegistry::default)
+            .clone();
+        let ttl = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.session_ttl)
+            .unwrap_or(DEFAULT_SESSION_TTL);
+        let session_store = self
+            .session_store
+            .get_or_insert_with(|| SessionStore::new(ttl))
+            .clone();
+
+        let mut token_store = TokenStore::new();
+        if let Some(ref decoder) = self.claims_decoder {
+            token_store.claims_decoder = Some(decoder.clone());
+        }
+
+        LoopbackEndpoint::new(
+            self.server_factory.clone(),
+            registry,
+            self.capability_filter.clone(),
+            self.access_validator.clone(),
+            self.tool_call_logger.clone(),
+            token_store,
+            session_store,
+        )
+    }
+
     /// Build the [`McpApp`], consuming the builder.
     pub fn build(self) -> anyhow::Result<McpApp<F, T>> {
         self.validate()?;
@@ -737,6 +781,7 @@ where
             token_store,
             session_store,
             tool_call_logger: app.tool_call_logger,
+            loopback_identity: None,
         },
     );
     run_stdio(handler).await
