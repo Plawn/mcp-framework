@@ -195,6 +195,97 @@ async fn two_sessions_are_two_identities() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_session_reopened_without_a_token_loses_the_previous_rights() -> anyhow::Result<()> {
+    // The dangerous direction, and the one the filter test above does not cover.
+    //
+    // The token store is keyed by session id alone; a loopback token carries no `expires_at`, so
+    // nothing expires it; and `resolve_token` never reads the `Authorization` header. Storing on
+    // connect and doing nothing on a tokenless connect therefore made the *first* caller's rights
+    // permanent for that name — a later caller claiming no credentials would still be served as
+    // an admin, with an audit record indistinguishable from the anonymous call it claims to be.
+    let (endpoint, _rx) = endpoint_with_logger().await;
+
+    let authed = endpoint
+        .connect(LoopbackIdentity::new("shared").with_bearer_token("secret"))
+        .await?;
+    let names: Vec<String> = authed
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.contains(&"admin_reset".to_string()), "premise broken: {names:?}");
+    authed.cancel().await?;
+
+    let anon = endpoint.connect(LoopbackIdentity::new("shared")).await?;
+    let names: Vec<String> = anon
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !names.contains(&"admin_reset".to_string()),
+        "the session reopened without a token but inherited the previous caller's rights: {names:?}"
+    );
+
+    anon.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forgetting_a_session_drops_its_token() -> anyhow::Result<()> {
+    // A closed client ends the conversation but not the credential: nothing expires a loopback
+    // token, so the owner of a session's lifecycle has to be able to drop it.
+    let (endpoint, _rx) = endpoint_with_logger().await;
+
+    let authed = endpoint
+        .connect(LoopbackIdentity::new("job-1").with_bearer_token("secret"))
+        .await?;
+    authed.cancel().await?;
+    endpoint.forget_session("job-1").await;
+
+    // Re-connecting *with* a token is the case that would hide a leak, so the probe reconnects
+    // with one and checks the store was empty in between.
+    let after = endpoint.connect(LoopbackIdentity::new("job-1")).await?;
+    let names: Vec<String> = after
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.contains(&"admin_reset".to_string()), "token survived forget: {names:?}");
+
+    after.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_identity_the_protocol_cannot_carry_is_refused() -> anyhow::Result<()> {
+    // Both shapes below used to be *accepted* and silently become something else: an empty id is
+    // a valid header value that reaches a tool as a real caller name, and an id no header can
+    // hold dropped the whole parts object, merging that caller into the shared `"default"`
+    // session — where it could read another caller's state.
+    let (endpoint, _rx) = endpoint_with_logger().await;
+
+    let err = endpoint
+        .connect(LoopbackIdentity::new(""))
+        .await
+        .expect_err("an empty session id should be refused");
+    assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+
+    let err = endpoint
+        .connect(LoopbackIdentity::new("thread\nid"))
+        .await
+        .expect_err("a session id no header can hold should be refused");
+    assert!(
+        matches!(err, mcp_framework::transport::LoopbackConnectError::InvalidIdentity(_)),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
 // ── The filter ───────────────────────────────────────────────────────
 
 #[tokio::test]

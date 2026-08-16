@@ -82,11 +82,33 @@ impl LoopbackIdentity {
         &self.session_id
     }
 
-    /// Rebuild the request metadata a network client would have carried.
+    /// Refuse an identity the framework could not carry faithfully.
     ///
-    /// Called once per request rather than cached because `http::request::Parts` is not `Clone`.
-    /// The cost is one small header map next to a whole tool call.
-    pub(crate) fn to_parts(&self) -> Option<http::request::Parts> {
+    /// Checked at [`connect`](LoopbackEndpoint::connect) rather than tolerated at request time.
+    /// The two rejected shapes are the ones that would *silently* become another identity:
+    ///
+    /// - an **empty** session id is a perfectly valid header value, so nothing downstream would
+    ///   complain — [`resolve_session_id`](crate::resolve_session_id) would hand `""` to the
+    ///   session store as a real key and to a context-aware tool as a real caller;
+    /// - a session id or token that **no header can hold** (a newline, a NUL) makes the parts
+    ///   unbuildable, and a caller without parts falls back to
+    ///   [`DEFAULT_SESSION_ID`](crate::constants::DEFAULT_SESSION_ID) — several broken callers
+    ///   would then merge into one shared session, and read each other's state.
+    ///
+    /// Both are refusals rather than repairs: an in-process caller that cannot name itself has a
+    /// bug, and inventing a name for it is how the bug stops being visible.
+    fn validate(&self) -> Result<(), LoopbackConnectError> {
+        if self.session_id.is_empty() {
+            return Err(LoopbackConnectError::InvalidIdentity(
+                "the session id is empty".to_string(),
+            ));
+        }
+        self.build_parts()
+            .map(|_| ())
+            .map_err(|e| LoopbackConnectError::InvalidIdentity(e.to_string()))
+    }
+
+    fn build_parts(&self) -> Result<http::request::Parts, http::Error> {
         let mut builder = http::Request::builder()
             .method(http::Method::POST)
             .uri("/mcp")
@@ -94,21 +116,41 @@ impl LoopbackIdentity {
         if let Some(ref token) = self.bearer_token {
             builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
-        match builder.body(()) {
-            Ok(request) => Some(request.into_parts().0),
-            // Only reachable if a caller builds an identity out of bytes a header cannot hold.
-            // Dropping the parts degrades the caller to the default session rather than killing
-            // the connection, so the failure is loud in logs and harmless in flight.
+        Ok(builder.body(())?.into_parts().0)
+    }
+
+    /// Rebuild the request metadata a network client would have carried.
+    ///
+    /// Called once per request rather than cached because `http::request::Parts` is not `Clone`.
+    /// The cost is one small header map next to a whole tool call.
+    pub(crate) fn to_parts(&self) -> Option<http::request::Parts> {
+        match self.build_parts() {
+            Ok(parts) => Some(parts),
+            // Unreachable: `connect` refuses such an identity. Kept as a guard rather than an
+            // `expect` because the consequence of being wrong is a shared session, not a panic —
+            // and logged at `error` because reaching here means the refusal was bypassed.
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     session_id = %self.session_id,
                     error = %e,
-                    "loopback identity is not expressible as request headers — falling back to the default session"
+                    "loopback identity is not expressible as request headers — this call degrades to the default session"
                 );
                 None
             }
         }
     }
+}
+
+/// Why an in-process session could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum LoopbackConnectError {
+    /// The identity would not survive the trip through request headers. See
+    /// [`LoopbackIdentity::validate`].
+    #[error("loopback identity cannot be carried by the protocol: {0}")]
+    InvalidIdentity(String),
+    /// The MCP `initialize` handshake failed.
+    #[error(transparent)]
+    Initialize(#[from] rmcp::service::ClientInitializeError),
 }
 
 /// A factory for in-process clients of an [`McpApp`](crate::McpApp).
@@ -181,14 +223,26 @@ where
     pub async fn connect(
         &self,
         identity: LoopbackIdentity,
-    ) -> Result<RunningService<RoleClient, ()>, rmcp::service::ClientInitializeError> {
-        if let Some(ref token) = identity.bearer_token {
-            self.token_store
-                .store_token(
-                    identity.session_id.clone(),
-                    StoredToken::new(token.clone(), None, None),
-                )
-                .await;
+    ) -> Result<RunningService<RoleClient, ()>, LoopbackConnectError> {
+        identity.validate()?;
+
+        // The credentials presented at connect **replace** whatever the store held for this
+        // session id, in both directions. Storing on `Some` and doing nothing on `None` would
+        // make the token outlive its session: the store is keyed by session id alone, a loopback
+        // token has no `expires_at` so `purge_expired` never reclaims it, and `resolve_token`
+        // ignores the `Authorization` header entirely. A session re-opened *anonymously* under a
+        // name a privileged caller used earlier would silently inherit that caller's rights —
+        // exactly the quiet privilege the loopback exists to remove.
+        match identity.bearer_token {
+            Some(ref token) => {
+                self.token_store
+                    .store_token(
+                        identity.session_id.clone(),
+                        StoredToken::new(token.clone(), None, None),
+                    )
+                    .await;
+            }
+            None => self.token_store.remove_token(&identity.session_id).await,
         }
 
         let handler = DynamicHandler::new(
@@ -225,7 +279,23 @@ where
             }
         });
 
-        ().serve((to_server, from_server)).await
+        Ok(().serve((to_server, from_server)).await?)
+    }
+
+    /// Drop everything this endpoint holds for `session_id`.
+    ///
+    /// Closing the client ends the conversation but leaves its *state* behind: the token store
+    /// keeps a credential that nothing expires, and the session store keeps whatever the tools
+    /// wrote. Over a process lifetime that is a slow leak, and — worse — a credential waiting for
+    /// the next caller who happens to reuse the name. A caller that owns the lifecycle of its
+    /// sessions (a chat thread, a job) calls this when one ends.
+    ///
+    /// The session store is shared with the network transport by design, so a loopback caller
+    /// must not name a session after an HTTP one: forgetting it here would forget it there too.
+    pub async fn forget_session(&self, session_id: &str) {
+        self.token_store.remove_token(session_id).await;
+        // deliberate: le `Option<T>` rendu est l'état qu'on jette — c'est le but de l'appel.
+        let _ = self.session_store.remove(session_id).await;
     }
 }
 
@@ -240,15 +310,17 @@ pub trait DynLoopback: Send + Sync {
         identity: LoopbackIdentity,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        RunningService<RoleClient, ()>,
-                        rmcp::service::ClientInitializeError,
-                    >,
-                > + Send
+            dyn Future<Output = Result<RunningService<RoleClient, ()>, LoopbackConnectError>>
+                + Send
                 + '_,
         >,
     >;
+
+    /// See [`LoopbackEndpoint::forget_session`].
+    fn forget_session_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 impl<T, F, S> DynLoopback for LoopbackEndpoint<T, F>
@@ -262,15 +334,18 @@ where
         identity: LoopbackIdentity,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        RunningService<RoleClient, ()>,
-                        rmcp::service::ClientInitializeError,
-                    >,
-                > + Send
+            dyn Future<Output = Result<RunningService<RoleClient, ()>, LoopbackConnectError>>
+                + Send
                 + '_,
         >,
     > {
         Box::pin(self.connect(identity))
+    }
+
+    fn forget_session_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.forget_session(session_id))
     }
 }
