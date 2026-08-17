@@ -8,25 +8,26 @@ mod routes;
 mod store;
 mod templates;
 
-use axum::{routing::{get, post}, Router};
-use std::sync::Arc;
-use crate::constants::{OAUTH_REGISTER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_TOKEN_PATH};
-
-pub use config::{
-    AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, UnknownTokenValidation,
+use crate::constants::{OAUTH_AUTHORIZE_PATH, OAUTH_REGISTER_PATH, OAUTH_TOKEN_PATH};
+use axum::{
+    Router,
+    routing::{get, post},
 };
+use std::sync::Arc;
+
+pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, UnknownTokenValidation};
 pub use jwks::{JwksRejection, JwksValidator, ValidatedJwt};
 pub use metadata::{
-    authorization_server_metadata_handler, protected_resource_metadata_handler, WellKnownState,
+    WellKnownState, authorization_server_metadata_handler, protected_resource_metadata_handler,
 };
-pub use routes::{oauth_router, OAuthState};
+pub use routes::{OAuthState, oauth_router};
 pub use store::{ClaimsDecoderFn, RefreshConfig, StoredToken, TokenStore};
 
 // Re-export middleware
 #[allow(unused_imports)]
 pub use middleware::{
-    basic_auth_middleware, bearer_auth_middleware, strip_framework_session_header,
-    AuthMiddlewareState, BasicAuthMiddlewareState, BearerToken,
+    AuthMiddlewareState, BasicAuthMiddlewareState, BearerToken, basic_auth_middleware,
+    bearer_auth_middleware, strip_framework_session_header,
 };
 
 /// State for MCP OAuth endpoints

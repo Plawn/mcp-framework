@@ -284,9 +284,7 @@ impl JwksValidator {
             let cache = self.cache.read().await;
             if !cache.cooldown_elapsed() {
                 return match &cache.last_error {
-                    Some(e) if cache.keys.is_empty() => {
-                        Err(JwksRejection::Unavailable(e.clone()))
-                    }
+                    Some(e) if cache.keys.is_empty() => Err(JwksRejection::Unavailable(e.clone())),
                     _ => Ok(()),
                 };
             }

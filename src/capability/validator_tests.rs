@@ -79,8 +79,7 @@ async fn tool_call_validator_closure() {
         AccessDecision::Allow
     );
     assert_eq!(
-        v.validate_prompt_access("anything", None, None, "s1")
-            .await,
+        v.validate_prompt_access("anything", None, None, "s1").await,
         AccessDecision::Allow
     );
 }

@@ -10,11 +10,13 @@ use std::any::Any;
 
 use crate::audit::ToolCallLogger;
 use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
-use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
-use crate::persistence::PersistenceBackend;
+use crate::capability::{
+    AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
+};
 use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL};
+use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
-use crate::transport::{run_http, run_stdio, HttpAppConfig};
+use crate::transport::{HttpAppConfig, run_http, run_stdio};
 
 /// Transport mode for the MCP server.
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -242,9 +244,7 @@ impl<F> McpAppBuilder<(), F> {
     ///     .run()
     ///     .await?;
     /// ```
-    pub fn with_sessions<T: SessionData>(
-        self,
-    ) -> McpAppBuilder<T, F> {
+    pub fn with_sessions<T: SessionData>(self) -> McpAppBuilder<T, F> {
         McpAppBuilder {
             name: self.name,
             auth: self.auth,
@@ -476,21 +476,18 @@ where
         // Validate bind_addr is parseable if settings are provided
         if let Some(ref s) = self.settings {
             s.bind_addr.parse::<std::net::SocketAddr>().map_err(|e| {
-                anyhow::anyhow!(
-                    "McpAppBuilder: invalid bind_addr '{}': {}",
-                    s.bind_addr,
-                    e
-                )
+                anyhow::anyhow!("McpAppBuilder: invalid bind_addr '{}': {}", s.bind_addr, e)
             })?;
 
             // Validate session_ttl >= 1 second
             if let Some(ttl) = s.session_ttl
-                && ttl < Duration::from_secs(1) {
-                    anyhow::bail!(
-                        "McpAppBuilder: session_ttl must be at least 1 second, got {:?}",
-                        ttl
-                    );
-                }
+                && ttl < Duration::from_secs(1)
+            {
+                anyhow::bail!(
+                    "McpAppBuilder: session_ttl must be at least 1 second, got {:?}",
+                    ttl
+                );
+            }
         }
 
         // Validate OAuth config fields are non-empty
@@ -508,11 +505,11 @@ where
 
         // Warn if auth != None in stdio mode (auth is ignored there)
         if let Some(ref s) = self.settings
-            && s.transport == TransportMode::Stdio && !matches!(self.auth, AuthProvider::None) {
-                tracing::warn!(
-                    "Auth provider is set but transport is Stdio — auth will be ignored"
-                );
-            }
+            && s.transport == TransportMode::Stdio
+            && !matches!(self.auth, AuthProvider::None)
+        {
+            tracing::warn!("Auth provider is set but transport is Stdio — auth will be ignored");
+        }
 
         Ok(())
     }
@@ -566,8 +563,7 @@ struct CliArgs {
 fn init_tracing(level: &str) {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .try_init()
@@ -619,8 +615,8 @@ fn resolve_http_addrs(settings: Option<&Settings>) -> (String, String) {
         None => {
             let bind_addr =
                 std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
-            let public_url = std::env::var("PUBLIC_URL")
-                .unwrap_or_else(|_| format!("http://{}", bind_addr));
+            let public_url =
+                std::env::var("PUBLIC_URL").unwrap_or_else(|_| format!("http://{}", bind_addr));
             (bind_addr, public_url)
         }
     }
@@ -652,7 +648,10 @@ where
 
     if let Some(ref backend) = persistence {
         session_store.set_persistence(backend.clone());
-        session_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+        session_store
+            .load_persisted()
+            .await
+            .map_err(anyhow::Error::from_boxed)?;
     }
 
     run_http(HttpAppConfig {
@@ -687,9 +686,15 @@ where
     let mut session_store = resolve_session_store(&app.session_store, &app.settings);
     if let Some(ref backend) = app.persistence {
         token_store.set_persistence(backend.clone());
-        token_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+        token_store
+            .load_persisted()
+            .await
+            .map_err(anyhow::Error::from_boxed)?;
         session_store.set_persistence(backend.clone());
-        session_store.load_persisted().await.map_err(anyhow::Error::from_boxed)?;
+        session_store
+            .load_persisted()
+            .await
+            .map_err(anyhow::Error::from_boxed)?;
     }
 
     if let Some(ref env_var) = app.stdio_token_env {
@@ -718,7 +723,10 @@ where
     let mut registry = app.capability_registry.unwrap_or_default();
     if let Some(ref backend) = app.persistence {
         registry.set_persistence(backend.clone());
-        registry.load_persisted_versions().await.map_err(anyhow::Error::from_boxed)?;
+        registry
+            .load_persisted_versions()
+            .await
+            .map_err(anyhow::Error::from_boxed)?;
     }
     let handler = DynamicHandler::new(
         server,
@@ -751,9 +759,7 @@ where
         let transport = settings.transport.clone();
         setup_tracing_from_settings(settings);
         match transport {
-            TransportMode::Http => {
-                run_http_mode(app).await
-            }
+            TransportMode::Http => run_http_mode(app).await,
             TransportMode::Stdio => run_stdio_mode(app).await,
         }
     } else {
@@ -761,9 +767,7 @@ where
         let args = CliArgs::parse();
         setup_tracing_from_cli(&args);
         match args.transport {
-            TransportMode::Http => {
-                run_http_mode(app).await
-            }
+            TransportMode::Http => run_http_mode(app).await,
             TransportMode::Stdio => run_stdio_mode(app).await,
         }
     }

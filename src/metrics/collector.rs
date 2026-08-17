@@ -51,7 +51,9 @@ enum Outcome {
 impl Outcome {
     fn classify(outcome: &ToolCallOutcome) -> Self {
         match outcome {
-            ToolCallOutcome::Success { is_error: false, .. } => Outcome::Success,
+            ToolCallOutcome::Success {
+                is_error: false, ..
+            } => Outcome::Success,
             ToolCallOutcome::Success { is_error: true, .. } => Outcome::ToolError,
             ToolCallOutcome::McpError { .. } => Outcome::McpError,
         }
@@ -173,7 +175,9 @@ impl MetricsCollector {
             let known = inner.sessions.contains_key(session);
             if known || inner.sessions.len() < self.config.max_sessions {
                 if !known {
-                    inner.sessions.insert(session.clone(), SessionStats::default());
+                    inner
+                        .sessions
+                        .insert(session.clone(), SessionStats::default());
                 }
                 if let Some(stats) = inner.sessions.get_mut(session) {
                     match outcome {
@@ -239,7 +243,11 @@ impl MetricsCollector {
                 }
             })
             .collect();
-        sessions.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.session_id.cmp(&b.session_id)));
+        sessions.sort_by(|a, b| {
+            b.calls
+                .cmp(&a.calls)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
 
         let total_calls = tools.iter().map(|t| t.calls).sum();
 
@@ -328,7 +336,9 @@ impl ToolCallLogger for MetricsCollector {
 
 /// Escape a Prometheus label value (`\`, `"`, and newline).
 fn escape_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Format a float without a trailing `.0` for integral values, so bucket bounds

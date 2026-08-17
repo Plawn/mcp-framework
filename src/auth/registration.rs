@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::McpOAuthState;
-use crate::constants::{MCP_CLIENT_ID_PREFIX, CONTENT_TYPE_JSON};
+use crate::constants::{CONTENT_TYPE_JSON, MCP_CLIENT_ID_PREFIX};
 use crate::http_util::HttpError;
 
 /// Dynamic Client Registration Request (RFC 7591)
@@ -52,7 +52,10 @@ fn build_fallback_registration(request: &ClientRegistrationRequest) -> ClientReg
         client_secret: None,
         client_name: request.client_name.clone(),
         redirect_uris: request.redirect_uris.clone(),
-        grant_types: vec!["authorization_code".to_string(), "refresh_token".to_string()],
+        grant_types: vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ],
         response_types: vec!["code".to_string()],
         token_endpoint_auth_method: "none".to_string(),
     }
@@ -129,7 +132,9 @@ pub async fn register_handler(
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse Keycloak DCR response: {}", e);
-                        Err(HttpError::server_error("Failed to parse registration response"))
+                        Err(HttpError::server_error(
+                            "Failed to parse registration response",
+                        ))
                     }
                 }
             } else {

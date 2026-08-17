@@ -102,7 +102,9 @@ impl DebugServer {
         let output = GreetOutput {
             message: format!("hello {}", params.name),
         };
-        Ok(CallToolResult::structured(serde_json::to_value(&output).unwrap()))
+        Ok(CallToolResult::structured(
+            serde_json::to_value(&output).unwrap(),
+        ))
     }
 
     #[tool(
@@ -140,7 +142,9 @@ impl DebugServer {
                 v
             })
             .collect();
-        Ok(CallToolResult::structured(serde_json::json!({ "projects": items })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "projects": items }),
+        ))
     }
 
     #[tool(
@@ -155,7 +159,9 @@ impl DebugServer {
         let output = PingOutput {
             message: "pong".to_string(),
         };
-        Ok(CallToolResult::structured(serde_json::to_value(&output).unwrap()))
+        Ok(CallToolResult::structured(
+            serde_json::to_value(&output).unwrap(),
+        ))
     }
 }
 

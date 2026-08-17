@@ -598,7 +598,9 @@ impl TokenStore {
                     if let JwksRejection::Unavailable(why) = &rejection {
                         jwks_unavailable = Some(why.clone());
                     }
-                    tracing::debug!("JWKS could not settle this bearer ({rejection}); asking the authorization server");
+                    tracing::debug!(
+                        "JWKS could not settle this bearer ({rejection}); asking the authorization server"
+                    );
                 }
             }
         }
@@ -624,12 +626,12 @@ impl TokenStore {
             } else {
                 BearerRejection::IntrospectionNotPermitted
             }),
-            TokenIntrospection::Unavailable(why) => Err(BearerRejection::IssuerUnreachable(
-                match jwks_unavailable {
+            TokenIntrospection::Unavailable(why) => {
+                Err(BearerRejection::IssuerUnreachable(match jwks_unavailable {
                     Some(jwks_why) => format!("JWKS: {jwks_why}; introspection: {why}"),
                     None => why,
-                },
-            )),
+                }))
+            }
         }
     }
 
@@ -687,7 +689,10 @@ impl TokenStore {
             if status == reqwest::StatusCode::FORBIDDEN
                 || status == reqwest::StatusCode::UNAUTHORIZED
             {
-                if !self.introspection_not_permitted.swap(true, Ordering::Relaxed) {
+                if !self
+                    .introspection_not_permitted
+                    .swap(true, Ordering::Relaxed)
+                {
                     tracing::warn!(
                         status = %status,
                         client_id = %config.client_id,

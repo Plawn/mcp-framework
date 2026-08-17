@@ -32,9 +32,11 @@ impl ServerHandler for SessionServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![
-            Tool::new("stats", "Show how many times you've called tools in this session", serde_json::Map::new()),
-        ]))
+        Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            "stats",
+            "Show how many times you've called tools in this session",
+            serde_json::Map::new(),
+        )]))
     }
 
     async fn call_tool(

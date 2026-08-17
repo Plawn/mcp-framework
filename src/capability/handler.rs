@@ -1,17 +1,17 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext};
-use rmcp::ErrorData as McpError;
 
 use crate::audit::{ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource};
 use crate::auth::TokenStore;
 use crate::newtypes::{SessionId, ToolName};
-use crate::session::{SessionData, resolve_session_id, SessionStore};
+use crate::session::{SessionData, SessionStore, resolve_session_id};
 
-use super::filter::{resolve_query_filter, resolve_token, CapabilityFilter};
+use super::filter::{CapabilityFilter, resolve_query_filter, resolve_token};
 use super::registry::CapabilityRegistry;
 use super::sanitize::sanitize_tool_schemas;
 use super::validator::{AccessDecision, AccessValidator};
@@ -95,9 +95,7 @@ impl<S, T: SessionData> DynamicHandler<S, T> {
     }
 }
 
-impl<S: ServerHandler, T: SessionData> ServerHandler
-    for DynamicHandler<S, T>
-{
+impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
     // ── initialize: capture the peer ─────────────────────────────────
 
     async fn initialize(
@@ -252,9 +250,21 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         }
 
         let has_logger = self.context.tool_call_logger.is_some();
-        let tool_name = if has_logger { Some(ToolName::new(request.name.as_ref())) } else { None };
-        let session_id = if has_logger { Some(SessionId::new(resolve_session_id(&context.extensions))) } else { None };
-        let start = if has_logger { Some((SystemTime::now(), Instant::now())) } else { None };
+        let tool_name = if has_logger {
+            Some(ToolName::new(request.name.as_ref()))
+        } else {
+            None
+        };
+        let session_id = if has_logger {
+            Some(SessionId::new(resolve_session_id(&context.extensions)))
+        } else {
+            None
+        };
+        let start = if has_logger {
+            Some((SystemTime::now(), Instant::now()))
+        } else {
+            None
+        };
 
         // Dispatch: try registry first, fall back to inner.
         // Only construct ToolCallContext (which clones Meta) when the tool
@@ -278,7 +288,11 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
                 request.arguments,
             )
         } else {
-            let audit_args = if has_logger { request.arguments.clone() } else { None };
+            let audit_args = if has_logger {
+                request.arguments.clone()
+            } else {
+                None
+            };
             (
                 self.inner.call_tool(request, context).await,
                 ToolCallSource::Inner,
@@ -286,9 +300,17 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
             )
         };
 
-        if let (Some(logger), Some(tool_name), Some(session_id), Some((start_wall, start_instant))) =
-            (self.context.tool_call_logger.clone(), tool_name, session_id, start)
-        {
+        if let (
+            Some(logger),
+            Some(tool_name),
+            Some(session_id),
+            Some((start_wall, start_instant)),
+        ) = (
+            self.context.tool_call_logger.clone(),
+            tool_name,
+            session_id,
+            start,
+        ) {
             let duration = start_instant.elapsed();
             let outcome = match &result {
                 Ok(CallToolResponse::Complete(call_result)) => ToolCallOutcome::Success {
@@ -329,7 +351,9 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
             tokio::spawn(async move {
                 if let Err(e) = tokio::spawn(async move {
                     logger.log(record).await;
-                }).await {
+                })
+                .await
+                {
                     tracing::error!("audit logger panicked: {e}");
                 }
             });
@@ -385,11 +409,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
             let token = resolve_token(&context.extensions, &self.context.token_store).await;
             let session_id = resolve_session_id(&context.extensions);
             let decision = validator
-                .validate_resource_access(
-                    &request.uri,
-                    token.as_ref(),
-                    session_id,
-                )
+                .validate_resource_access(&request.uri, token.as_ref(), session_id)
                 .await;
             if let AccessDecision::Deny(reason) = decision {
                 return Err(McpError::invalid_request(
@@ -516,10 +536,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler
         self.inner.on_progress(notification, context)
     }
 
-    async fn on_initialized(
-        &self,
-        mut context: NotificationContext<RoleServer>,
-    ) {
+    async fn on_initialized(&self, mut context: NotificationContext<RoleServer>) {
         self.enrich_extensions(&mut context.extensions);
         let session_id = resolve_session_id(&context.extensions);
         self.registry

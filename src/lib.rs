@@ -93,16 +93,16 @@ pub use audit::{
     CompositeLogger, NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource,
     TracingLogger,
 };
-#[cfg(feature = "metrics")]
-pub use metrics::{MetricsCollector, MetricsConfig, MetricsSnapshot, SessionMetrics, ToolMetrics};
-pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
-#[cfg(feature = "redis")]
-pub use persistence::RedisBackend;
 pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
 };
-pub use runner::{run, LogLevel, McpApp, McpAppBuilder, Settings, TransportMode};
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsCollector, MetricsConfig, MetricsSnapshot, SessionMetrics, ToolMetrics};
 pub use newtypes::{SessionId, ToolName};
-pub use session::{resolve_session_id, RequestContextExt, Session, SessionData, SessionStore};
+#[cfg(feature = "redis")]
+pub use persistence::RedisBackend;
+pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
+pub use runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
+pub use session::{RequestContextExt, Session, SessionData, SessionStore, resolve_session_id};

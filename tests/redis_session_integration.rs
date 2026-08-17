@@ -13,10 +13,10 @@ use std::time::Duration;
 use mcp_framework::auth::AuthProvider;
 use mcp_framework::prelude::*;
 use mcp_framework::session::{RequestContextExt, SessionStore};
-use mcp_framework::transport::{build_app, HttpAppConfig};
+use mcp_framework::transport::{HttpAppConfig, build_app};
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{tool, ServiceExt};
+use rmcp::{ServiceExt, tool};
 
 // ── Session data type ──────────────────────────────────────────────
 
@@ -92,9 +92,8 @@ async fn redis_available() -> bool {
 /// (mirrors the production pattern — no KEYS scan).
 async fn cleanup_redis_prefix(prefix: &str) {
     let client = redis::Client::open(redis_url().as_str()).unwrap();
-    let mut conn: redis::aio::ConnectionManager = redis::aio::ConnectionManager::new(client)
-        .await
-        .unwrap();
+    let mut conn: redis::aio::ConnectionManager =
+        redis::aio::ConnectionManager::new(client).await.unwrap();
     let mut to_del = Vec::new();
     for ns in ["sessions", "tokens"] {
         let idx_key = format!("{prefix}:{ns}:__idx__");
@@ -118,9 +117,7 @@ async fn cleanup_redis_prefix(prefix: &str) {
 }
 
 /// Load a fresh SessionStore from Redis and return all session entries.
-async fn load_sessions_from_redis(
-    prefix: &str,
-) -> Vec<(String, CounterSession)> {
+async fn load_sessions_from_redis(prefix: &str) -> Vec<(String, CounterSession)> {
     let redis = Arc::new(
         RedisBackend::connect(&redis_url())
             .await
@@ -128,8 +125,8 @@ async fn load_sessions_from_redis(
             .with_prefix(prefix),
     );
     let backend: Arc<dyn PersistenceBackend> = redis.clone();
-    let store = SessionStore::<CounterSession>::new(Duration::from_secs(300))
-        .with_persistence(redis);
+    let store =
+        SessionStore::<CounterSession>::new(Duration::from_secs(300)).with_persistence(redis);
     store.load_persisted().await.unwrap();
 
     let keys = backend.keys("sessions").await.unwrap();
@@ -153,8 +150,7 @@ struct TestServer {
 /// Calls `load_persisted()` on the session store before starting the server,
 /// mirroring what `run_http_mode` does in production.
 async fn start_server(redis: Arc<RedisBackend>) -> TestServer {
-    let mut session_store =
-        SessionStore::<CounterSession>::new(Duration::from_secs(300));
+    let mut session_store = SessionStore::<CounterSession>::new(Duration::from_secs(300));
     session_store.set_persistence(redis.clone());
     session_store.load_persisted().await.unwrap();
 
@@ -270,10 +266,7 @@ async fn session_persists_across_server_restart() -> anyhow::Result<()> {
 
     let entries = load_sessions_from_redis(&prefix).await;
     assert_eq!(entries.len(), 1, "one session should be in Redis");
-    assert_eq!(
-        entries[0].1.counter, 2,
-        "restored counter should be 2"
-    );
+    assert_eq!(entries[0].1.counter, 2, "restored counter should be 2");
 
     // ── Server 2 (simulated restart) ──────────────────────────────
 

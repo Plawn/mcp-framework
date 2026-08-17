@@ -3,9 +3,9 @@
 //! Each test builds an example binary, spawns it as a child process with
 //! `--transport stdio`, and communicates over stdin/stdout using an rmcp client.
 
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
 
 /// Spawn an example binary with `--transport stdio`.
 fn spawn_example(example: &str) -> anyhow::Result<TokioChildProcess> {
@@ -23,11 +23,12 @@ async fn minimal_server_initializes() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let info = client.peer().peer_info().expect("server info");
-    assert!(info
-        .instructions
-        .as_deref()
-        .unwrap_or("")
-        .contains("minimal"));
+    assert!(
+        info.instructions
+            .as_deref()
+            .unwrap_or("")
+            .contains("minimal")
+    );
 
     client.cancel().await?;
     Ok(())
@@ -43,8 +44,14 @@ async fn list_tools_returns_registered_tools() -> anyhow::Result<()> {
     let tools = client.list_all_tools().await?;
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
-    assert!(names.contains(&"greet"), "expected 'greet' tool, got: {names:?}");
-    assert!(names.contains(&"add"), "expected 'add' tool, got: {names:?}");
+    assert!(
+        names.contains(&"greet"),
+        "expected 'greet' tool, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"add"),
+        "expected 'add' tool, got: {names:?}"
+    );
 
     client.cancel().await?;
     Ok(())
@@ -56,12 +63,14 @@ async fn call_greet_tool() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("greet").with_arguments(
-            serde_json::json!({ "name": "World" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("greet").with_arguments(
+                serde_json::json!({ "name": "World" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
         .await?;
 
     let text = result
@@ -86,12 +95,14 @@ async fn call_add_tool() -> anyhow::Result<()> {
     let client = ().serve(transport).await?;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("add").with_arguments(
-            serde_json::json!({ "a": 2.5, "b": 3.5 })
-                .as_object()
-                .unwrap()
-                .clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("add").with_arguments(
+                serde_json::json!({ "a": 2.5, "b": 3.5 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
         .await?;
 
     let text = result
@@ -150,9 +161,7 @@ async fn call_dynamic_ping_tool() -> anyhow::Result<()> {
     let transport = spawn_example("dynamic_capabilities")?;
     let client = ().serve(transport).await?;
 
-    let result = client
-        .call_tool(CallToolRequestParams::new("ping"))
-        .await?;
+    let result = client.call_tool(CallToolRequestParams::new("ping")).await?;
 
     let text = result
         .content

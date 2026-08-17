@@ -60,8 +60,8 @@ async fn oauth() -> AuthProvider {
 }
 
 fn expired_jwt() -> String {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
     format!("{header}.{payload}.invalid-signature")
 }
@@ -93,7 +93,11 @@ fn requests() -> [serde_json::Value; 3] {
     ]
 }
 
-async fn post_mcp(app: &Router, bearer: &str, body: &serde_json::Value) -> axum::response::Response {
+async fn post_mcp(
+    app: &Router,
+    bearer: &str,
+    body: &serde_json::Value,
+) -> axum::response::Response {
     app.clone()
         .oneshot(
             Request::post("/mcp")

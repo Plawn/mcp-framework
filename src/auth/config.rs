@@ -1,13 +1,13 @@
-use oauth2::{
-    AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl,
-    basic::BasicClient,
-};
+use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
 
 // Type alias for the configured client
 pub type ConfiguredClient = oauth2::Client<
     oauth2::StandardErrorResponse<oauth2::basic::BasicErrorResponseType>,
     oauth2::StandardTokenResponse<oauth2::EmptyExtraTokenFields, oauth2::basic::BasicTokenType>,
-    oauth2::StandardTokenIntrospectionResponse<oauth2::EmptyExtraTokenFields, oauth2::basic::BasicTokenType>,
+    oauth2::StandardTokenIntrospectionResponse<
+        oauth2::EmptyExtraTokenFields,
+        oauth2::basic::BasicTokenType,
+    >,
     oauth2::StandardRevocableToken,
     oauth2::StandardErrorResponse<oauth2::RevocationErrorResponseType>,
     oauth2::EndpointSet,
@@ -48,13 +48,12 @@ impl OAuthConfig {
     /// - OAUTH_UNKNOWN_TOKEN_VALIDATION (see [`UnknownTokenValidation`])
     /// - OAUTH_EXPECTED_AUDIENCE (comma-separated, defaults to unconstrained)
     pub fn from_env() -> Result<Self, String> {
-        let client_id = std::env::var("OAUTH_CLIENT_ID")
-            .map_err(|_| "OAUTH_CLIENT_ID not set")?;
+        let client_id = std::env::var("OAUTH_CLIENT_ID").map_err(|_| "OAUTH_CLIENT_ID not set")?;
         let client_secret = std::env::var("OAUTH_CLIENT_SECRET").ok();
-        let issuer_url = std::env::var("OAUTH_ISSUER_URL")
-            .map_err(|_| "OAUTH_ISSUER_URL not set")?;
-        let redirect_url = std::env::var("OAUTH_REDIRECT_URL")
-            .map_err(|_| "OAUTH_REDIRECT_URL not set")?;
+        let issuer_url =
+            std::env::var("OAUTH_ISSUER_URL").map_err(|_| "OAUTH_ISSUER_URL not set")?;
+        let redirect_url =
+            std::env::var("OAUTH_REDIRECT_URL").map_err(|_| "OAUTH_REDIRECT_URL not set")?;
 
         let scopes = std::env::var("OAUTH_SCOPES")
             .unwrap_or_else(|_| "openid,profile,email".to_string())
@@ -101,7 +100,9 @@ impl OAuthConfig {
         let mut client = BasicClient::new(ClientId::new(self.client_id.clone()))
             .set_auth_uri(AuthUrl::new(auth_url).map_err(|e| e.to_string())?)
             .set_token_uri(TokenUrl::new(token_url).map_err(|e| e.to_string())?)
-            .set_redirect_uri(RedirectUrl::new(self.redirect_url.clone()).map_err(|e| e.to_string())?);
+            .set_redirect_uri(
+                RedirectUrl::new(self.redirect_url.clone()).map_err(|e| e.to_string())?,
+            );
 
         if let Some(ref secret) = self.client_secret {
             client = client.set_client_secret(ClientSecret::new(secret.clone()));
@@ -125,10 +126,10 @@ impl BasicAuthConfig {
     /// - BASIC_AUTH_USERNAME
     /// - BASIC_AUTH_PASSWORD
     pub fn from_env() -> Result<Self, String> {
-        let username = std::env::var("BASIC_AUTH_USERNAME")
-            .map_err(|_| "BASIC_AUTH_USERNAME not set")?;
-        let password = std::env::var("BASIC_AUTH_PASSWORD")
-            .map_err(|_| "BASIC_AUTH_PASSWORD not set")?;
+        let username =
+            std::env::var("BASIC_AUTH_USERNAME").map_err(|_| "BASIC_AUTH_USERNAME not set")?;
+        let password =
+            std::env::var("BASIC_AUTH_PASSWORD").map_err(|_| "BASIC_AUTH_PASSWORD not set")?;
         Ok(Self { username, password })
     }
 }

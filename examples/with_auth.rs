@@ -27,9 +27,11 @@ impl ServerHandler for AuthServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![
-            Tool::new("whoami", "Returns info about the current authenticated session", serde_json::Map::new()),
-        ]))
+        Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            "whoami",
+            "Returns info about the current authenticated session",
+            serde_json::Map::new(),
+        )]))
     }
 
     async fn call_tool(
@@ -41,10 +43,7 @@ impl ServerHandler for AuthServer {
             let session_id = context.session_id();
             let token_store = context.token_store();
             let has_token = token_store.has_valid_token(session_id).await;
-            let msg = format!(
-                "Session: {}\nAuthenticated: {}",
-                session_id, has_token
-            );
+            let msg = format!("Session: {}\nAuthenticated: {}", session_id, has_token);
             Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
         } else {
             Err(McpError::invalid_params("unknown tool", None))
@@ -56,10 +55,8 @@ impl ServerHandler for AuthServer {
 async fn main() -> anyhow::Result<()> {
     McpAppBuilder::new("auth-example")
         .auth(AuthProvider::Basic(BasicAuthConfig {
-            username: std::env::var("BASIC_AUTH_USERNAME")
-                .unwrap_or_else(|_| "admin".to_string()),
-            password: std::env::var("BASIC_AUTH_PASSWORD")
-                .unwrap_or_else(|_| "secret".to_string()),
+            username: std::env::var("BASIC_AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string()),
+            password: std::env::var("BASIC_AUTH_PASSWORD").unwrap_or_else(|_| "secret".to_string()),
         }))
         .server(|| AuthServer)
         .run()

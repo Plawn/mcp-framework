@@ -6,18 +6,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use base64::Engine as _;
 use mcp_framework::auth::{
-    bearer_auth_middleware, AuthMiddlewareState, BearerToken, RefreshConfig, StoredToken,
-    TokenMode, TokenStore,
+    AuthMiddlewareState, BearerToken, RefreshConfig, StoredToken, TokenMode, TokenStore,
+    bearer_auth_middleware,
 };
 
 fn make_jwt(exp_secs_from_now: i64) -> String {
@@ -26,8 +26,8 @@ fn make_jwt(exp_secs_from_now: i64) -> String {
         .unwrap()
         .as_secs() as i64;
     let exp = (now + exp_secs_from_now).max(0) as u64;
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(format!(r#"{{"exp":{}}}"#, exp).as_bytes());
     format!("{}.{}.sig", header, payload_b64)
@@ -68,9 +68,13 @@ async fn echo_bearer(request: Request<Body>) -> Response {
 }
 
 async fn spawn_app(state: Arc<AuthMiddlewareState>) -> std::net::SocketAddr {
-    let app = Router::new()
-        .route("/whoami", get(echo_bearer))
-        .layer(middleware::from_fn_with_state(state, bearer_auth_middleware));
+    let app =
+        Router::new()
+            .route("/whoami", get(echo_bearer))
+            .layer(middleware::from_fn_with_state(
+                state,
+                bearer_auth_middleware,
+            ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

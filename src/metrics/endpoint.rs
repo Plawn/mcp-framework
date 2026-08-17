@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{Query, State},
     http::header,
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use serde::Deserialize;
 
@@ -43,10 +43,6 @@ async fn serve_metrics(
         axum::Json(snapshot).into_response()
     } else {
         let body = collector.render_prometheus();
-        (
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-            body,
-        )
-            .into_response()
+        ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
     }
 }
