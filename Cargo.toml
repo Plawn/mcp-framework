@@ -1,6 +1,6 @@
 [package]
 name = "mcp-framework"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "An opinionated framework for building MCP servers with HTTP/stdio transport and OAuth/Basic auth"
 license = "MIT"
