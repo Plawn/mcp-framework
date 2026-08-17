@@ -1,6 +1,6 @@
 [package]
 name = "mcp-framework"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "An opinionated framework for building MCP servers with HTTP/stdio transport and OAuth/Basic auth"
 license = "MIT"
@@ -26,6 +26,9 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 urlencoding = "2"
 base64 = "0.22"
 sha2 = "0.10"
+# Local (JWKS) validation of bearer tokens the OAuth proxy did not issue.
+# `rust_crypto` is the pure-Rust provider — no C toolchain needed at build time.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
@@ -46,6 +49,8 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 # Build signed-shaped JWTs (payload only, no verification) for auth tests.
 base64 = "0.22"
+# Mint genuinely signed JWTs against a mock JWKS in the bearer-validation tests.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 [profile.release]
 strip = true

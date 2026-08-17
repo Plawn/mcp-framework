@@ -1,21 +1,24 @@
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
-};
+use axum::{Router, routing::get};
 use rmcp::ServerHandler;
-
-use crate::auth::{
-    authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
-    mcp_oauth_router, oauth_router, protected_resource_metadata_handler,
-    strip_framework_session_header, AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState,
-    McpOAuthState, OAuthConfig, OAuthState, RefreshConfig, TokenStore, WellKnownState,
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+
 use crate::audit::ToolCallLogger;
-use crate::capability::{AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
-use crate::constants::{HTTP_REQUEST_TIMEOUT, CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, OAUTH_MOUNT};
+use crate::auth::{
+    AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig,
+    OAuthState, RefreshConfig, TokenStore, WellKnownState, authorization_server_metadata_handler,
+    basic_auth_middleware, bearer_auth_middleware, mcp_oauth_router, oauth_router,
+    protected_resource_metadata_handler, strip_framework_session_header,
+};
+use crate::capability::{
+    AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
+};
+use crate::constants::{
+    CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, HTTP_REQUEST_TIMEOUT, OAUTH_MOUNT,
+};
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
 
@@ -175,7 +178,12 @@ where
                     oauth_config.issuer_url.trim_end_matches('/')
                 ),
             };
-            TokenStore::with_refresh_config(refresh_config)
+            let mut store = TokenStore::with_refresh_config(refresh_config);
+            // Lets a bearer the proxy never issued be validated against the
+            // issuer's published keys — the only path open when the configured
+            // OAuth client is public and Keycloak refuses introspection to it.
+            store.configure_unknown_bearer_validation(oauth_config);
+            store
         }
         _ => TokenStore::new(),
     };
@@ -224,21 +232,18 @@ where
     //
     // rmcp 1.5 validates the Host header against an allowlist (default: loopback
     // only). For public deployments we derive the allowed host from PUBLIC_URL.
-    let mut allowed_hosts: Vec<String> = vec![
-        "localhost".into(),
-        "127.0.0.1".into(),
-        "::1".into(),
-    ];
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
     if let Ok(url) = url::Url::parse(&config.public_url)
-        && let Some(host) = url.host_str() {
-            let authority = match url.port() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_string(),
-            };
-            if !allowed_hosts.contains(&authority) {
-                allowed_hosts.push(authority);
-            }
+        && let Some(host) = url.host_str()
+    {
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        if !allowed_hosts.contains(&authority) {
+            allowed_hosts.push(authority);
         }
+    }
     tracing::info!(allowed_hosts = ?allowed_hosts, "MCP host validation configured");
     let mcp_config = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
@@ -326,7 +331,11 @@ where
             },
         );
 
-    (app.layer(cors).layer(trace_layer), token_store, registry_ref)
+    (
+        app.layer(cors).layer(trace_layer),
+        token_store,
+        registry_ref,
+    )
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
@@ -374,13 +383,15 @@ where
 
     let (app, token_store, registry) = build_app(config);
 
-    token_store.load_persisted().await.map_err(|e| {
-        anyhow::anyhow!("failed to load persisted tokens: {e}")
-    })?;
+    token_store
+        .load_persisted()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load persisted tokens: {e}"))?;
 
-    registry.load_persisted_versions().await.map_err(|e| {
-        anyhow::anyhow!("failed to load persisted capability versions: {e}")
-    })?;
+    registry
+        .load_persisted_versions()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load persisted capability versions: {e}"))?;
 
     // Start token cleanup task (purge expired tokens every 5 minutes)
     let token_cleanup = token_store.start_cleanup_task(CLEANUP_INTERVAL);

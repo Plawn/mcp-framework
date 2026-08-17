@@ -4,7 +4,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{app_with, whoami_request};
-use mcp_framework::auth::{AuthProvider, OAuthConfig, StoredToken, TokenMode};
+use mcp_framework::auth::{
+    AuthProvider, OAuthConfig, StoredToken, TokenMode, UnknownTokenValidation,
+};
 use mcp_framework::constants::MCP_SESSION_ID_HEADER;
 
 fn oauth() -> AuthProvider {
@@ -15,6 +17,8 @@ fn oauth() -> AuthProvider {
         redirect_url: "http://localhost/oauth/callback".to_string(),
         scopes: vec!["openid".to_string()],
         token_mode: TokenMode::Opaque,
+        unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
+        expected_audiences: vec![],
     })
 }
 

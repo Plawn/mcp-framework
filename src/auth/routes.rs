@@ -4,15 +4,13 @@ use axum::{
     response::{IntoResponse, Redirect},
     routing::get,
 };
-use oauth2::{
-    AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, Scope,
-};
+use oauth2::{AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, Scope};
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{OAuthConfig, TokenStore, StoredToken};
 use super::templates;
-use crate::constants::{OAUTH_LOGIN_PATH, OAUTH_CALLBACK_PATH, OAUTH_STATUS_PATH};
+use super::{OAuthConfig, StoredToken, TokenStore};
+use crate::constants::{OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATUS_PATH};
 use crate::http_util::HttpError;
 
 /// Shared state for OAuth routes
@@ -79,10 +77,10 @@ async fn login_handler(
     let (auth_url, _) = auth_request.url();
 
     // Store pending auth
-    state.store.store_pending_auth(
-        csrf_state,
-        pkce_verifier.secret().clone(),
-    ).await;
+    state
+        .store
+        .store_pending_auth(csrf_state, pkce_verifier.secret().clone())
+        .await;
 
     Ok(Redirect::temporary(auth_url.as_str()))
 }
@@ -93,13 +91,19 @@ async fn callback_handler(
     Query(query): Query<CallbackQuery>,
 ) -> Result<impl IntoResponse, HttpError> {
     // Retrieve pending auth
-    let pending = state.store.take_pending_auth(&query.state).await.ok_or_else(|| {
-        tracing::warn!("Invalid or expired OAuth state: {}", query.state);
-        HttpError::bad_request("Invalid or expired authentication state")
-    })?;
+    let pending = state
+        .store
+        .take_pending_auth(&query.state)
+        .await
+        .ok_or_else(|| {
+            tracing::warn!("Invalid or expired OAuth state: {}", query.state);
+            HttpError::bad_request("Invalid or expired authentication state")
+        })?;
 
     if pending.is_expired() {
-        return Err(HttpError::bad_request("Authentication request has timed out"));
+        return Err(HttpError::bad_request(
+            "Authentication request has timed out",
+        ));
     }
 
     // Extract session_id from state if present
@@ -125,7 +129,10 @@ async fn callback_handler(
 
     // Store with session_id if available, otherwise use a generated one
     let final_session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    state.store.store_token(final_session_id.clone(), stored_token).await;
+    state
+        .store
+        .store_token(final_session_id.clone(), stored_token)
+        .await;
 
     tracing::info!("OAuth successful for session: {}", final_session_id);
 

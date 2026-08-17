@@ -43,7 +43,11 @@ async fn main() -> anyhow::Result<()> {
     // An admin tool that will be filtered out for unauthenticated sessions
     registry
         .add_tool(
-            Tool::new("admin_reset", "Reset the server (admin only)", serde_json::Map::new()),
+            Tool::new(
+                "admin_reset",
+                "Reset the server (admin only)",
+                serde_json::Map::new(),
+            ),
             |_args| async {
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     "Server reset!",

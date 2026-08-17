@@ -62,48 +62,45 @@ fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
         Value::Object(map) => {
             if let Some(Value::String(ref_str)) = map.get("$ref")
                 && let Some(name) = ref_str.strip_prefix("#/$defs/")
-                    && let Some(def) = defs.get(name) {
-                        let mut inlined = def.clone();
-                        if let Value::Object(ref mut inlined_map) = inlined {
-                            for (k, v) in map.iter() {
-                                if k == "$ref" {
-                                    continue;
+                && let Some(def) = defs.get(name)
+            {
+                let mut inlined = def.clone();
+                if let Value::Object(ref mut inlined_map) = inlined {
+                    for (k, v) in map.iter() {
+                        if k == "$ref" {
+                            continue;
+                        }
+                        match (k.as_str(), inlined_map.get_mut(k), v) {
+                            // Deep-merge properties (sibling wins on key collision).
+                            (
+                                "properties",
+                                Some(Value::Object(def_props)),
+                                Value::Object(sib_props),
+                            ) => {
+                                for (pk, pv) in sib_props {
+                                    def_props.insert(pk.clone(), pv.clone());
                                 }
-                                match (k.as_str(), inlined_map.get_mut(k), v) {
-                                    // Deep-merge properties (sibling wins on key collision).
-                                    (
-                                        "properties",
-                                        Some(Value::Object(def_props)),
-                                        Value::Object(sib_props),
-                                    ) => {
-                                        for (pk, pv) in sib_props {
-                                            def_props.insert(pk.clone(), pv.clone());
-                                        }
-                                    }
-                                    // Union required lists.
-                                    (
-                                        "required",
-                                        Some(Value::Array(def_req)),
-                                        Value::Array(sib_req),
-                                    ) => {
-                                        for item in sib_req {
-                                            if !def_req.contains(item) {
-                                                def_req.push(item.clone());
-                                            }
-                                        }
-                                    }
-                                    // Everything else: sibling overrides def.
-                                    _ => {
-                                        inlined_map.insert(k.clone(), v.clone());
+                            }
+                            // Union required lists.
+                            ("required", Some(Value::Array(def_req)), Value::Array(sib_req)) => {
+                                for item in sib_req {
+                                    if !def_req.contains(item) {
+                                        def_req.push(item.clone());
                                     }
                                 }
                             }
+                            // Everything else: sibling overrides def.
+                            _ => {
+                                inlined_map.insert(k.clone(), v.clone());
+                            }
                         }
-                        *value = inlined;
-                        // The inlined definition may itself contain $refs
-                        resolve_refs(value, defs);
-                        return;
                     }
+                }
+                *value = inlined;
+                // The inlined definition may itself contain $refs
+                resolve_refs(value, defs);
+                return;
+            }
             for v in map.values_mut() {
                 resolve_refs(v, defs);
             }
@@ -184,8 +181,7 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
                 if tag_key.is_none() {
                     tag_key = Some(prop_name.clone());
                 }
-                if tag_key.as_deref() == Some(prop_name.as_str())
-                    && !tag_values.contains(const_val)
+                if tag_key.as_deref() == Some(prop_name.as_str()) && !tag_values.contains(const_val)
                 {
                     tag_values.push(const_val.clone());
                 }

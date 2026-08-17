@@ -10,11 +10,11 @@ use std::time::Duration;
 use mcp_framework::auth::AuthProvider;
 use mcp_framework::prelude::*;
 use mcp_framework::session::SessionStore;
-use mcp_framework::transport::{build_app, HttpAppConfig};
+use mcp_framework::transport::{HttpAppConfig, build_app};
 use rmcp::handler::server::tool::schema_for_output;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{tool, ServiceExt};
+use rmcp::{ServiceExt, tool};
 
 // ── Tool parameter types ────────────────────────────────────────────
 
@@ -205,11 +205,12 @@ async fn http_initialize() -> anyhow::Result<()> {
     let client = connect_client(addr).await;
 
     let info = client.peer().peer_info().expect("server info");
-    assert!(info
-        .instructions
-        .as_deref()
-        .unwrap_or("")
-        .contains("HTTP integration test"));
+    assert!(
+        info.instructions
+            .as_deref()
+            .unwrap_or("")
+            .contains("HTTP integration test")
+    );
 
     client.cancel().await?;
     Ok(())
@@ -268,12 +269,14 @@ async fn http_call_small_tool() -> anyhow::Result<()> {
     let client = connect_client(addr).await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("greet").with_arguments(
-            serde_json::json!({ "name": "World" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("greet").with_arguments(
+                serde_json::json!({ "name": "World" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
         .await?;
 
     let text = result
@@ -297,12 +300,14 @@ async fn http_call_large_tool() -> anyhow::Result<()> {
 
     // Request a ~10KB response to stress SSE streaming
     let result = client
-        .call_tool(CallToolRequestParams::new("large_response").with_arguments(
-            serde_json::json!({ "size": 10000 })
-                .as_object()
-                .unwrap()
-                .clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("large_response").with_arguments(
+                serde_json::json!({ "size": 10000 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
         .await?;
 
     let text = result
@@ -314,7 +319,9 @@ async fn http_call_large_tool() -> anyhow::Result<()> {
 
     // Verify it's valid JSON and contains the projects array
     let parsed: serde_json::Value = serde_json::from_str(text)?;
-    let projects = parsed["projects"].as_array().expect("expected projects array");
+    let projects = parsed["projects"]
+        .as_array()
+        .expect("expected projects array");
     assert!(
         projects.len() > 1,
         "expected multiple projects, got {}",
@@ -331,9 +338,7 @@ async fn http_call_empty_params_tool() -> anyhow::Result<()> {
     let addr = start_server().await;
     let client = connect_client(addr).await;
 
-    let result = client
-        .call_tool(CallToolRequestParams::new("ping"))
-        .await?;
+    let result = client.call_tool(CallToolRequestParams::new("ping")).await?;
 
     let text = result
         .content
@@ -357,12 +362,14 @@ async fn http_multiple_calls_same_session() -> anyhow::Result<()> {
     // Make several calls on the same connection to test session reuse
     for i in 0..5 {
         let result = client
-            .call_tool(CallToolRequestParams::new("greet").with_arguments(
-                serde_json::json!({ "name": format!("User{i}") })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ))
+            .call_tool(
+                CallToolRequestParams::new("greet").with_arguments(
+                    serde_json::json!({ "name": format!("User{i}") })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
             .await?;
 
         let text = result
@@ -401,8 +408,14 @@ async fn http_query_filter_excludes_tools() -> anyhow::Result<()> {
     let tools = client.list_all_tools().await?;
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
-    assert!(!names.contains(&"ping"), "ping should be filtered out, got: {names:?}");
-    assert!(names.contains(&"greet"), "greet should still be present, got: {names:?}");
+    assert!(
+        !names.contains(&"ping"),
+        "ping should be filtered out, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"greet"),
+        "greet should still be present, got: {names:?}"
+    );
 
     client.cancel().await?;
     Ok(())
@@ -415,9 +428,7 @@ async fn http_query_filter_rejects_call() -> anyhow::Result<()> {
 
     let client = connect_client_with_filter(addr, "ping").await;
 
-    let result = client
-        .call_tool(CallToolRequestParams::new("ping"))
-        .await;
+    let result = client.call_tool(CallToolRequestParams::new("ping")).await;
 
     assert!(result.is_err(), "calling filtered tool should return error");
 
@@ -437,7 +448,10 @@ async fn http_query_filter_multiple_tools() -> anyhow::Result<()> {
 
     assert!(!names.contains(&"ping"), "ping should be filtered");
     assert!(!names.contains(&"greet"), "greet should be filtered");
-    assert!(names.contains(&"large_response"), "large_response should remain");
+    assert!(
+        names.contains(&"large_response"),
+        "large_response should remain"
+    );
 
     client.cancel().await?;
     Ok(())
@@ -467,8 +481,7 @@ async fn http_no_filter_returns_all_tools() -> anyhow::Result<()> {
 /// (which enables SSE priming events). This reproduces the pre-fix behavior.
 async fn start_server_with_sse_priming() -> std::net::SocketAddr {
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpService,
-        session::local::LocalSessionManager,
+        StreamableHttpService, session::local::LocalSessionManager,
     };
 
     let mcp_service = StreamableHttpService::new(
@@ -503,10 +516,7 @@ async fn http_sse_priming_causes_client_issues() {
 
     // The connect itself may fail or succeed depending on how the client
     // handles the priming event during initialization.
-    let client_result = tokio::time::timeout(
-        Duration::from_secs(5),
-        ().serve(transport),
-    ).await;
+    let client_result = tokio::time::timeout(Duration::from_secs(5), ().serve(transport)).await;
 
     match client_result {
         Ok(Ok(client)) => {
@@ -515,7 +525,8 @@ async fn http_sse_priming_causes_client_issues() {
             let tool_result = tokio::time::timeout(
                 Duration::from_secs(5),
                 client.call_tool(CallToolRequestParams::new("ping")),
-            ).await;
+            )
+            .await;
 
             // Document the behavior: with priming, tool calls may fail.
             // We don't assert failure (rmcp client may handle it),

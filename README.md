@@ -272,6 +272,8 @@ When using CLI mode (`settings: None`):
 | `OAUTH_ISSUER_URL` | Keycloak realm URL | — |
 | `OAUTH_REDIRECT_URL` | OAuth redirect URL | — |
 | `OAUTH_SCOPES` | Comma-separated scopes | `openid,profile,email` |
+| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | How to check a bearer the proxy did not issue: `jwks`, `introspection`, `jwks_then_introspection`, `reject` | `jwks_then_introspection` |
+| `OAUTH_EXPECTED_AUDIENCE` | Comma-separated audiences a locally validated JWT must carry | — (unconstrained) |
 
 A `.env` file is loaded automatically in CLI mode.
 

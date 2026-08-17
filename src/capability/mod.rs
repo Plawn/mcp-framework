@@ -12,6 +12,6 @@ mod sanitize;
 mod validator;
 
 pub use filter::{CapabilityFilter, PromptFilter, ResourceFilter, ToolFilter};
+pub(crate) use handler::{DynamicHandler, HandlerContext};
 pub use registry::{CapabilityRegistry, ToolCallContext};
 pub use validator::{AccessDecision, AccessValidator, ToolCallValidator};
-pub(crate) use handler::{DynamicHandler, HandlerContext};

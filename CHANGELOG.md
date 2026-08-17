@@ -8,7 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > History before `0.2.0` was not retro-documented; see `git log` for earlier releases.
 
-## [0.2.0] — Unreleased
+## [0.3.0] — Unreleased
+
+### Added — local (JWKS) validation of bearers the proxy did not issue
+
+Keycloak refuses the RFC 7662 introspection endpoint to **public** clients
+(`403 {"error":"invalid_request","error_description":"Client not allowed."}`).
+Since introspection was the only check available for a bearer absent from
+`TokenStore`, a public-client deployment in `TokenMode::Passthrough` rejected
+every such token with `401` at MCP `initialize` — including a valid
+token-exchange token minted for a downstream audience.
+
+- **`src/auth/jwks.rs`.** OIDC discovery → `jwks_uri` → key set, cached by `kid`
+  with a TTL. An unknown `kid` triggers a refetch (signing keys rotate), but at
+  most once per cooldown, and the cooldown keys off the last *attempt* — so
+  neither a forged `kid` nor an unreachable issuer turns one inbound request
+  into one outbound request. Keys already held survive a failed refresh.
+  Asymmetric algorithms only (`alg` confusion).
+- **`TokenStore::validate_unknown_bearer`.** Order: `TokenStore` (a
+  proxy-issued token causes no round-trip at all) → JWKS → introspection. A
+  verdict from the issuer's own keys is *final*: only "could not answer"
+  (`NotAJwt` / `UnknownKey` / `Unavailable`) falls through, so the default
+  policy is no weaker than `jwks` alone.
+- **Typed `BearerRejection`** replaces the previous boolean, separating in the
+  logs what the client's uniform `401` cannot: introspection not permitted (a
+  server misconfiguration — warned once per store, then never retried), an
+  invalid token, and a token accepted locally via JWKS.
+
+**Breaking for consumers** building `OAuthConfig` with a struct literal: two
+new fields, `unknown_token_validation` and `expected_audiences`.
+`OAuthConfig::from_env()` reads them from `OAUTH_UNKNOWN_TOKEN_VALIDATION`
+(`jwks` | `introspection` | `jwks_then_introspection` | `reject`, default
+`jwks_then_introspection`) and `OAUTH_EXPECTED_AUDIENCE` (comma-separated,
+empty = `aud` unconstrained). Existing behaviour is preserved by
+`OAUTH_UNKNOWN_TOKEN_VALIDATION=introspection`.
+
+### Dependencies
+
+- added `jsonwebtoken` `11` (`rust_crypto` + `use_pem`, no default features) —
+  the pure-Rust provider, so the build needs no C toolchain
+
+## [0.2.0] — 2026-08-05
 
 ### Changed — rmcp 1.7 → 3.1
 

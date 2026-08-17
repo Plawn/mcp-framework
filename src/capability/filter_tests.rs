@@ -7,12 +7,14 @@ fn make_tool(name: &str) -> Tool {
 
 #[test]
 fn tool_filter_filters_tools() {
-    let filter = ToolFilter(|tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
-        tools
-            .into_iter()
-            .filter(|t| !t.name.starts_with("admin_"))
-            .collect()
-    });
+    let filter = ToolFilter(
+        |tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
+            tools
+                .into_iter()
+                .filter(|t| !t.name.starts_with("admin_"))
+                .collect()
+        },
+    );
 
     let tools = vec![make_tool("public"), make_tool("admin_delete")];
     let filtered = filter.filter_tools(tools, None);
@@ -23,9 +25,7 @@ fn tool_filter_filters_tools() {
 #[test]
 fn tool_filter_passes_prompts_through() {
     let filter =
-        ToolFilter(|_tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> {
-            Vec::new()
-        });
+        ToolFilter(|_tools: Vec<Tool>, _token: Option<&StoredToken>| -> Vec<Tool> { Vec::new() });
 
     let prompts = vec![Prompt::new::<_, &str>("test", None, None)];
     let result = filter.filter_prompts(prompts.clone(), None);
@@ -34,13 +34,11 @@ fn tool_filter_passes_prompts_through() {
 
 #[test]
 fn prompt_filter_filters_prompts() {
-    let filter =
-        PromptFilter(|prompts: Vec<Prompt>, _token: Option<&StoredToken>| -> Vec<Prompt> {
-            prompts
-                .into_iter()
-                .filter(|p| p.name != "secret")
-                .collect()
-        });
+    let filter = PromptFilter(
+        |prompts: Vec<Prompt>, _token: Option<&StoredToken>| -> Vec<Prompt> {
+            prompts.into_iter().filter(|p| p.name != "secret").collect()
+        },
+    );
 
     let prompts = vec![
         Prompt::new::<_, &str>("public", None, None),
@@ -99,7 +97,9 @@ async fn resolve_token_without_http_context_uses_default_session() {
         )
         .await;
 
-    let token = resolve_token(&extensions, &store).await.expect("stdio token");
+    let token = resolve_token(&extensions, &store)
+        .await
+        .expect("stdio token");
     assert_eq!(token.access_token, "stdio-token");
 }
 
@@ -141,7 +141,11 @@ fn resolve_query_filter_no_parts() {
 #[test]
 fn resolve_query_filter_no_query() {
     let mut extensions = Extensions::new();
-    let (parts, _) = http::Request::builder().uri("/mcp").body(()).unwrap().into_parts();
+    let (parts, _) = http::Request::builder()
+        .uri("/mcp")
+        .body(())
+        .unwrap()
+        .into_parts();
     extensions.insert(parts);
     assert!(resolve_query_filter(&extensions).is_empty());
 }

@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::Engine as _;
 use common::app_with;
-use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode};
+use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode, UnknownTokenValidation};
 use tower::ServiceExt as _;
 
 async fn oauth() -> AuthProvider {
@@ -51,12 +51,17 @@ async fn oauth() -> AuthProvider {
         redirect_url: "http://localhost/oauth/callback".to_string(),
         scopes: vec!["openid".to_string()],
         token_mode: TokenMode::Passthrough,
+        // Left on the default on purpose: this issuer publishes no JWKS, so
+        // every unknown bearer exercises the JWKS-unavailable fall-through to
+        // introspection that these assertions depend on.
+        unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
+        expected_audiences: vec![],
     })
 }
 
 fn expired_jwt() -> String {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
     format!("{header}.{payload}.invalid-signature")
 }
@@ -88,7 +93,11 @@ fn requests() -> [serde_json::Value; 3] {
     ]
 }
 
-async fn post_mcp(app: &Router, bearer: &str, body: &serde_json::Value) -> axum::response::Response {
+async fn post_mcp(
+    app: &Router,
+    bearer: &str,
+    body: &serde_json::Value,
+) -> axum::response::Response {
     app.clone()
         .oneshot(
             Request::post("/mcp")

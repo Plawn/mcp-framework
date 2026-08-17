@@ -2,7 +2,11 @@ use super::*;
 use rmcp::model::{ContentBlock, GetPromptResult, ReadResourceResult, ResourceContents};
 
 fn make_tool(name: &str) -> Tool {
-    Tool::new(name.to_string(), format!("Tool {name}"), serde_json::Map::new())
+    Tool::new(
+        name.to_string(),
+        format!("Tool {name}"),
+        serde_json::Map::new(),
+    )
 }
 
 fn make_prompt(name: &str) -> Prompt {
@@ -164,9 +168,7 @@ async fn get_prompt_dispatches() {
     })
     .await;
 
-    let result = reg
-        .get_prompt(&GetPromptRequestParams::new("test"))
-        .await;
+    let result = reg.get_prompt(&GetPromptRequestParams::new("test")).await;
     assert!(result.is_some());
     let result = result.unwrap().unwrap();
     assert_eq!(result.description.as_deref(), Some("dispatched"));
@@ -217,10 +219,11 @@ async fn read_resource_dispatches() {
 #[tokio::test]
 async fn read_resource_returns_none_for_unknown() {
     let reg = CapabilityRegistry::new();
-    assert!(reg
-        .read_resource(&ReadResourceRequestParams::new("nope"))
-        .await
-        .is_none());
+    assert!(
+        reg.read_resource(&ReadResourceRequestParams::new("nope"))
+            .await
+            .is_none()
+    );
 }
 
 // ── Clone sharing test ───────────────────────────────────────────
@@ -390,7 +393,9 @@ async fn version_shared_across_clones() {
 async fn call_tool_returns_error_for_context_tool() {
     let reg = CapabilityRegistry::new();
     reg.add_tool_with_context(make_tool("ctx_tool"), |_args, _ctx| async {
-        Ok(CallToolResult::success(vec![ContentBlock::text("with context")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            "with context",
+        )]))
     })
     .await;
 
@@ -445,7 +450,8 @@ async fn contains_tool_works() {
 #[tokio::test]
 async fn register_app_resource_listed_with_correct_mime() {
     let reg = CapabilityRegistry::new();
-    reg.register_app_resource("ui://test/chart", "<html>chart</html>").await;
+    reg.register_app_resource("ui://test/chart", "<html>chart</html>")
+        .await;
 
     let resources = reg.resources().await;
     assert_eq!(resources.len(), 1);
@@ -470,7 +476,12 @@ async fn register_app_resource_read_returns_html() {
 
     assert_eq!(result.contents.len(), 1);
     match &result.contents[0] {
-        ResourceContents::TextResourceContents { uri, mime_type, text, .. } => {
+        ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        } => {
             assert_eq!(uri, "ui://test/nps");
             assert_eq!(mime_type.as_deref(), Some(crate::constants::APP_MIME_TYPE));
             assert_eq!(text, html);
@@ -493,7 +504,8 @@ async fn app_tool_injects_meta_ui() {
 async fn app_tool_preserves_existing_meta() {
     let mut tool = make_tool("get_nps");
     let mut meta = rmcp::model::MetaObject::default();
-    meta.0.insert("existing".to_string(), serde_json::json!("value"));
+    meta.0
+        .insert("existing".to_string(), serde_json::json!("value"));
     tool.meta = Some(meta);
 
     let enriched = CapabilityRegistry::app_tool(tool, "ui://example/nps");

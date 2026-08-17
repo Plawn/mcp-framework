@@ -37,10 +37,7 @@ async fn custom_logger_receives_record() {
 
     struct CountingLogger;
     impl ToolCallLogger for CountingLogger {
-        fn log(
-            &self,
-            _record: ToolCallRecord,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        fn log(&self, _record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             COUNT.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::ready(()))
         }

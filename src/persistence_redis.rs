@@ -57,11 +57,7 @@ impl RedisBackend {
 }
 
 impl PersistenceBackend for RedisBackend {
-    fn get(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, Option<Vec<u8>>> {
+    fn get(&self, ns: &str, key: &str) -> BoxFuture<'_, Option<Vec<u8>>> {
         let rkey = self.redis_key(ns, key);
         let mut conn = self.conn.clone();
         Box::pin(async move {
@@ -70,13 +66,7 @@ impl PersistenceBackend for RedisBackend {
         })
     }
 
-    fn set(
-        &self,
-        ns: &str,
-        key: &str,
-        value: &[u8],
-        ttl: Option<Duration>,
-    ) -> BoxFuture<'_, ()> {
+    fn set(&self, ns: &str, key: &str, value: &[u8], ttl: Option<Duration>) -> BoxFuture<'_, ()> {
         let rkey = self.redis_key(ns, key);
         let idx = self.index_key(ns);
         let member = key.to_string();
@@ -93,22 +83,14 @@ impl PersistenceBackend for RedisBackend {
                 .to_owned();
             if let Some(ttl) = ttl {
                 let secs = ttl.as_secs().max(1);
-                pipe = pipe
-                    .cmd("EXPIRE")
-                    .arg(&rkey)
-                    .arg(secs)
-                    .to_owned();
+                pipe = pipe.cmd("EXPIRE").arg(&rkey).arg(secs).to_owned();
             }
             pipe.query_async::<()>(&mut conn).await?;
             Ok(())
         })
     }
 
-    fn delete(
-        &self,
-        ns: &str,
-        key: &str,
-    ) -> BoxFuture<'_, ()> {
+    fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()> {
         let rkey = self.redis_key(ns, key);
         let idx = self.index_key(ns);
         let member = key.to_string();
@@ -126,10 +108,7 @@ impl PersistenceBackend for RedisBackend {
         })
     }
 
-    fn keys(
-        &self,
-        ns: &str,
-    ) -> BoxFuture<'_, Vec<String>> {
+    fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>> {
         let idx = self.index_key(ns);
         let mut conn = self.conn.clone();
         Box::pin(async move {
@@ -166,20 +145,14 @@ impl PersistenceBackend for RedisBackend {
         })
     }
 
-    fn release_lock(
-        &self,
-        ns: &str,
-        key: &str,
-        token: &str,
-    ) -> BoxFuture<'_, ()> {
+    fn release_lock(&self, ns: &str, key: &str, token: &str) -> BoxFuture<'_, ()> {
         let rkey = self.redis_key(ns, key);
         let token = token.to_string();
         let mut conn = self.conn.clone();
         Box::pin(async move {
             // Compare-and-delete: only delete the key if it still holds our token,
             // so a late release after TTL expiry can't drop a peer's lock.
-            const RELEASE_LUA: &str =
-                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+            const RELEASE_LUA: &str = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
             let _: i64 = redis::Script::new(RELEASE_LUA)
                 .key(&rkey)
                 .arg(&token)
