@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > History before `0.2.0` was not retro-documented; see `git log` for earlier releases.
 
+## [0.3.1] — Unreleased
+
+### Added — `transport::loopback`, an in-process caller that is a real client
+
+An application embedding this framework often calls its own tools from inside
+the same process — an agent loop, a scheduler, a chat turn. Doing that through
+a hand-held executor puts those calls *underneath* the protocol, so none of
+what the framework applies on the MCP path applies to them: no
+`ToolCallLogger`, no metrics, no `CapabilityFilter`, no `AccessValidator`. The
+divergence is silent — the calls work, they are simply neither audited nor
+filtered.
+
+- **`LoopbackEndpoint::connect(identity)`** returns a `LoopbackSession` that
+  derefs to a `Peer<RoleClient>`. The transport is a pair of typed
+  `futures::channel::mpsc` halves (`ClientJsonRpcMessage` /
+  `ServerJsonRpcMessage`) — no byte serialisation — driving the **same**
+  `DynamicHandler` as HTTP, so every hook applies with no exception to write.
+- **Identity is not a second mechanism.** `LoopbackIdentity::to_parts()`
+  synthesises `http::request::Parts` carrying `mcp-session-id` and
+  `Authorization`, so `resolve_session_id` / `resolve_token` remain the only
+  resolution path.
+- **`TokenMode::Opaque` is refused at connect time**
+  (`LoopbackConnectError::UnresolvableCredential`): a framework-issued bearer is
+  resolvable only through the HTTP transport's `TokenStore`, and letting it
+  through would make the call anonymous rather than authenticated.
+- **The endpoint owns its stores.** An in-process caller's session id usually
+  comes from *its* client; sharing the HTTP transport's `SessionStore` would put
+  an externally-reachable collision between the two surfaces. The endpoint keeps
+  its own `TokenStore`, `SessionStore` and `token_mode`.
+- **`LoopbackSession` cancels both ends on drop**, and a failed handshake aborts
+  the server task — evicting an entry from a cache closes the connection, it
+  does not leak a task.
+- **`McpAppBuilder::validate()` refuses a divergent builder.** A
+  `capability_filter` (or any other setting) applied *after* `loopback()` used
+  to miss the loopback surface silently; construction now fails, naming the
+  field.
+
+### Added — `ToolCallContext.session_id`
+
+A tool handler now knows which session its call came from. Without it, every
+tool needing that fact becomes one more special case in the application's
+wiring.
+
+### Dependencies
+
+- added `futures` `0.3` — the `Sink`/`Stream` halves of the loopback transport
+- `rmcp` gains the `client` feature (the loopback's own end is a client)
+
 ## [0.3.0] — Unreleased
 
 ### Added — local (JWKS) validation of bearers the proxy did not issue

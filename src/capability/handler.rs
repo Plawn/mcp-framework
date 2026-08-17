@@ -26,6 +26,10 @@ pub(crate) struct HandlerContext<T: SessionData> {
     pub token_store: TokenStore,
     pub session_store: SessionStore<T>,
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Set only by the loopback transport, which has no HTTP request to carry the caller's
+    /// identity. Synthesizes the request parts a network client would have sent, so session
+    /// resolution and token extraction keep working off a single mechanism.
+    pub loopback_identity: Option<crate::transport::LoopbackIdentity>,
 }
 
 /// Merge `registry` items into `inner`, removing inner items that collide
@@ -75,6 +79,14 @@ impl<S, T: SessionData> DynamicHandler<S, T> {
     fn enrich_extensions(&self, extensions: &mut Extensions) {
         extensions.insert(self.context.token_store.clone());
         extensions.insert(self.context.session_store.clone());
+        if let Some(parts) = self
+            .context
+            .loopback_identity
+            .as_ref()
+            .and_then(|id| id.to_parts())
+        {
+            extensions.insert(parts);
+        }
     }
 
     /// Advertise the capabilities backed by the registry when the inner
@@ -273,6 +285,10 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
             let tool_ctx = crate::capability::registry::ToolCallContext {
                 peer: context.peer.clone(),
                 meta: context.meta.clone(),
+                // Resolved again rather than reusing the audit copy above: that one only exists
+                // when a logger is configured, and a tool's behaviour must not depend on whether
+                // the application happens to be auditing.
+                session_id: resolve_session_id(&context.extensions).to_string(),
             };
             self.registry
                 .try_call_tool(&request.name, request.arguments.clone(), Some(tool_ctx))

@@ -9,14 +9,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::any::Any;
 
 use crate::audit::ToolCallLogger;
-use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenStore};
+use crate::auth::{AuthProvider, ClaimsDecoderFn, StoredToken, TokenMode, TokenStore};
 use crate::capability::{
     AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
 };
 use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL};
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
-use crate::transport::{HttpAppConfig, run_http, run_stdio};
+use crate::transport::{HttpAppConfig, LoopbackEndpoint, run_http, run_stdio};
 
 /// Transport mode for the MCP server.
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -156,6 +156,7 @@ where
             persistence: None,
             extra_routes: None,
             public_routes: None,
+            loopback: LoopbackGuard::default(),
         }
     }
 }
@@ -199,6 +200,32 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     persistence: Option<Arc<dyn PersistenceBackend>>,
     extra_routes: Option<Router>,
     public_routes: Option<Router>,
+    loopback: LoopbackGuard,
+}
+
+/// Remembers whether a loopback endpoint has been handed out, and what changed afterwards.
+///
+/// [`McpAppBuilder::loopback`] takes a **snapshot**: the endpoint holds its own clones of the
+/// registry, the filter, the validator, the logger and the server factory. Configuring any of
+/// those afterwards therefore reconfigures the network transport and leaves the in-process one on
+/// the old value — the two paths diverge, and the whole point of the loopback is that they do not.
+///
+/// Nothing about the shape of the API prevents that order of calls, so the builder records it and
+/// [`validate`](McpAppBuilder::validate) refuses to build. A boot failure naming the field beats a
+/// filter that quietly applies to half the callers.
+#[derive(Default)]
+struct LoopbackGuard {
+    handed_out: bool,
+    diverged: Vec<&'static str>,
+}
+
+impl LoopbackGuard {
+    /// Record that `field` was set. A no-op until an endpoint has actually been handed out.
+    fn note(&mut self, field: &'static str) {
+        if self.handed_out && !self.diverged.contains(&field) {
+            self.diverged.push(field);
+        }
+    }
 }
 
 impl McpAppBuilder<()> {
@@ -229,6 +256,7 @@ impl McpAppBuilder<()> {
             persistence: None,
             extra_routes: None,
             public_routes: None,
+            loopback: LoopbackGuard::default(),
         }
     }
 }
@@ -244,7 +272,8 @@ impl<F> McpAppBuilder<(), F> {
     ///     .run()
     ///     .await?;
     /// ```
-    pub fn with_sessions<T: SessionData>(self) -> McpAppBuilder<T, F> {
+    pub fn with_sessions<T: SessionData>(mut self) -> McpAppBuilder<T, F> {
+        self.loopback.note("with_sessions");
         McpAppBuilder {
             name: self.name,
             auth: self.auth,
@@ -260,6 +289,7 @@ impl<F> McpAppBuilder<(), F> {
             persistence: self.persistence,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
+            loopback: self.loopback,
         }
     }
 }
@@ -269,6 +299,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
     /// Set the authentication provider (default: `AuthProvider::None`).
     pub fn auth(mut self, auth: AuthProvider) -> Self {
         self.auth = auth;
+        self.loopback.note("auth");
         self
     }
 
@@ -281,24 +312,28 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
     /// Provide manual settings (bypasses CLI parsing and env vars).
     pub fn settings(mut self, settings: Settings) -> Self {
         self.settings = Some(settings);
+        self.loopback.note("settings");
         self
     }
 
     /// Set the dynamic capability registry.
     pub fn capability_registry(mut self, registry: CapabilityRegistry) -> Self {
         self.capability_registry = Some(registry);
+        self.loopback.note("capability_registry");
         self
     }
 
     /// Set the capability filter for per-session visibility.
     pub fn capability_filter(mut self, filter: Arc<dyn CapabilityFilter>) -> Self {
         self.capability_filter = Some(filter);
+        self.loopback.note("capability_filter");
         self
     }
 
     /// Provide a pre-built session store.
     pub fn session_store(mut self, store: SessionStore<T>) -> Self {
         self.session_store = Some(store);
+        self.loopback.note("session_store");
         self
     }
 
@@ -308,6 +343,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
     /// is validated before dispatch. Denied requests return an MCP error.
     pub fn access_validator(mut self, validator: Arc<dyn AccessValidator>) -> Self {
         self.access_validator = Some(validator);
+        self.loopback.note("access_validator");
         self
     }
 
@@ -326,6 +362,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self.claims_decoder = Some(Arc::new(move |token: &str| {
             decoder(token).map(|c| Arc::new(c) as Arc<dyn Any + Send + Sync>)
         }));
+        self.loopback.note("claims_decoder");
         self
     }
 
@@ -335,6 +372,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
     /// (fire-and-forget via `tokio::spawn`).
     pub fn tool_call_logger(mut self, logger: Arc<dyn ToolCallLogger>) -> Self {
         self.tool_call_logger = Some(logger);
+        self.loopback.note("tool_call_logger");
         self
     }
 
@@ -371,6 +409,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             Some(existing) => Arc::new(crate::audit::CompositeLogger::new(vec![existing, logger])),
             None => logger,
         });
+        self.loopback.note("metrics");
         if let Some(route) = crate::metrics::metrics_router(collector) {
             self = self.public_routes(route);
         }
@@ -431,7 +470,8 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
     }
 
     /// Transfer all non-factory fields into a new builder with a different factory type.
-    fn with_factory<G>(self, factory: G) -> McpAppBuilder<T, G> {
+    fn with_factory<G>(mut self, factory: G) -> McpAppBuilder<T, G> {
+        self.loopback.note("server");
         McpAppBuilder {
             name: self.name,
             auth: self.auth,
@@ -447,6 +487,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             persistence: self.persistence,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
+            loopback: self.loopback,
         }
     }
 
@@ -503,6 +544,20 @@ where
             }
         }
 
+        // A loopback endpoint is a *snapshot* of the builder, and nothing in the API stops a
+        // caller from configuring the application further afterwards. What follows would then
+        // apply to the network transport only, while the in-process caller kept the old value —
+        // a filter or a validator applied to half the traffic, silently. Naming the fields is the
+        // whole value of the check: "configure before `loopback()`" is not actionable on its own.
+        if !self.loopback.diverged.is_empty() {
+            anyhow::bail!(
+                "McpAppBuilder: {} set after `loopback()` handed out an endpoint — that endpoint \
+                 kept the earlier value, so in-process callers and network clients would no longer \
+                 take the same path. Configure everything before calling `loopback()`.",
+                self.loopback.diverged.join(", ")
+            );
+        }
+
         // Warn if auth != None in stdio mode (auth is ignored there)
         if let Some(ref s) = self.settings
             && s.transport == TransportMode::Stdio
@@ -512,6 +567,69 @@ where
         }
 
         Ok(())
+    }
+
+    /// A factory for in-process clients of this application.
+    ///
+    /// An in-process caller — an agent loop, a scheduler — that reaches into the
+    /// [`CapabilityRegistry`] directly takes a path no network client takes, and so slips past
+    /// the capability filter, the access validator and the tool-call logger. A loopback client
+    /// takes the same path as everyone else, minus the socket.
+    ///
+    /// Does **not** consume the builder: the application can serve its network transport and
+    /// hand out loopback sessions at once. The registry is materialized here if unset, so both
+    /// sides dispatch through the same one — that shared registry is the point of the whole
+    /// exercise.
+    ///
+    /// Everything the endpoint captures is a **snapshot**. Configuring any of those fields
+    /// afterwards makes the two paths diverge, so the builder records it and
+    /// [`validate`](Self::validate) refuses to build. Call `loopback()` last.
+    ///
+    /// # What the endpoint does *not* share
+    ///
+    /// The [`TokenStore`] **and** the [`SessionStore`], both for the same reason: a loopback
+    /// session id is chosen by the in-process caller (a chat thread id, a job name), an HTTP one
+    /// is chosen by the network client, and they are keyed in the same namespace. Sharing either
+    /// store would mean an in-process caller that names its session after an HTTP session id
+    /// reads and writes that client's state — and in engine's case the thread id comes straight
+    /// from a request body, so the collision would be reachable from outside.
+    ///
+    /// Consequences worth knowing rather than discovering: in-process session data is **not**
+    /// persisted (a persistence backend attached to the app reaches the HTTP store only), and it
+    /// does not survive a restart. Sessions of `T = ()` — the common case — hold nothing anyway.
+    pub fn loopback(&mut self) -> LoopbackEndpoint<T, F> {
+        let registry = self
+            .capability_registry
+            .get_or_insert_with(CapabilityRegistry::default)
+            .clone();
+        let ttl = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.session_ttl)
+            .unwrap_or(DEFAULT_SESSION_TTL);
+
+        let mut token_store = TokenStore::new();
+        if let Some(ref decoder) = self.claims_decoder {
+            token_store.claims_decoder = Some(decoder.clone());
+        }
+
+        // Only OAuth has a token mode; everything else behaves as Passthrough.
+        let token_mode = match self.auth {
+            AuthProvider::OAuth(ref oauth) => oauth.token_mode.clone(),
+            AuthProvider::None | AuthProvider::Basic(_) => TokenMode::Passthrough,
+        };
+
+        self.loopback.handed_out = true;
+        LoopbackEndpoint::new(
+            self.server_factory.clone(),
+            registry,
+            self.capability_filter.clone(),
+            self.access_validator.clone(),
+            self.tool_call_logger.clone(),
+            token_store,
+            SessionStore::new(ttl),
+            token_mode,
+        )
     }
 
     /// Build the [`McpApp`], consuming the builder.
@@ -737,6 +855,7 @@ where
             token_store,
             session_store,
             tool_call_logger: app.tool_call_logger,
+            loopback_identity: None,
         },
     );
     run_stdio(handler).await
