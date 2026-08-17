@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -10,6 +11,8 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
+use super::config::UnknownTokenValidation;
+use super::jwks::{JwksRejection, JwksValidator};
 use crate::constants::{
     NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH, NS_REFRESH_LOCK, NS_TOKENS, OPAQUE_ACCESS_TTL,
     OPAQUE_REFRESH_TTL, PENDING_AUTH_TIMEOUT, REFRESH_LOCK_POLL, REFRESH_LOCK_TTL,
@@ -174,8 +177,89 @@ pub struct RefreshConfig {
 /// Result of asking the OAuth authorization server whether an access token is
 /// currently active.
 pub(super) enum TokenIntrospection {
-    Active { expires_at: Option<Instant> },
+    Active {
+        expires_at: Option<Instant>,
+    },
+    /// The server answered, and the answer is "no".
     Inactive,
+    /// The server refused the *caller*, not the token: the configured OAuth
+    /// client may not use the introspection endpoint. Keycloak returns
+    /// `403 Client not allowed.` for public clients. This is a deployment
+    /// configuration fact, and must never be reported as an invalid token.
+    NotPermitted,
+    /// The endpoint could not be reached or its answer was unusable.
+    Unavailable(String),
+}
+
+/// Which path accepted a bearer the `/oauth/token` proxy never issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BearerValidationSource {
+    /// Verified locally against the issuer's published signing keys.
+    Jwks,
+    /// Confirmed active by the authorization server (RFC 7662).
+    Introspection,
+}
+
+/// An unknown bearer that passed validation.
+#[derive(Debug, Clone)]
+pub(super) struct ValidatedBearer {
+    pub expires_at: Option<Instant>,
+    pub subject: Option<String>,
+    pub source: BearerValidationSource,
+}
+
+/// Why an unknown bearer was refused.
+///
+/// The variants exist so the middleware can log the real cause. Every one of
+/// them still yields a `401` to the client — a deployment misconfiguration must
+/// not be distinguishable from a bad token by an unauthenticated caller.
+#[derive(Debug, Clone)]
+pub(super) enum BearerRejection {
+    /// `OAUTH_UNKNOWN_TOKEN_VALIDATION=reject`: only proxy-issued tokens work.
+    PolicyReject,
+    /// The token was checked (locally or by the issuer) and did not pass.
+    TokenInvalid(String),
+    /// The credential is not a JWT, so JWKS cannot speak for it, and
+    /// introspection is unavailable or forbidden to this client.
+    OpaqueUnverifiable,
+    /// The only permitted path was introspection, and the authorization server
+    /// refuses it to the configured client (public client).
+    IntrospectionNotPermitted,
+    /// Neither the issuer's keys nor its introspection endpoint could be reached.
+    IssuerUnreachable(String),
+}
+
+impl std::fmt::Display for BearerRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PolicyReject => write!(
+                f,
+                "unknown bearers are refused by policy (OAUTH_UNKNOWN_TOKEN_VALIDATION=reject)"
+            ),
+            Self::TokenInvalid(why) => write!(f, "token is invalid: {why}"),
+            Self::OpaqueUnverifiable => write!(
+                f,
+                "credential is not a JWT and no introspection endpoint is usable, \
+                 so it cannot be validated — configure a confidential OAuth client \
+                 to enable introspection, or have the client send a JWT"
+            ),
+            Self::IntrospectionNotPermitted => write!(
+                f,
+                "the configured OAuth client is not allowed to introspect tokens \
+                 (public client) and no other validation path is enabled — set \
+                 OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks_then_introspection or point \
+                 OAUTH_CLIENT_ID at a confidential client"
+            ),
+            Self::IssuerUnreachable(why) => write!(f, "the OAuth issuer is unreachable: {why}"),
+        }
+    }
+}
+
+/// Policy and issuer keys used to validate bearers the proxy did not issue.
+#[derive(Clone)]
+pub(super) struct BearerValidation {
+    pub policy: UnknownTokenValidation,
+    pub jwks: JwksValidator,
 }
 
 /// Type-erased claims decoder function.
@@ -257,6 +341,14 @@ pub struct TokenStore {
     opaque_index: Arc<RwLock<OpaqueIndex>>,
     /// Orders in-memory mutations with persistence writes and deletions.
     mutation_lock: Arc<Mutex<()>>,
+
+    /// Policy + issuer keys for bearers the `/oauth/token` proxy did not issue.
+    /// `None` keeps the historical behaviour: introspection only.
+    bearer_validation: Option<Arc<BearerValidation>>,
+    /// Latched once the authorization server has told us this OAuth client may
+    /// not introspect. Shared across clones so the explanatory `WARN` is emitted
+    /// once per process and no further request pays for a doomed round-trip.
+    introspection_not_permitted: Arc<AtomicBool>,
 }
 
 impl TokenStore {
@@ -271,22 +363,33 @@ impl TokenStore {
             persistence: None,
             opaque_index: Arc::new(RwLock::new(OpaqueIndex::default())),
             mutation_lock: Arc::new(Mutex::new(())),
+            bearer_validation: None,
+            introspection_not_permitted: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Create a new TokenStore with refresh configuration
     pub fn with_refresh_config(config: RefreshConfig) -> Self {
         Self {
-            tokens: Arc::new(RwLock::new(HashMap::new())),
-            pending_auths: Arc::new(RwLock::new(HashMap::new())),
-            http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(Some(config))),
-            refresh_locks: Arc::new(RwLock::new(HashMap::new())),
-            claims_decoder: None,
-            persistence: None,
-            opaque_index: Arc::new(RwLock::new(OpaqueIndex::default())),
-            mutation_lock: Arc::new(Mutex::new(())),
+            ..Self::new()
         }
+    }
+
+    /// Configure how bearers that the `/oauth/token` proxy did not issue are
+    /// validated. Without this, only RFC 7662 introspection is attempted.
+    ///
+    /// The JWKS validator shares this store's HTTP client, so the key cache it
+    /// builds is shared by every clone of the store.
+    pub fn configure_unknown_bearer_validation(&mut self, config: &super::OAuthConfig) {
+        self.bearer_validation = Some(Arc::new(BearerValidation {
+            policy: config.unknown_token_validation,
+            jwks: JwksValidator::new(
+                &config.issuer_url,
+                config.expected_audiences.clone(),
+                self.http_client.clone(),
+            ),
+        }));
     }
 
     /// Attach a persistence backend for surviving server restarts.
@@ -430,23 +533,132 @@ impl TokenStore {
     /// `/oauth/token` proxy.
     ///
     /// Tokens emitted by the proxy are already present in the store, together
-    /// with their expiry. An unknown token may still be legitimate (for example
-    /// a bring-your-own-token client), but it must be checked with the
-    /// authorization server before it is allowed to seed a framework session.
+    /// with their expiry. An unknown token may still be legitimate (a
+    /// bring-your-own-token client, or a service forwarding a token obtained by
+    /// Keycloak token-exchange), but it must be checked before it is allowed to
+    /// seed a framework session.
+    ///
+    /// Two checks are possible, and the configured
+    /// [`UnknownTokenValidation`] policy decides which are tried:
+    ///
+    /// 1. **JWKS** — verify the signature against the issuer's published keys.
+    ///    Needs nothing but the issuer's public keys, so it works with a public
+    ///    OAuth client.
+    /// 2. **Introspection** (RFC 7662) — ask the authorization server. Keycloak
+    ///    only allows this for confidential clients.
+    ///
+    /// Under the default `jwks_then_introspection`, introspection is a fallback
+    /// for what JWKS cannot answer (an opaque credential, unreachable issuer
+    /// keys). A JWT the issuer's own keys *rejected* is never re-litigated
+    /// through introspection.
+    pub(super) async fn validate_unknown_bearer(
+        &self,
+        token: &str,
+    ) -> Result<ValidatedBearer, BearerRejection> {
+        let policy = self
+            .bearer_validation
+            .as_ref()
+            .map_or(UnknownTokenValidation::Introspection, |v| v.policy);
+
+        if policy == UnknownTokenValidation::Reject {
+            return Err(BearerRejection::PolicyReject);
+        }
+
+        // (a) Local verification against the issuer's signing keys.
+        let mut jwks_unavailable: Option<String> = None;
+        let mut credential_is_opaque = false;
+        if policy.allows_jwks()
+            && let Some(validation) = self.bearer_validation.as_ref()
+        {
+            match validation.jwks.validate(token).await {
+                Ok(jwt) => {
+                    tracing::info!(
+                        subject = jwt.subject.as_deref().unwrap_or("<none>"),
+                        audiences = ?jwt.audiences,
+                        azp = jwt.authorized_party.as_deref().unwrap_or("<none>"),
+                        "Bearer not issued by this proxy was validated locally against the issuer's JWKS"
+                    );
+                    return Ok(ValidatedBearer {
+                        expires_at: jwt.expires_at,
+                        subject: jwt.subject,
+                        source: BearerValidationSource::Jwks,
+                    });
+                }
+                Err(rejection) => {
+                    if !rejection.may_fall_back() || !policy.allows_introspection() {
+                        return Err(match rejection {
+                            JwksRejection::NotAJwt => BearerRejection::OpaqueUnverifiable,
+                            JwksRejection::Unavailable(why) => {
+                                BearerRejection::IssuerUnreachable(why)
+                            }
+                            other => BearerRejection::TokenInvalid(other.to_string()),
+                        });
+                    }
+                    credential_is_opaque = rejection == JwksRejection::NotAJwt;
+                    if let JwksRejection::Unavailable(why) = &rejection {
+                        jwks_unavailable = Some(why.clone());
+                    }
+                    tracing::debug!("JWKS could not settle this bearer ({rejection}); asking the authorization server");
+                }
+            }
+        }
+
+        // (b) Ask the authorization server.
+        if !policy.allows_introspection() {
+            // Only reachable when the policy is `jwks` and no validator was
+            // wired up (non-OAuth deployment).
+            return Err(BearerRejection::OpaqueUnverifiable);
+        }
+
+        match self.introspect_access_token(token).await {
+            TokenIntrospection::Active { expires_at } => Ok(ValidatedBearer {
+                expires_at,
+                subject: None,
+                source: BearerValidationSource::Introspection,
+            }),
+            TokenIntrospection::Inactive => Err(BearerRejection::TokenInvalid(
+                "the authorization server reports it as inactive".to_string(),
+            )),
+            TokenIntrospection::NotPermitted => Err(if credential_is_opaque {
+                BearerRejection::OpaqueUnverifiable
+            } else {
+                BearerRejection::IntrospectionNotPermitted
+            }),
+            TokenIntrospection::Unavailable(why) => Err(BearerRejection::IssuerUnreachable(
+                match jwks_unavailable {
+                    Some(jwks_why) => format!("JWKS: {jwks_why}; introspection: {why}"),
+                    None => why,
+                },
+            )),
+        }
+    }
+
+    /// Ask the authorization server whether an access token is active (RFC 7662).
+    ///
+    /// Once the server has answered that this OAuth client may not introspect,
+    /// the verdict is latched: further calls short-circuit to
+    /// [`TokenIntrospection::NotPermitted`] without a round-trip, and the
+    /// explanatory warning is emitted only once.
     pub(super) async fn introspect_access_token(&self, token: &str) -> TokenIntrospection {
+        if self.introspection_not_permitted.load(Ordering::Relaxed) {
+            return TokenIntrospection::NotPermitted;
+        }
+
         let Some(config) = self.refresh_config.read().await.clone() else {
             tracing::warn!("Cannot introspect bearer token: OAuth configuration unavailable");
-            return TokenIntrospection::Inactive;
+            return TokenIntrospection::Unavailable(
+                "no OAuth configuration is available".to_string(),
+            );
         };
 
         let introspection_url = format!("{}/introspect", config.token_url.trim_end_matches('/'));
         let mut params = vec![
             ("token", token.to_string()),
             ("token_type_hint", "access_token".to_string()),
-            ("client_id", config.client_id),
+            ("client_id", config.client_id.clone()),
         ];
-        if let Some(secret) = config.client_secret {
-            params.push(("client_secret", secret));
+        if let Some(ref secret) = config.client_secret {
+            params.push(("client_secret", secret.clone()));
         }
 
         let response = match self
@@ -459,23 +671,48 @@ impl TokenStore {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!("OAuth token introspection request failed: {error}");
-                return TokenIntrospection::Inactive;
+                return TokenIntrospection::Unavailable(error.to_string());
             }
         };
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
+            // 401/403 here are about the *client*, not the token: Keycloak
+            // answers `403 Client not allowed.` when `OAUTH_CLIENT_ID` names a
+            // public client, and `401 Authentication failed.` when the
+            // credentials are wrong. Reporting either as "token inactive" is how
+            // a configuration problem used to masquerade as an auth failure —
+            // and retrying it on every request is pure waste, since neither
+            // clears without a redeploy.
+            if status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::UNAUTHORIZED
+            {
+                if !self.introspection_not_permitted.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        status = %status,
+                        client_id = %config.client_id,
+                        "The configured OAuth client may not use Keycloak's token introspection \
+                         endpoint (this is what a public client gets). Bearers not issued by this \
+                         framework's /oauth/token proxy can now only be accepted through local \
+                         JWKS validation. Point OAUTH_CLIENT_ID at a confidential client to \
+                         restore introspection. Not retrying."
+                    );
+                }
+                return TokenIntrospection::NotPermitted;
+            }
+
             tracing::warn!(
-                status = %response.status(),
+                status = %status,
                 "OAuth token introspection was rejected"
             );
-            return TokenIntrospection::Inactive;
+            return TokenIntrospection::Unavailable(format!("introspection returned {status}"));
         }
 
         let payload: serde_json::Value = match response.json().await {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::warn!("Invalid OAuth token introspection response: {error}");
-                return TokenIntrospection::Inactive;
+                return TokenIntrospection::Unavailable(error.to_string());
             }
         };
 

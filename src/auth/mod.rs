@@ -1,4 +1,5 @@
 mod config;
+mod jwks;
 mod metadata;
 mod middleware;
 mod proxy;
@@ -11,7 +12,10 @@ use axum::{routing::{get, post}, Router};
 use std::sync::Arc;
 use crate::constants::{OAUTH_REGISTER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_TOKEN_PATH};
 
-pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode};
+pub use config::{
+    AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, UnknownTokenValidation,
+};
+pub use jwks::{JwksRejection, JwksValidator, ValidatedJwt};
 pub use metadata::{
     authorization_server_metadata_handler, protected_resource_metadata_handler, WellKnownState,
 };

@@ -13,7 +13,6 @@ use axum::{
 use std::sync::Arc;
 
 use super::config::TokenMode;
-use super::store::TokenIntrospection;
 use super::{BasicAuthConfig, StoredToken, TokenStore};
 use crate::constants::{
     AUTHORIZATION_HEADER, BASIC_PREFIX, BASIC_PREFIX_LOWER, BASIC_REALM, BEARER_PREFIX,
@@ -282,14 +281,26 @@ pub async fn bearer_auth_middleware(
 
         // A token captured by `/oauth/token` is already trusted and carries the
         // authorization server's expiry in the store. A bring-your-own token is
-        // unknown to the store, so validate it with Keycloak before allowing it
-        // to create or replace a session entry. This is the boundary that rejects
-        // arbitrary bearer strings and JWTs with invalid signatures.
-        let introspected_expiry = if matching_token.is_none() {
-            match state.token_store.introspect_access_token(&token).await {
-                TokenIntrospection::Active { expires_at } => expires_at,
-                TokenIntrospection::Inactive => {
-                    tracing::warn!("Bearer token is inactive or invalid, returning 401");
+        // unknown to the store, so validate it — locally against the issuer's
+        // JWKS, or with Keycloak — before allowing it to create or replace a
+        // session entry. This is the boundary that rejects arbitrary bearer
+        // strings and JWTs with invalid signatures.
+        let validated_expiry = if matching_token.is_none() {
+            match state.token_store.validate_unknown_bearer(&token).await {
+                Ok(validated) => {
+                    tracing::debug!(
+                        session = %session_id,
+                        source = ?validated.source,
+                        subject = validated.subject.as_deref().unwrap_or("<none>"),
+                        "Accepted a bearer this framework did not issue"
+                    );
+                    validated.expires_at
+                }
+                Err(rejection) => {
+                    // The client always sees the same opaque 401 — the cause is
+                    // for the operator's logs only, and separates "your token is
+                    // bad" from "this server's OAuth client is misconfigured".
+                    tracing::warn!("Rejecting bearer for session '{session_id}': {rejection}");
                     return unauthorized_response(&state.resource_metadata_url);
                 }
             }
@@ -299,7 +310,7 @@ pub async fn bearer_auth_middleware(
 
         let candidate = matching_token
             .clone()
-            .unwrap_or_else(|| StoredToken::new(token.clone(), None, introspected_expiry));
+            .unwrap_or_else(|| StoredToken::new(token.clone(), None, validated_expiry));
         let token_is_expired = candidate.is_expired() || jwt_is_expired(&token).unwrap_or(false);
         let has_refresh = candidate.refresh_token.is_some();
 
@@ -321,7 +332,7 @@ pub async fn bearer_auth_middleware(
             let (refresh_token, expires_at) = matching_token
                 .as_ref()
                 .map(|prev| (prev.refresh_token.clone(), prev.expires_at))
-                .unwrap_or((None, introspected_expiry));
+                .unwrap_or((None, validated_expiry));
             let stored_token = StoredToken {
                 access_token: token.clone(),
                 refresh_token,

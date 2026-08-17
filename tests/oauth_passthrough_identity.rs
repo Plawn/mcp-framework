@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{Json, Router, http::StatusCode, routing::post};
 use common::{app_with, whoami_request};
-use mcp_framework::auth::{AuthProvider, OAuthConfig, StoredToken, TokenMode};
+use mcp_framework::auth::{
+    AuthProvider, OAuthConfig, StoredToken, TokenMode, UnknownTokenValidation,
+};
 use mcp_framework::constants::MCP_SESSION_ID_HEADER;
 
 async fn oauth() -> AuthProvider {
@@ -34,6 +36,11 @@ async fn oauth() -> AuthProvider {
         redirect_url: "http://localhost/oauth/callback".to_string(),
         scopes: vec!["openid".to_string()],
         token_mode: TokenMode::Passthrough,
+        // Left on the default on purpose: this issuer publishes no JWKS, so
+        // every unknown bearer exercises the JWKS-unavailable fall-through to
+        // introspection that these assertions depend on.
+        unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
+        expected_audiences: vec![],
     })
 }
 

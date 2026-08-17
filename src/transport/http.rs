@@ -175,7 +175,12 @@ where
                     oauth_config.issuer_url.trim_end_matches('/')
                 ),
             };
-            TokenStore::with_refresh_config(refresh_config)
+            let mut store = TokenStore::with_refresh_config(refresh_config);
+            // Lets a bearer the proxy never issued be validated against the
+            // issuer's published keys — the only path open when the configured
+            // OAuth client is public and Keycloak refuses introspection to it.
+            store.configure_unknown_bearer_validation(oauth_config);
+            store
         }
         _ => TokenStore::new(),
     };

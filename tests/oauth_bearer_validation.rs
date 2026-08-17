@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::Engine as _;
 use common::app_with;
-use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode};
+use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode, UnknownTokenValidation};
 use tower::ServiceExt as _;
 
 async fn oauth() -> AuthProvider {
@@ -51,6 +51,11 @@ async fn oauth() -> AuthProvider {
         redirect_url: "http://localhost/oauth/callback".to_string(),
         scopes: vec!["openid".to_string()],
         token_mode: TokenMode::Passthrough,
+        // Left on the default on purpose: this issuer publishes no JWKS, so
+        // every unknown bearer exercises the JWKS-unavailable fall-through to
+        // introspection that these assertions depend on.
+        unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
+        expected_audiences: vec![],
     })
 }
 

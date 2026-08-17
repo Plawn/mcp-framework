@@ -71,6 +71,20 @@ pub const SESSION_LOCK_TTL: Duration = REFRESH_LOCK_TTL;
 pub const SESSION_LOCK_WAIT: Duration = REFRESH_LOCK_WAIT;
 pub const SESSION_LOCK_POLL: Duration = REFRESH_LOCK_POLL;
 
+// === JWKS validation of unknown bearers ===
+/// How long a fetched JWKS document is trusted before it is refetched.
+pub const JWKS_CACHE_TTL: Duration = Duration::from_secs(600);
+/// Minimum delay between two JWKS fetches. An unknown `kid` triggers a refetch
+/// (Keycloak rotates signing keys), but only once per cooldown — otherwise a
+/// forged token carrying a random `kid` would let a client drive one outbound
+/// request per inbound request.
+pub const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+/// Timeout applied to OIDC discovery and JWKS fetches, so a hung issuer cannot
+/// stall the auth middleware for the full [`HTTP_REQUEST_TIMEOUT`].
+pub const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Clock-skew tolerance when checking `exp` / `nbf` on a locally validated JWT.
+pub const JWKS_CLOCK_SKEW_LEEWAY: Duration = Duration::from_secs(30);
+
 // === MCP Apps (ext-apps) ===
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 
