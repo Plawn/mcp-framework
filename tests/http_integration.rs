@@ -5,6 +5,7 @@
 //! Streamable HTTP + SSE path — the same path that was failing with
 //! "connection closed before message completed" after the rmcp 1.2 upgrade.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_framework::auth::AuthProvider;
@@ -12,9 +13,9 @@ use mcp_framework::prelude::*;
 use mcp_framework::session::SessionStore;
 use mcp_framework::transport::{HttpAppConfig, build_app};
 use rmcp::handler::server::tool::schema_for_output;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{ServiceExt, tool};
+use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt, tool};
 
 // ── Tool parameter types ────────────────────────────────────────────
 
@@ -148,6 +149,17 @@ impl ServerHandler for TestServer {
     }
 }
 
+/// Reproduces clients that advertise the latest protocol from `get_info()`
+/// but still call the legacy `ServiceExt::serve` entry point.
+#[derive(Clone, Copy)]
+struct ModernInitializeClient;
+
+impl ClientHandler for ModernInitializeClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28)
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Start the HTTP MCP server on a random port, return the bound address.
@@ -165,6 +177,7 @@ async fn start_server() -> std::net::SocketAddr {
         session_store: SessionStore::default(),
         tool_call_logger: None,
         persistence: None,
+        protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
         extra_routes: None,
         public_routes: None,
     };
@@ -180,6 +193,35 @@ async fn start_server() -> std::net::SocketAddr {
     addr
 }
 
+/// Start an independent HTTP instance sharing only the persistence backend.
+async fn start_server_with_persistence(persistence: Arc<InMemoryBackend>) -> std::net::SocketAddr {
+    let config: HttpAppConfig<_, ()> = HttpAppConfig {
+        public_url: "http://localhost".to_string(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        auth: AuthProvider::None,
+        server_factory: || TestServer::new(),
+        app_name: "http-persistence-test".to_string(),
+        capability_registry: None,
+        capability_filter: None,
+        access_validator: None,
+        claims_decoder: None,
+        session_store: SessionStore::default(),
+        tool_call_logger: None,
+        persistence: Some(persistence),
+        protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        extra_routes: None,
+        public_routes: None,
+    };
+
+    let (app, _token_store, _registry) = build_app(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
 /// Connect an rmcp HTTP client to the server at the given address.
 async fn connect_client(
     addr: std::net::SocketAddr,
@@ -187,6 +229,32 @@ async fn connect_client(
     let url = format!("http://{}/mcp", addr);
     let transport = StreamableHttpClientTransport::from_uri(url);
     ().serve(transport).await.expect("client connect failed")
+}
+
+async fn connect_modern_initialize_client(
+    addr: std::net::SocketAddr,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ModernInitializeClient> {
+    let url = format!("http://{}/mcp", addr);
+    let transport = StreamableHttpClientTransport::from_uri(url);
+    ModernInitializeClient
+        .serve(transport)
+        .await
+        .expect("hybrid client connect failed")
+}
+
+async fn connect_modern_discover_client(
+    addr: std::net::SocketAddr,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let url = format!("http://{}/mcp", addr);
+    let transport = StreamableHttpClientTransport::from_uri(url);
+    ().serve_with_lifecycle(
+        transport,
+        ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await
+    .expect("modern discover client connect failed")
 }
 
 fn init_test_tracing() {
@@ -233,6 +301,174 @@ async fn http_list_tools() -> anyhow::Result<()> {
     assert!(names.contains(&"ping"), "missing ping, got: {names:?}");
 
     client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_modern_initialize_is_downgraded_to_coherent_legacy_session() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+    let client = connect_modern_initialize_client(addr).await;
+
+    let info = client.peer().peer_info().expect("server info");
+    assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
+
+    let tools = client.list_all_tools().await?;
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    assert!(names.contains(&"ping"), "missing ping, got: {names:?}");
+    assert!(names.contains(&"greet"), "missing greet, got: {names:?}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_modern_discover_remains_stateless_and_lists_tools() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let discover_response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "server/discover")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "stateless-test",
+                        "version": "1"
+                    }
+                }
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(discover_response.status(), reqwest::StatusCode::OK);
+    assert!(
+        discover_response.headers().get("mcp-session-id").is_none(),
+        "modern discover must not create a session"
+    );
+
+    let client = connect_modern_discover_client(addr).await;
+
+    let info = client.peer().peer_info().expect("server info");
+    assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+
+    let tools = client.list_all_tools().await?;
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    assert!(names.contains(&"ping"), "missing ping, got: {names:?}");
+    assert!(names.contains(&"greet"), "missing greet, got: {names:?}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_modern_request_without_per_request_metadata_is_rejected() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response.text().await?.contains("protocolVersion"),
+        "error must identify the missing protocol metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_legacy_session_is_restored_on_another_instance() -> anyhow::Result<()> {
+    init_test_tracing();
+    let persistence = Arc::new(InMemoryBackend::new());
+    let first = start_server_with_persistence(persistence.clone()).await;
+    let second = start_server_with_persistence(persistence.clone()).await;
+    let http = reqwest::Client::new();
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "multi-instance-test", "version": "1" }
+        }
+    });
+    let initialize_response = http
+        .post(format!("http://{first}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .json(&initialize)
+        .send()
+        .await?;
+    assert_eq!(initialize_response.status(), reqwest::StatusCode::OK);
+    let session_id = initialize_response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize must create a legacy session")
+        .to_str()?
+        .to_owned();
+
+    assert!(
+        persistence
+            .keys("mcp_transport_sessions")
+            .await
+            .map_err(anyhow::Error::from_boxed)?
+            .contains(&session_id),
+        "rmcp transport session was not persisted"
+    );
+
+    let initialized_response = http
+        .post(format!("http://{second}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await?;
+    assert_eq!(initialized_response.status(), reqwest::StatusCode::ACCEPTED);
+
+    let list_response = http
+        .post(format!("http://{second}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await?;
+    assert_eq!(list_response.status(), reqwest::StatusCode::OK);
+    let body = list_response.text().await?;
+    assert!(
+        body.contains("\"name\":\"ping\""),
+        "unexpected body: {body}"
+    );
+
     Ok(())
 }
 

@@ -32,6 +32,7 @@ pub fn app_with(auth: AuthProvider) -> (Router, TokenStore) {
         session_store: SessionStore::default(),
         tool_call_logger: None,
         persistence: None,
+        protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
         extra_routes: Some(Router::new().route("/whoami", get(whoami))),
         public_routes: None,
     };

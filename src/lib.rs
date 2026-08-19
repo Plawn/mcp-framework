@@ -39,6 +39,7 @@
 //!         session_store: None,
 //!         tool_call_logger: None,
 //!         persistence: None,
+//!         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
 //!         extra_routes: None,
 //!         public_routes: None,
 //!     }).await
@@ -106,3 +107,4 @@ pub use persistence::RedisBackend;
 pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 pub use runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
 pub use session::{RequestContextExt, Session, SessionData, SessionStore, resolve_session_id};
+pub use transport::ProtocolLifecyclePolicy;

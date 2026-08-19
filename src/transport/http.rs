@@ -21,6 +21,8 @@ use crate::constants::{
 };
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
+use crate::transport::protocol::{ProtocolLifecyclePolicy, normalize_protocol_lifecycle};
+use crate::transport::session_persistence::TransportSessionStore;
 
 /// Configuration for building the HTTP app
 pub struct HttpAppConfig<F, T: SessionData = ()> {
@@ -41,8 +43,11 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     pub session_store: SessionStore<T>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
-    /// Optional persistence backend for TokenStore.
+    /// Optional persistence backend shared by tokens, dynamic capabilities,
+    /// application sessions, and rmcp transport sessions.
     pub persistence: Option<Arc<dyn PersistenceBackend>>,
+    /// Streamable HTTP lifecycle compatibility policy.
+    pub protocol_lifecycle: ProtocolLifecyclePolicy,
     /// Extra routes merged into the auth-wrapped MCP router.
     ///
     /// Routes registered here sit inside the same `AuthProvider` middleware as
@@ -168,6 +173,9 @@ where
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    let transport_session_ttl = config.session_store.ttl();
+    let transport_persistence = config.persistence.clone();
+
     let mut token_store = match &config.auth {
         AuthProvider::OAuth(oauth_config) => {
             let refresh_config = RefreshConfig {
@@ -245,9 +253,20 @@ where
         }
     }
     tracing::info!(allowed_hosts = ?allowed_hosts, "MCP host validation configured");
-    let mcp_config = StreamableHttpServerConfig::default()
+    let mut mcp_config = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
-        .with_allowed_hosts(allowed_hosts);
+        .with_allowed_hosts(allowed_hosts)
+        // Modern requests are self-contained. Require both the HTTP header and
+        // the SEP-2575 request metadata instead of silently treating malformed
+        // modern traffic as an older protocol.
+        .with_stateless_protocol_metadata_required(true);
+
+    if let Some(backend) = transport_persistence {
+        mcp_config.session_store = Some(Arc::new(TransportSessionStore::new(
+            backend,
+            transport_session_ttl,
+        )));
+    }
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -269,11 +288,21 @@ where
         mcp_config,
     );
 
+    // Scope lifecycle normalization to the MCP fallback. Extra application
+    // routes must receive their request bodies byte-for-byte unchanged.
+    let mcp_fallback =
+        Router::new()
+            .fallback_service(mcp_service)
+            .layer(axum::middleware::from_fn_with_state(
+                config.protocol_lifecycle,
+                normalize_protocol_lifecycle,
+            ));
+
     let mcp_router = {
         let base = config
             .extra_routes
             .unwrap_or_default()
-            .fallback_service(mcp_service);
+            .fallback_service(mcp_fallback);
         wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
     };
 

@@ -104,6 +104,11 @@ impl<T: SessionData> SessionStore<T> {
         self.persistence = Some(backend);
     }
 
+    /// Return the inactivity TTL configured for this store.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     async fn persist_entry(&self, session_id: &str, data: &T) {
         if let Some(ref backend) = self.persistence {
             let persisted = PersistedSession {

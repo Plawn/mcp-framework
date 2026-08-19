@@ -16,7 +16,9 @@ use crate::capability::{
 use crate::constants::{DEFAULT_BIND_ADDR, DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL};
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
-use crate::transport::{HttpAppConfig, LoopbackEndpoint, run_http, run_stdio};
+use crate::transport::{
+    HttpAppConfig, LoopbackEndpoint, ProtocolLifecyclePolicy, run_http, run_stdio,
+};
 
 /// Transport mode for the MCP server.
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -109,8 +111,11 @@ where
     pub session_store: Option<SessionStore<T>>,
     /// Optional tool call audit logger.
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
-    /// Optional persistence backend shared by `TokenStore` and `SessionStore`.
+    /// Optional persistence backend shared by tokens, application state, and
+    /// legacy rmcp transport sessions.
     pub persistence: Option<Arc<dyn PersistenceBackend>>,
+    /// Streamable HTTP lifecycle compatibility policy.
+    pub protocol_lifecycle: ProtocolLifecyclePolicy,
     /// Extra axum routes merged into the auth-wrapped MCP router.
     ///
     /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
@@ -154,6 +159,7 @@ where
             session_store: None,
             tool_call_logger: None,
             persistence: None,
+            protocol_lifecycle: ProtocolLifecyclePolicy::default(),
             extra_routes: None,
             public_routes: None,
             loopback: LoopbackGuard::default(),
@@ -198,6 +204,7 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     session_store: Option<SessionStore<T>>,
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
+    protocol_lifecycle: ProtocolLifecyclePolicy,
     extra_routes: Option<Router>,
     public_routes: Option<Router>,
     loopback: LoopbackGuard,
@@ -254,6 +261,7 @@ impl McpAppBuilder<()> {
             session_store: None,
             tool_call_logger: None,
             persistence: None,
+            protocol_lifecycle: ProtocolLifecyclePolicy::default(),
             extra_routes: None,
             public_routes: None,
             loopback: LoopbackGuard::default(),
@@ -287,6 +295,7 @@ impl<F> McpAppBuilder<(), F> {
             session_store: None,
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
+            protocol_lifecycle: self.protocol_lifecycle,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
             loopback: self.loopback,
@@ -463,9 +472,21 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self
     }
 
-    /// Set the persistence backend, shared by `TokenStore` and `SessionStore`.
+    /// Set the persistence backend shared by tokens, application state, and
+    /// legacy rmcp transport sessions.
     pub fn persistence(mut self, backend: Arc<dyn PersistenceBackend>) -> Self {
         self.persistence = Some(backend);
+        self
+    }
+
+    /// Set the Streamable HTTP lifecycle policy.
+    ///
+    /// [`ProtocolLifecyclePolicy::Hybrid`] is the default. It supports both
+    /// modern `server/discover` clients and legacy initialize clients, while
+    /// repairing clients that advertise a modern version but still use the
+    /// legacy handshake.
+    pub fn protocol_lifecycle(mut self, policy: ProtocolLifecyclePolicy) -> Self {
+        self.protocol_lifecycle = policy;
         self
     }
 
@@ -485,6 +506,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
+            protocol_lifecycle: self.protocol_lifecycle,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
             loopback: self.loopback,
@@ -648,6 +670,7 @@ where
             session_store: self.session_store,
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
+            protocol_lifecycle: self.protocol_lifecycle,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
         })
@@ -785,6 +808,7 @@ where
         session_store,
         tool_call_logger: app.tool_call_logger,
         persistence,
+        protocol_lifecycle: app.protocol_lifecycle,
         extra_routes: app.extra_routes,
         public_routes: app.public_routes,
     })

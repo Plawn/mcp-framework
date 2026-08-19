@@ -69,7 +69,7 @@ Tokens and sessions are accessible via `RequestContextExt` on the request contex
 The original struct-based API is still supported:
 
 ```rust
-use mcp_framework::{run, McpApp, AuthProvider};
+use mcp_framework::{run, McpApp, AuthProvider, ProtocolLifecyclePolicy};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         capability_registry: None,
         capability_filter: None,
         session_store: None,
+        protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
     }).await
 }
 ```
@@ -91,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 Pass a `Settings` struct to bypass CLI parsing and env vars entirely:
 
 ```rust
-use mcp_framework::{run, McpApp, AuthProvider, Settings, TransportMode};
+use mcp_framework::{run, McpApp, AuthProvider, ProtocolLifecyclePolicy, Settings, TransportMode};
 
 run(McpApp {
     name: "my-mcp-server".into(),
@@ -107,8 +108,19 @@ run(McpApp {
     capability_registry: None,
     capability_filter: None,
     session_store: None,
+    protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
 }).await
 ```
+
+### Protocol lifecycle compatibility
+
+HTTP servers default to `ProtocolLifecyclePolicy::Hybrid`: legacy
+`initialize` clients keep their sessions, correct 2026 clients use the
+stateless `server/discover` lifecycle, and clients that advertise 2026 while
+still using `initialize` are safely negotiated down to `2025-11-25`.
+
+Use `.protocol_lifecycle(ProtocolLifecyclePolicy::Strict)` only when every
+client is known to use the lifecycle matching its advertised protocol version.
 
 ### CLI mode (when `settings: None`)
 

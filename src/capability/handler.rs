@@ -154,14 +154,16 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
         let token = resolve_token(&context.extensions, &self.context.token_store).await;
         let query_filter = resolve_query_filter(&context.extensions);
         let mut inner_result = self.inner.list_tools(request, context).await?;
+        let inner_count = inner_result.tools.len();
+        let registry_tools = self.registry.tools().await;
+        let registry_count = registry_tools.len();
 
-        merge_registry_items(
-            &mut inner_result.tools,
-            self.registry.tools().await,
-            |a, b| a.name.as_ref() == b.name.as_ref(),
-        );
+        merge_registry_items(&mut inner_result.tools, registry_tools, |a, b| {
+            a.name.as_ref() == b.name.as_ref()
+        });
 
         sanitize_tool_schemas(&mut inner_result.tools);
+        let merged_count = inner_result.tools.len();
 
         if let Some(ref filter) = self.context.filter {
             inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
@@ -172,6 +174,16 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
                 .tools
                 .retain(|t| !query_filter.contains(t.name.as_ref()));
         }
+
+        tracing::info!(
+            inner_count,
+            registry_count,
+            merged_count,
+            returned_count = inner_result.tools.len(),
+            capability_filter_enabled = self.context.filter.is_some(),
+            query_filter_count = query_filter.len(),
+            "MCP tools/list completed"
+        );
 
         Ok(inner_result)
     }

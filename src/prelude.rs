@@ -23,6 +23,7 @@ pub use crate::persistence::RedisBackend;
 pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 pub use crate::runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
 pub use crate::session::{RequestContextExt, Session, SessionData, SessionStore};
+pub use crate::transport::ProtocolLifecyclePolicy;
 
 // Re-exports from rmcp so consumers don't need it as a direct dependency
 pub use rmcp::model::{
