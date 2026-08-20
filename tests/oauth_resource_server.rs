@@ -992,7 +992,7 @@ async fn run_http_fails_before_it_binds_anything() {
     .await
     .expect("run_http must return, not start serving");
 
-    let error = outcome.err().expect("a misconfigured server must not run");
+    let error = outcome.expect_err("a misconfigured server must not run");
     assert!(
         error.to_string().contains("OAUTH_EXPECTED_AUDIENCE"),
         "{error}"
