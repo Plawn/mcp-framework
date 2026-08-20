@@ -30,13 +30,24 @@ fn nonblank_description(node: &Value) -> Option<&str> {
 ///   `serde_json::Value` (the "accept anything" schema), but strict MCP clients
 ///   like dust.tt reject boolean schemas and expect objects.
 fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
-    schema.remove("$schema");
-    fold_title_into_description(schema);
-
-    for value in schema.values_mut() {
-        sanitize_value_recursive(value);
-    }
+    sanitize_schema_node(schema);
 }
+
+/// Keywords whose value is a map of *user-chosen names* to subschemas. The
+/// map itself is not a schema node: a key named `title` or `$schema` in there
+/// is a property the tool author declared, not a meta-field to strip.
+const NAMED_SUBSCHEMA_CONTAINERS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
+/// Keywords whose value is plain data (instance values), never a schema.
+/// An `enum` of objects, or a `default` object carrying a `title` key, must
+/// reach the client verbatim.
+const DATA_KEYWORDS: &[&str] = &["enum", "const", "default", "examples"];
 
 /// Remove `title` from a schema node, promoting it to `description` when the
 /// node has none.
@@ -61,23 +72,40 @@ fn fold_title_into_description(map: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Walk a JSON value and clean up schema nodes:
+/// Clean up one schema node: remove `$schema`, fold `title` into
+/// `description` (then drop it), and recurse into its subschemas — through
+/// the containers whose keys are user names (see
+/// [`NAMED_SUBSCHEMA_CONTAINERS`]) without treating the container as a node,
+/// and not at all into data keywords (see [`DATA_KEYWORDS`]).
+fn sanitize_schema_node(map: &mut serde_json::Map<String, Value>) {
+    map.remove("$schema");
+    fold_title_into_description(map);
+    for (key, v) in map.iter_mut() {
+        if DATA_KEYWORDS.contains(&key.as_str()) {
+            continue;
+        }
+        if NAMED_SUBSCHEMA_CONTAINERS.contains(&key.as_str()) {
+            if let Value::Object(named) = v {
+                for subschema in named.values_mut() {
+                    sanitize_value_recursive(subschema);
+                }
+            }
+            continue;
+        }
+        sanitize_value_recursive(v);
+    }
+}
+
+/// Walk a JSON value that is in *schema position* and clean it up:
 /// - `true` → `{}` (boolean schema → empty object schema)
-/// - Objects get `$schema` removed and `title` folded into `description`
-///   (then removed), before recursing into their values
-/// - Arrays recurse into each element
+/// - Objects are schema nodes, handled by [`sanitize_schema_node`]
+/// - Arrays (`allOf`, `prefixItems`, …) recurse into each element
 fn sanitize_value_recursive(value: &mut Value) {
     match value {
         Value::Bool(true) => {
             *value = Value::Object(serde_json::Map::new());
         }
-        Value::Object(map) => {
-            map.remove("$schema");
-            fold_title_into_description(map);
-            for v in map.values_mut() {
-                sanitize_value_recursive(v);
-            }
-        }
+        Value::Object(map) => sanitize_schema_node(map),
         Value::Array(arr) => {
             for v in arr.iter_mut() {
                 sanitize_value_recursive(v);

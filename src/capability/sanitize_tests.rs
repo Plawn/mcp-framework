@@ -886,3 +886,75 @@ fn two_sanitize_passes_share_one_audit() {
     sanitize_tool_schemas(&mut second, &audit);
     assert!(audit.audit(&second[0]).is_none());
 }
+
+/// #926 — `properties` is a map of user-chosen names, not a schema node: a
+/// parameter literally named `title` (or `$schema`) must survive sanitization,
+/// while the meta-fields *inside* that parameter's own schema are still
+/// stripped. Same for `patternProperties` and `$defs` (inlined before we get
+/// here, but the walker must not mangle a definition named `title` either).
+#[test]
+fn property_named_like_a_meta_field_is_kept() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": { "type": "string", "title": "Title", "$schema": "x" },
+            "$schema": { "type": "string" },
+            "definitions": { "type": "array", "items": { "type": "string" } }
+        },
+        "patternProperties": {
+            "^title$": { "type": "integer", "title": "Pattern" }
+        },
+        "required": ["title"]
+    });
+    let Value::Object(schema) = schema else {
+        unreachable!()
+    };
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize(&mut tools);
+
+    let out = tools[0].input_schema.as_ref();
+    let props = out["properties"].as_object().unwrap();
+    assert!(props.contains_key("title"), "property `title` was stripped");
+    assert!(
+        props.contains_key("$schema"),
+        "property `$schema` was stripped"
+    );
+    assert!(props.contains_key("definitions"));
+    // Inside the parameter's own schema, meta-fields are still cleaned up.
+    assert_eq!(props["title"]["description"], "Title");
+    assert!(props["title"].get("title").is_none());
+    assert!(props["title"].get("$schema").is_none());
+    let pat = out["patternProperties"].as_object().unwrap();
+    assert!(pat.contains_key("^title$"));
+    assert_eq!(pat["^title$"]["description"], "Pattern");
+}
+
+/// `enum` / `const` / `default` / `examples` hold instance data, not schemas:
+/// an object value carrying a `title` key reaches the client verbatim.
+#[test]
+fn data_keywords_are_not_treated_as_schemas() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "preset": {
+                "type": "object",
+                "enum": [{ "title": "a", "$schema": "keep" }],
+                "default": { "title": "b" },
+                "examples": [{ "title": "c" }],
+                "const": { "title": "d" }
+            }
+        }
+    });
+    let Value::Object(schema) = schema else {
+        unreachable!()
+    };
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize(&mut tools);
+
+    let preset = &tools[0].input_schema["properties"]["preset"];
+    assert_eq!(preset["enum"][0]["title"], "a");
+    assert_eq!(preset["enum"][0]["$schema"], "keep");
+    assert_eq!(preset["default"]["title"], "b");
+    assert_eq!(preset["examples"][0]["title"], "c");
+    assert_eq!(preset["const"]["title"], "d");
+}

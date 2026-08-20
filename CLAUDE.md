@@ -592,7 +592,11 @@ The HTML bundle runs in an isolated iframe — it does not receive the tool call
 `sanitize_tool_schemas` rewrites every `Tool` on its way to `tools/list`, so the
 schema schemars emits is one an MCP client actually accepts. It runs, in order:
 
-1. **`$schema` / `title` stripping** at every nesting level. `title` is *folded
+1. **`$schema` / `title` stripping** at every *schema node*. The walker is
+   schema-aware: `properties` / `patternProperties` / `$defs` / `definitions`
+   / `dependentSchemas` are maps of user-chosen names and are traversed without
+   being treated as nodes (a parameter named `title` survives), and the data
+   keywords `enum` / `const` / `default` / `examples` are never entered. `title` is *folded
    into `description`* first when the node has none — a `#[schemars(title =
    "...")]` or a type name is sometimes the only documentation there is, and it
    is what the LLM would otherwise never see. Once a `description` is present,
