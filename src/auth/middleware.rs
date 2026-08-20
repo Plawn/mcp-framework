@@ -423,9 +423,7 @@ pub async fn bearer_auth_middleware(
         let needs_store = session_token
             .as_ref()
             .is_none_or(|previous| previous.access_token != token);
-        if needs_store
-            && let Some(stored_token) = replacement
-        {
+        if needs_store && let Some(stored_token) = replacement {
             state
                 .token_store
                 .store_token(session_id.clone(), stored_token)

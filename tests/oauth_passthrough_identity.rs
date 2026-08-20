@@ -144,9 +144,8 @@ fn jwt_issued_at(sub: &str, sid: &str, iat: u64) -> String {
     let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let header = enc.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
     let exp = iat + 3600;
-    let payload = enc.encode(
-        format!(r#"{{"sub":"{sub}","sid":"{sid}","iat":{iat},"exp":{exp}}}"#).as_bytes(),
-    );
+    let payload = enc
+        .encode(format!(r#"{{"sub":"{sub}","sid":"{sid}","iat":{iat},"exp":{exp}}}"#).as_bytes());
     format!("{header}.{payload}.sig")
 }
 
@@ -166,7 +165,10 @@ async fn sessionless_identity_survives_a_bearer_refresh() {
 
     assert_eq!(status1, StatusCode::OK);
     assert_eq!(status2, StatusCode::OK);
-    assert_eq!(id1, id2, "a refreshed bearer must keep its session identity");
+    assert_eq!(
+        id1, id2,
+        "a refreshed bearer must keep its session identity"
+    );
     assert!(id1.starts_with("cred-sid-"), "got {id1}");
 
     // One entry, holding the current bearer — not two half-live ones.
