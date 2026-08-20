@@ -63,12 +63,15 @@ pub trait PersistenceBackend: Send + Sync + 'static {
     /// that guarantee — a peer deleting the key between the two would see it
     /// resurrected with a fresh TTL.
     ///
-    /// The default does nothing and reports the entry as present, which is
-    /// correct for a backend without expiry. A backend that honours `ttl` in
-    /// `set` should override this with its native primitive (Redis `EXPIRE`).
+    /// The default reports `false` without touching anything: a backend that
+    /// does not implement the primitive cannot promise the guarantee, so the
+    /// callers that depend on it (transport session recovery) stay disabled
+    /// rather than fail open. Override it with the backend's native primitive
+    /// (Redis `EXPIRE`; a presence check under the store's own lock for an
+    /// in-process map) to enable them.
     fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, bool> {
         let _ = (ns, key, ttl);
-        Box::pin(async { Ok(true) })
+        Box::pin(async { Ok(false) })
     }
 
     /// Atomically acquire a distributed lock for `key` within `ns`, held for at

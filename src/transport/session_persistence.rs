@@ -43,20 +43,20 @@ impl SessionStore for TransportSessionStore {
         // Re-arm the TTL: this instance is about to own the session, and the
         // next failover must be able to find it too. `touch` is atomic, so a
         // session a peer deleted between the read and this point is reported
-        // gone rather than resurrected with a fresh lifetime. A failed re-arm
-        // is not a failed load — the state was read; only its lifetime stays.
-        match self
+        // gone rather than resurrected with a fresh lifetime. A re-arm that
+        // cannot answer is a failed load: without its verdict the state read
+        // above may belong to a session that no longer exists, and the only
+        // safe outcome is the one rmcp gives an unknown session — the client
+        // re-initializes.
+        if self
             .backend
             .touch(NS_TRANSPORT_SESSIONS, session_id, self.ttl)
-            .await
+            .await?
         {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(e) => {
-                tracing::warn!(session_id, error = %e, "could not re-arm transport session TTL");
-            }
+            Ok(Some(state))
+        } else {
+            Ok(None)
         }
-        Ok(Some(state))
     }
 
     async fn store(&self, session_id: &str, state: &SessionState) -> Result<(), SessionStoreError> {
@@ -195,16 +195,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_re_arm_still_loads_the_state() {
+    async fn a_re_arm_that_cannot_answer_fails_the_load() {
         let spy = Spy::new();
         let store = TransportSessionStore::new(spy.clone(), Duration::from_secs(1));
         store.store("s1", &state()).await.unwrap();
 
+        // The peer's delete lands in the window *and* the re-arm errors: the
+        // state read must not be handed out on the strength of a stale read.
+        spy.delete_after_get.store(true, Ordering::SeqCst);
         spy.fail_touch.store(true, Ordering::SeqCst);
-        let loaded = store.load("s1").await.unwrap();
-        assert!(
-            loaded.is_some(),
-            "the state was read; only its lifetime is unchanged"
+        assert!(store.load("s1").await.is_err());
+    }
+
+    /// A backend that keeps the trait's default `touch` cannot vouch for the
+    /// key, so recovery is off for it — the stored state is never handed out.
+    #[tokio::test]
+    async fn a_backend_without_touch_never_restores() {
+        struct NoTouch(InMemoryBackend);
+        impl PersistenceBackend for NoTouch {
+            fn get(&self, ns: &str, key: &str) -> BoxFuture<'_, Option<Vec<u8>>> {
+                self.0.get(ns, key)
+            }
+            fn set(
+                &self,
+                ns: &str,
+                key: &str,
+                v: &[u8],
+                ttl: Option<Duration>,
+            ) -> BoxFuture<'_, ()> {
+                self.0.set(ns, key, v, ttl)
+            }
+            fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()> {
+                self.0.delete(ns, key)
+            }
+            fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>> {
+                self.0.keys(ns)
+            }
+        }
+        let store = TransportSessionStore::new(
+            Arc::new(NoTouch(InMemoryBackend::new())),
+            Duration::from_secs(1),
         );
+        store.store("s1", &state()).await.unwrap();
+        assert!(store.load("s1").await.unwrap().is_none());
     }
 }
