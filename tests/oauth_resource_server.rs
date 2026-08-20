@@ -28,11 +28,12 @@ use common::{app_with, whoami_request};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mcp_framework::CapabilityRegistry;
 use mcp_framework::auth::{
-    AuthProvider, OAuthConfig, StoredToken, TokenMode, UnknownTokenValidation,
+    AuthProvider, OAuthConfig, StoredToken, TokenMode, TokenStore, UnknownTokenValidation,
 };
 use mcp_framework::capability::{CapabilityFilter, ToolFilter};
-use mcp_framework::constants::MCP_SESSION_ID_HEADER;
-use mcp_framework::session::SessionStore;
+use mcp_framework::constants::{MCP_SESSION_ID_HEADER, NS_TOKENS};
+use mcp_framework::persistence::{InMemoryBackend, PersistenceBackend};
+use mcp_framework::session::{SessionStore, session_id_from_parts};
 use mcp_framework::transport::{HttpAppConfig, build_app, run_http};
 use rmcp::ServerHandler;
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
@@ -954,9 +955,13 @@ fn config_with(auth: AuthProvider) -> HttpAppConfig<fn() -> NoopServer, ()> {
         tool_call_logger: None,
         persistence: None,
         protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
-        extra_routes: None,
+        extra_routes: Some(Router::new().route("/whoami", get(echo_session_id))),
         public_routes: None,
     }
+}
+
+async fn echo_session_id(parts: axum::http::request::Parts) -> String {
+    session_id_from_parts(&parts).to_string()
 }
 
 #[tokio::test]
@@ -991,5 +996,72 @@ async fn run_http_fails_before_it_binds_anything() {
     assert!(
         error.to_string().contains("OAUTH_EXPECTED_AUDIENCE"),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Startup: nothing token-shaped is loaded, kept, or swept
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_persisted_grant_is_neither_loaded_nor_disturbed() {
+    // A deployment that switches from passthrough to resource-server mode keeps
+    // its Redis. The grants already in it belong to the old mode: this one must
+    // not adopt them, and must not garbage-collect them either — switching back
+    // has to be possible.
+    let backend = Arc::new(InMemoryBackend::new());
+
+    let mut seed = TokenStore::new();
+    seed.set_persistence(backend.clone());
+    seed.store_token(
+        "victim-session".to_string(),
+        StoredToken::new(
+            "keycloak-access".to_string(),
+            Some("keycloak-refresh".to_string()),
+            None,
+        ),
+    )
+    .await;
+
+    // The write-through is fire-and-forget.
+    let mut persisted = None;
+    for _ in 0..100 {
+        persisted = backend.get(NS_TOKENS, "victim-session").await.unwrap();
+        if persisted.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let persisted = persisted.expect("the passthrough grant is in the backend");
+
+    let auth = issuer().await.auth;
+    let bearer = Jwt::valid(&auth).sign();
+    let mut config = config_with(auth);
+    config.persistence = Some(backend.clone());
+    let (app, token_store, _registry) = build_app(config).expect("valid test configuration");
+
+    // What `run_http` would do at boot. In this mode it is a no-op, because no
+    // backend was ever attached to the token store.
+    token_store.load_persisted().await.unwrap();
+    assert!(
+        token_store.peek_token("victim-session").await.is_none(),
+        "a pure resource server does not resurrect someone else's grant"
+    );
+
+    // And serving a request writes nothing back.
+    let (status, session_id) =
+        whoami_request(&app, &[("authorization", &format!("Bearer {bearer}"))]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(token_store.peek_token(&session_id).await.is_none());
+
+    assert_eq!(
+        backend.get(NS_TOKENS, "victim-session").await.unwrap(),
+        Some(persisted),
+        "the persisted grant is left exactly as it was found"
+    );
+    assert_eq!(
+        backend.keys(NS_TOKENS).await.unwrap().len(),
+        1,
+        "and nothing was added to the token namespace"
     );
 }

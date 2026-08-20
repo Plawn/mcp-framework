@@ -69,6 +69,18 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     pub public_routes: Option<Router>,
 }
 
+/// Whether this configuration keeps server-side token state.
+///
+/// `false` only for [`TokenMode::ResourceServer`](crate::auth::TokenMode::ResourceServer),
+/// where the framework validates a bearer and forgets it: no refresh
+/// configuration, no token persistence, no load-at-startup, no expiry sweep.
+fn keeps_token_state(auth: &AuthProvider) -> bool {
+    match auth {
+        AuthProvider::OAuth(oauth_config) => oauth_config.token_mode.is_stateful(),
+        _ => true,
+    }
+}
+
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
 fn wrap_auth_middleware(
     router: Router,
@@ -215,8 +227,13 @@ where
     let transport_session_ttl = config.session_store.ttl();
     let transport_persistence = config.persistence.clone();
 
+    // Whether this deployment keeps token state at all. A pure resource server
+    // validates and forgets: giving it a refresh configuration or a persistence
+    // backend would hand it back the very state the mode exists to abolish.
+    let keeps_token_state = keeps_token_state(&config.auth);
+
     let mut token_store = match &config.auth {
-        AuthProvider::OAuth(oauth_config) => {
+        AuthProvider::OAuth(oauth_config) if keeps_token_state => {
             let refresh_config = RefreshConfig {
                 client_id: oauth_config.client_id.clone(),
                 client_secret: oauth_config.client_secret.clone(),
@@ -229,6 +246,13 @@ where
             // Lets a bearer the proxy never issued be validated against the
             // issuer's published keys — the only path open when the configured
             // OAuth client is public and Keycloak refuses introspection to it.
+            store.configure_unknown_bearer_validation(oauth_config);
+            store
+        }
+        AuthProvider::OAuth(oauth_config) => {
+            // Validation only: the issuer's public keys, and nothing that could
+            // refresh, store or resurrect a grant.
+            let mut store = TokenStore::new();
             store.configure_unknown_bearer_validation(oauth_config);
             store
         }
@@ -246,7 +270,12 @@ where
 
     let mut registry = config.capability_registry.unwrap_or_default();
     if let Some(ref backend) = config.persistence {
-        token_store.set_persistence(backend.clone());
+        // Sessions, capabilities and session bindings still persist — only the
+        // *token* namespace is left alone in resource-server mode, so a grant a
+        // previous passthrough deployment wrote is neither loaded nor touched.
+        if keeps_token_state {
+            token_store.set_persistence(backend.clone());
+        }
         registry.set_persistence(backend.clone());
         session_bindings.set_persistence(backend.clone());
     }
@@ -481,20 +510,24 @@ where
     // Start session cleanup task
     let session_cleanup = config.session_store.start_cleanup_task();
 
+    let keeps_token_state = keeps_token_state(&config.auth);
     let (app, token_store, registry) = build_app(config)?;
 
-    token_store
-        .load_persisted()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to load persisted tokens: {e}"))?;
+    if keeps_token_state {
+        token_store
+            .load_persisted()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load persisted tokens: {e}"))?;
+    }
 
     registry
         .load_persisted_versions()
         .await
         .map_err(|e| anyhow::anyhow!("failed to load persisted capability versions: {e}"))?;
 
-    // Start token cleanup task (purge expired tokens every 5 minutes)
-    let token_cleanup = token_store.start_cleanup_task(CLEANUP_INTERVAL);
+    // Purge expired tokens every 5 minutes — there are none to purge when the
+    // store is never written to.
+    let token_cleanup = keeps_token_state.then(|| token_store.start_cleanup_task(CLEANUP_INTERVAL));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
@@ -505,7 +538,9 @@ where
 
         // Stop cleanup tasks
         session_cleanup.abort();
-        token_cleanup.abort();
+        if let Some(token_cleanup) = token_cleanup {
+            token_cleanup.abort();
+        }
 
         // Give connections 5 seconds to close gracefully, then force exit
         tokio::spawn(async {
