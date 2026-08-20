@@ -501,15 +501,20 @@ pub async fn bearer_auth_middleware(
 /// The whole mode is this function: **validate, derive an identity, attach —
 /// and touch no shared state**.
 ///
-/// 1. **Validate** the bearer with the configured
-///    [`UnknownTokenValidation`](super::UnknownTokenValidation) policy. Every
-///    bearer is "unknown" here, because this mode issues none: the
-///    [`TokenStore`] is never consulted (no `peek_token`, no adoption) and never
-///    written. `jwks` is the intended policy — signature, `iss`, `exp`, `nbf`
-///    and `aud` are all checked locally against the issuer's published keys,
-///    with the same asymmetric-algorithm restriction and fetch cooldown as
-///    everywhere else. `introspection` remains available for deployments that
-///    explicitly ask for it.
+/// 1. **Validate** the bearer against the issuer's published keys — signature,
+///    `iss`, `exp`, `nbf` and `aud`, with the same asymmetric-algorithm
+///    restriction and fetch cooldown as everywhere else. The [`TokenStore`] is
+///    never consulted (no `peek_token`, no adoption) and never written.
+///
+///    This path is JWKS-**only**, deliberately ignoring
+///    [`UnknownTokenValidation`](super::UnknownTokenValidation): RFC 7662
+///    introspection reports whether a token is active, not who it was minted
+///    for, so falling back to it would wave through a token whose audience is
+///    another service — defeating the mandatory `OAUTH_EXPECTED_AUDIENCE`
+///    check that makes this mode safe. `OAuthConfig::validate` already refuses
+///    `introspection` at boot and coerces `jwks_then_introspection`; calling
+///    [`TokenStore::validate_bearer_via_jwks`] here makes the guarantee
+///    structural instead of configuration-dependent.
 /// 2. **Derive** the session identity from the credential's stable claims
 ///    (`sid`, then `sub`) when the protocol supplies none, exactly as the other
 ///    modes do — see [`credential_session_key`]. This is what lets a
@@ -529,7 +534,7 @@ async fn authorize_as_resource_server(
     request: &mut Request<Body>,
     token: &str,
 ) -> Result<(), Response> {
-    let validated = match state.token_store.validate_unknown_bearer(token).await {
+    let validated = match state.token_store.validate_bearer_via_jwks(token).await {
         Ok(validated) => validated,
         Err(rejection) => {
             // As everywhere else, the client only ever sees an opaque 401; the

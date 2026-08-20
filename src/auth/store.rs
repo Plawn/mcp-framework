@@ -256,6 +256,15 @@ impl std::fmt::Display for BearerRejection {
     }
 }
 
+/// Translate a local (JWKS) verdict into the rejection the middleware logs.
+fn bearer_rejection_from_jwks(rejection: JwksRejection) -> BearerRejection {
+    match rejection {
+        JwksRejection::NotAJwt => BearerRejection::OpaqueUnverifiable,
+        JwksRejection::Unavailable(why) => BearerRejection::IssuerUnreachable(why),
+        other => BearerRejection::TokenInvalid(other.to_string()),
+    }
+}
+
 /// Policy and issuer keys used to validate bearers the proxy did not issue.
 #[derive(Clone)]
 pub(super) struct BearerValidation {
@@ -386,9 +395,13 @@ impl TokenStore {
     ///
     /// The JWKS validator shares this store's HTTP client, so the key cache it
     /// builds is shared by every clone of the store.
+    ///
+    /// In [`TokenMode::ResourceServer`](super::TokenMode::ResourceServer) the
+    /// policy is forced to [`UnknownTokenValidation::Jwks`]: see
+    /// [`OAuthConfig::effective_unknown_token_validation`](super::OAuthConfig::effective_unknown_token_validation).
     pub fn configure_unknown_bearer_validation(&mut self, config: &super::OAuthConfig) {
         self.bearer_validation = Some(Arc::new(BearerValidation {
-            policy: config.unknown_token_validation,
+            policy: config.effective_unknown_token_validation(),
             jwks: JwksValidator::new(
                 &config.issuer_url,
                 config.expected_audiences.clone(),
@@ -556,6 +569,46 @@ impl TokenStore {
     /// for what JWKS cannot answer (an opaque credential, unreachable issuer
     /// keys). A JWT the issuer's own keys *rejected* is never re-litigated
     /// through introspection.
+    /// Validate a bearer **against the issuer's published keys only**.
+    ///
+    /// This is the sole validation path of
+    /// [`TokenMode::ResourceServer`](super::TokenMode::ResourceServer), and it
+    /// deliberately ignores [`UnknownTokenValidation`]: introspection answers
+    /// `active: true` without saying *who the token was minted for*, so an
+    /// introspection fallback would silently defeat the mandatory
+    /// `OAUTH_EXPECTED_AUDIENCE` check that makes a pure resource server safe
+    /// (any token the issuer ever signed, for any service, introspects as
+    /// active). `OAuthConfig::validate` refuses `introspection` at boot and
+    /// coerces `jwks_then_introspection` to `jwks`; this function makes the
+    /// guarantee structural rather than configuration-dependent.
+    pub(super) async fn validate_bearer_via_jwks(
+        &self,
+        token: &str,
+    ) -> Result<ValidatedBearer, BearerRejection> {
+        let Some(validation) = self.bearer_validation.as_ref() else {
+            return Err(BearerRejection::TokenInvalid(
+                "no JWKS validator is configured for this server".to_string(),
+            ));
+        };
+
+        match validation.jwks.validate(token).await {
+            Ok(jwt) => {
+                tracing::info!(
+                    subject = jwt.subject.as_deref().unwrap_or("<none>"),
+                    audiences = ?jwt.audiences,
+                    azp = jwt.authorized_party.as_deref().unwrap_or("<none>"),
+                    "Bearer validated locally against the issuer's JWKS (resource-server mode)"
+                );
+                Ok(ValidatedBearer {
+                    expires_at: jwt.expires_at,
+                    subject: jwt.subject,
+                    source: BearerValidationSource::Jwks,
+                })
+            }
+            Err(rejection) => Err(bearer_rejection_from_jwks(rejection)),
+        }
+    }
+
     pub(super) async fn validate_unknown_bearer(
         &self,
         token: &str,
@@ -591,13 +644,7 @@ impl TokenStore {
                 }
                 Err(rejection) => {
                     if !rejection.may_fall_back() || !policy.allows_introspection() {
-                        return Err(match rejection {
-                            JwksRejection::NotAJwt => BearerRejection::OpaqueUnverifiable,
-                            JwksRejection::Unavailable(why) => {
-                                BearerRejection::IssuerUnreachable(why)
-                            }
-                            other => BearerRejection::TokenInvalid(other.to_string()),
-                        });
+                        return Err(bearer_rejection_from_jwks(rejection));
                     }
                     credential_is_opaque = rejection == JwksRejection::NotAJwt;
                     if let JwksRejection::Unavailable(why) = &rejection {

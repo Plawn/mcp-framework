@@ -94,7 +94,7 @@ pub use audit::{
     CompositeLogger, NoopLogger, ToolCallLogger, ToolCallOutcome, ToolCallRecord, ToolCallSource,
     TracingLogger,
 };
-pub use auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, TokenStore};
+pub use auth::{AuthProvider, BasicAuthConfig, ConfigError, OAuthConfig, TokenMode, TokenStore};
 pub use capability::{
     AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
     ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,

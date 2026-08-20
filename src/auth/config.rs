@@ -17,6 +17,34 @@ pub type ConfiguredClient = oauth2::Client<
     oauth2::EndpointSet,
 >;
 
+/// A configuration combination the framework refuses to start with.
+///
+/// Returned by [`OAuthConfig::validate`] and propagated by
+/// [`build_app`](crate::transport::build_app) / [`run_http`](crate::transport::run_http),
+/// so a misconfiguration is a startup failure on every entry point — not only
+/// through [`McpAppBuilder`](crate::McpAppBuilder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError(String);
+
+impl ConfigError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The explanation, for callers that want to re-wrap it.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// OAuth configuration for Keycloak OIDC
 #[derive(Clone)]
 pub struct OAuthConfig {
@@ -98,30 +126,66 @@ impl OAuthConfig {
     /// which is exactly the confused-deputy case RFC 8707 / the MCP spec
     /// require a resource server to refuse. In the proxying modes the audience
     /// is implied by the fact that this server performed the exchange itself.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.token_mode != TokenMode::ResourceServer {
             return Ok(());
         }
 
         if self.expected_audiences.is_empty() {
-            return Err(
+            return Err(ConfigError::new(
                 "MCP_TOKEN_MODE=resource_server requires OAUTH_EXPECTED_AUDIENCE to be set \
                  (comma-separated). A pure resource server accepts a bearer on its signature \
                  alone, so without an audience it would accept every token the issuer signs, \
-                 for any service. Set it to the audience Keycloak puts in this server's tokens."
-                    .to_string(),
-            );
+                 for any service. Set it to the audience Keycloak puts in this server's tokens.",
+            ));
         }
 
-        if self.unknown_token_validation == UnknownTokenValidation::Reject {
-            return Err("MCP_TOKEN_MODE=resource_server is incompatible with \
-                 OAUTH_UNKNOWN_TOKEN_VALIDATION=reject: every bearer is an 'unknown' bearer in \
-                 resource-server mode (the framework issues none), so nothing would ever be \
-                 accepted. Use jwks (recommended), or jwks_then_introspection."
-                .to_string());
+        match self.unknown_token_validation {
+            UnknownTokenValidation::Reject => {
+                return Err(ConfigError::new(
+                    "MCP_TOKEN_MODE=resource_server is incompatible with \
+                     OAUTH_UNKNOWN_TOKEN_VALIDATION=reject: every bearer is an 'unknown' bearer \
+                     in resource-server mode (the framework issues none), so nothing would ever \
+                     be accepted. Use jwks.",
+                ));
+            }
+            UnknownTokenValidation::Introspection => {
+                return Err(ConfigError::new(
+                    "MCP_TOKEN_MODE=resource_server is incompatible with \
+                     OAUTH_UNKNOWN_TOKEN_VALIDATION=introspection: RFC 7662 answers whether a \
+                     token is active, not who it was minted for, so it cannot enforce \
+                     OAUTH_EXPECTED_AUDIENCE — any token the issuer ever signed, for any \
+                     service, introspects as active. Use jwks.",
+                ));
+            }
+            UnknownTokenValidation::JwksThenIntrospection => {
+                // The default value of the env var, so refusing it outright
+                // would break every deployment that never set it. Coerced
+                // instead — loudly, because the operator asked for a fallback
+                // that this mode cannot honour.
+                tracing::warn!(
+                    "OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks_then_introspection is coerced to `jwks` \
+                     in resource-server mode: an introspection fallback would accept tokens \
+                     whose audience is another service. Set it to `jwks` to silence this."
+                );
+            }
+            UnknownTokenValidation::Jwks => {}
         }
 
         Ok(())
+    }
+
+    /// The validation policy actually applied, after resource-server coercion.
+    ///
+    /// [`TokenMode::ResourceServer`] is JWKS-only by construction (see
+    /// [`validate`](Self::validate) for why); every other mode uses the
+    /// configured value verbatim.
+    pub fn effective_unknown_token_validation(&self) -> UnknownTokenValidation {
+        if self.token_mode == TokenMode::ResourceServer {
+            UnknownTokenValidation::Jwks
+        } else {
+            self.unknown_token_validation
+        }
     }
 
     /// Build the OAuth2 client for Keycloak

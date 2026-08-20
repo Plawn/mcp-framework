@@ -22,7 +22,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{Request, StatusCode},
-    routing::get,
+    routing::{get, post},
 };
 use common::{app_with, whoami_request};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -49,26 +49,45 @@ const MODULUS_1: &str = "t9pJsVVvTdGuph_D6wVlw84VxTSHsmd2OoJRsL1_2N3BAu9DGSascso
 /// in this mode — see `resource_server_mode_refuses_an_unconstrained_audience`.
 const AUDIENCE: &str = "blumana-mcp";
 
-/// A mock Keycloak that only serves discovery + JWKS. It deliberately has no
-/// token endpoint: nothing in this mode may talk to one.
-async fn issuer() -> (AuthProvider, Arc<AtomicUsize>) {
+/// A mock Keycloak, and the counters proving what the framework did and did not
+/// ask it.
+struct MockIssuer {
+    auth: AuthProvider,
+    /// How many times the issuer's signing keys were fetched.
+    jwks_hits: Arc<AtomicUsize>,
+    /// How many times RFC 7662 introspection was called. A pure resource server
+    /// must never reach this endpoint, whatever the configured policy says.
+    introspect_hits: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct IssuerState {
+    base: String,
+    jwks_hits: Arc<AtomicUsize>,
+    introspect_hits: Arc<AtomicUsize>,
+}
+
+/// A mock Keycloak that serves discovery + JWKS, and an introspection endpoint
+/// that says "active" to *anything*. It deliberately has no token endpoint:
+/// nothing in this mode may talk to one. The permissive introspection is the
+/// trap: it is exactly what an introspection fallback would wave through.
+async fn issuer() -> MockIssuer {
     let jwks_hits = Arc::new(AtomicUsize::new(0));
+    let introspect_hits = Arc::new(AtomicUsize::new(0));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let issuer_url = format!("http://{addr}/realms/test");
 
-    async fn discovery(
-        State((base, _)): State<(String, Arc<AtomicUsize>)>,
-    ) -> Json<serde_json::Value> {
+    async fn discovery(State(state): State<IssuerState>) -> Json<serde_json::Value> {
         Json(serde_json::json!({
-            "issuer": base,
-            "jwks_uri": format!("{base}/protocol/openid-connect/certs"),
+            "issuer": state.base,
+            "jwks_uri": format!("{}/protocol/openid-connect/certs", state.base),
         }))
     }
 
-    async fn certs(State((_, hits)): State<(String, Arc<AtomicUsize>)>) -> Json<serde_json::Value> {
-        hits.fetch_add(1, Ordering::Relaxed);
+    async fn certs(State(state): State<IssuerState>) -> Json<serde_json::Value> {
+        state.jwks_hits.fetch_add(1, Ordering::Relaxed);
         Json(serde_json::json!({
             "keys": [{
                 "kty": "RSA",
@@ -81,20 +100,34 @@ async fn issuer() -> (AuthProvider, Arc<AtomicUsize>) {
         }))
     }
 
+    async fn introspect(State(state): State<IssuerState>) -> Json<serde_json::Value> {
+        state.introspect_hits.fetch_add(1, Ordering::Relaxed);
+        Json(serde_json::json!({ "active": true }))
+    }
+
     let app = Router::new()
         .route(
             "/realms/test/.well-known/openid-configuration",
             get(discovery),
         )
         .route("/realms/test/protocol/openid-connect/certs", get(certs))
-        .with_state((issuer_url.clone(), jwks_hits.clone()));
+        .route(
+            "/realms/test/protocol/openid-connect/token/introspect",
+            post(introspect),
+        )
+        .with_state(IssuerState {
+            base: issuer_url.clone(),
+            jwks_hits: jwks_hits.clone(),
+            introspect_hits: introspect_hits.clone(),
+        });
 
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    (
-        AuthProvider::OAuth(resource_server_config(issuer_url)),
+    MockIssuer {
+        auth: AuthProvider::OAuth(resource_server_config(issuer_url)),
         jwks_hits,
-    )
+        introspect_hits,
+    }
 }
 
 fn resource_server_config(issuer_url: String) -> OAuthConfig {
@@ -199,7 +232,7 @@ async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
 
 #[tokio::test]
 async fn a_request_without_a_bearer_is_told_where_to_authenticate() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let (app, _) = app_with(auth);
 
     let response = app
@@ -227,7 +260,7 @@ async fn a_request_without_a_bearer_is_told_where_to_authenticate() {
 
 #[tokio::test]
 async fn a_valid_bearer_is_accepted_and_nothing_is_kept() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let bearer = Jwt::valid(&auth).sign();
     let (app, token_store) = app_with(auth);
 
@@ -254,7 +287,7 @@ async fn a_valid_bearer_is_accepted_and_nothing_is_kept() {
 
 #[tokio::test]
 async fn an_expired_bearer_is_refused_rather_than_refreshed() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let bearer = Jwt {
         exp: now() - 3600,
         ..Jwt::valid(&auth)
@@ -271,7 +304,7 @@ async fn an_expired_bearer_is_refused_rather_than_refreshed() {
 
 #[tokio::test]
 async fn a_token_minted_for_another_service_is_refused() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let bearer = Jwt {
         audience: "some-other-api",
         ..Jwt::valid(&auth)
@@ -288,7 +321,7 @@ async fn a_token_minted_for_another_service_is_refused() {
 
 #[tokio::test]
 async fn a_bearer_signed_by_a_key_the_issuer_does_not_publish_is_refused() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     // Signed with key 2 but claiming key 1's `kid`: the signature check fails
     // against the published key.
     let bearer = Jwt {
@@ -305,7 +338,9 @@ async fn a_bearer_signed_by_a_key_the_issuer_does_not_publish_is_refused() {
 
 #[tokio::test]
 async fn a_non_jwt_credential_is_refused_without_asking_anyone() {
-    let (auth, jwks_hits) = issuer().await;
+    let MockIssuer {
+        auth, jwks_hits, ..
+    } = issuer().await;
     let (app, _) = app_with(auth);
 
     let (status, _) = whoami_request(&app, &[("authorization", "Bearer not-a-jwt")]).await;
@@ -320,7 +355,7 @@ async fn a_non_jwt_credential_is_refused_without_asking_anyone() {
 
 #[tokio::test]
 async fn the_same_user_lands_on_the_same_identity_across_requests() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let auth_header = format!("Bearer {}", Jwt::valid(&auth).sign());
     let (app, _) = app_with(auth);
 
@@ -332,7 +367,7 @@ async fn the_same_user_lands_on_the_same_identity_across_requests() {
 
 #[tokio::test]
 async fn a_client_cannot_bind_itself_to_someone_elses_identity() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let auth_header = format!("Bearer {}", Jwt::valid(&auth).sign());
     let (app, _) = app_with(auth);
 
@@ -412,7 +447,7 @@ async fn post_mcp(
 
 #[tokio::test]
 async fn a_filter_still_sees_the_credential_although_nothing_is_stored() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let bearer = Jwt::valid(&auth).sign();
 
     let saw_token = Arc::new(AtomicBool::new(false));
@@ -510,7 +545,7 @@ async fn a_filter_still_sees_the_credential_although_nothing_is_stored() {
 
 #[tokio::test]
 async fn the_token_endpoint_is_not_proxied() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let (app, _) = app_with(auth);
 
     let response = app
@@ -534,7 +569,7 @@ async fn the_token_endpoint_is_not_proxied() {
 
 #[tokio::test]
 async fn the_authorization_and_login_flows_are_not_proxied() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let (app, _) = app_with(auth);
 
     // `/oauth/authorize` goes with `/oauth/token`: it rewrites `client_id`, so
@@ -567,7 +602,7 @@ async fn the_authorization_and_login_flows_are_not_proxied() {
 
 #[tokio::test]
 async fn dynamic_client_registration_stays_because_keycloak_sends_no_cors() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let expected_client_id = match &auth {
         AuthProvider::OAuth(config) => config.client_id.clone(),
         _ => unreachable!(),
@@ -610,7 +645,7 @@ async fn dynamic_client_registration_stays_because_keycloak_sends_no_cors() {
 
 #[tokio::test]
 async fn protected_resource_metadata_names_the_authorization_server() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let issuer_url = issuer_url_of(&auth);
     let (app, _) = app_with(auth);
 
@@ -631,7 +666,7 @@ async fn protected_resource_metadata_names_the_authorization_server() {
 
 #[tokio::test]
 async fn authorization_server_metadata_describes_keycloak_not_this_server() {
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let issuer_url = issuer_url_of(&auth);
     let (app, _) = app_with(auth);
 
@@ -660,7 +695,7 @@ async fn authorization_server_metadata_describes_keycloak_not_this_server() {
 #[tokio::test]
 async fn the_proxying_modes_still_advertise_themselves() {
     // Guard against the branch leaking into passthrough.
-    let (auth, _) = issuer().await;
+    let auth = issuer().await.auth;
     let issuer_url = issuer_url_of(&auth);
     let mut config = resource_server_config(issuer_url);
     config.token_mode = TokenMode::Passthrough;
@@ -691,7 +726,8 @@ fn resource_server_mode_refuses_an_unconstrained_audience() {
 
     let error = config
         .validate()
-        .expect_err("this cannot be allowed to run");
+        .expect_err("this cannot be allowed to run")
+        .to_string();
     assert!(
         error.contains("OAUTH_EXPECTED_AUDIENCE"),
         "the message must name the variable to set: {error}"
@@ -705,7 +741,8 @@ fn resource_server_mode_refuses_the_reject_policy() {
 
     let error = config
         .validate()
-        .expect_err("nothing would ever be accepted");
+        .expect_err("nothing would ever be accepted")
+        .to_string();
     assert!(error.contains("reject"), "{error}");
 }
 
@@ -722,4 +759,78 @@ fn the_proxying_modes_are_left_alone_by_the_boot_check() {
             "the requirement is specific to resource-server mode ({mode:?})"
         );
     }
+}
+
+#[test]
+fn resource_server_mode_refuses_the_introspection_policy() {
+    let mut config = resource_server_config("http://issuer/realms/test".to_string());
+    config.unknown_token_validation = UnknownTokenValidation::Introspection;
+
+    let error = config
+        .validate()
+        .expect_err("introspection cannot enforce an audience")
+        .to_string();
+    assert!(
+        error.contains("OAUTH_EXPECTED_AUDIENCE"),
+        "the message must say what introspection fails to check: {error}"
+    );
+}
+
+#[test]
+fn the_default_policy_is_coerced_to_jwks_rather_than_refused() {
+    // `jwks_then_introspection` is the default value of the env var, so
+    // refusing it outright would break every deployment that never set it.
+    let mut config = resource_server_config("http://issuer/realms/test".to_string());
+    config.unknown_token_validation = UnknownTokenValidation::JwksThenIntrospection;
+
+    assert!(config.validate().is_ok(), "the default must still boot");
+    assert_eq!(
+        config.effective_unknown_token_validation(),
+        UnknownTokenValidation::Jwks,
+        "but the fallback half of it is dropped"
+    );
+
+    let mut passthrough = resource_server_config("http://issuer/realms/test".to_string());
+    passthrough.token_mode = TokenMode::Passthrough;
+    passthrough.unknown_token_validation = UnknownTokenValidation::JwksThenIntrospection;
+    assert_eq!(
+        passthrough.effective_unknown_token_validation(),
+        UnknownTokenValidation::JwksThenIntrospection,
+        "the coercion is specific to resource-server mode"
+    );
+}
+
+#[tokio::test]
+async fn introspection_never_gets_a_say_even_when_the_policy_asks_for_it() {
+    // The hole this closes: RFC 7662 answers "is this token active", never
+    // "who was it minted for". A token the issuer signed for another service
+    // introspects as active, so an introspection fallback silently defeats the
+    // mandatory audience check — the whole reason this mode is safe.
+    let MockIssuer {
+        auth,
+        introspect_hits,
+        ..
+    } = issuer().await;
+    let mut config = match auth {
+        AuthProvider::OAuth(config) => config,
+        _ => unreachable!(),
+    };
+    config.unknown_token_validation = UnknownTokenValidation::JwksThenIntrospection;
+    let (app, _) = app_with(AuthProvider::OAuth(config));
+
+    // An opaque credential: JWKS cannot speak for it, which is precisely the
+    // case `jwks_then_introspection` would hand to the authorization server —
+    // and this mock says "active" to anything.
+    let (status, _) = whoami_request(&app, &[("authorization", "Bearer opaque-but-active")]).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a credential the issuer's keys cannot vouch for is refused"
+    );
+    assert_eq!(
+        introspect_hits.load(Ordering::Relaxed),
+        0,
+        "and the authorization server is never even asked"
+    );
 }

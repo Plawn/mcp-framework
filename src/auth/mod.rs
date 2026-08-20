@@ -15,7 +15,9 @@ use axum::{
 };
 use std::sync::Arc;
 
-pub use config::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, UnknownTokenValidation};
+pub use config::{
+    AuthProvider, BasicAuthConfig, ConfigError, OAuthConfig, TokenMode, UnknownTokenValidation,
+};
 pub use jwks::{JwksRejection, JwksValidator, ValidatedJwt};
 pub use metadata::{
     WellKnownState, authorization_server_metadata_handler, protected_resource_metadata_handler,
