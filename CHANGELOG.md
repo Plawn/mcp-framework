@@ -10,6 +10,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] — Unreleased
 
+### Added — `TokenMode::ResourceServer`, the framework as a pure OAuth resource server
+
+In passthrough the client and the server co-own the same refresh token. Keycloak
+rotates refresh tokens, so the first server-side refresh invalidates the copy the
+client is holding and the link breaks one cycle later. MCP 2025-06-18 settled the
+question by classifying the MCP server as an OAuth **resource server**: it
+validates, it does not exchange.
+
+- **`MCP_TOKEN_MODE=resource_server`** (alias `resource-server`, or
+  `OAuthConfig::token_mode`). The inbound JWT is validated locally against the
+  issuer's published keys — same JWKS path, same rules (asymmetric algorithms
+  only, `kid` cache, rate-limited refetch, `iss` / `exp` / `nbf` / `aud`) — and
+  **nothing is kept**: no `TokenStore` entry, no server-side refresh, no proxied
+  exchange. An expired or invalid bearer gets `401` plus the protected-resource
+  `WWW-Authenticate` challenge, and the client refreshes on its own. The server
+  becomes stateless: horizontal scaling no longer needs shared persistence for
+  tokens.
+- **`OAUTH_EXPECTED_AUDIENCE` is mandatory in this mode** and
+  `OAuthConfig::validate()` fails at boot without it. The mode accepts a bearer on
+  the strength of a signature alone, so an unconstrained `aud` would accept every
+  token the issuer ever signed, for any service — the confused deputy an audience
+  check exists to prevent. `OAUTH_UNKNOWN_TOKEN_VALIDATION=reject` is refused for
+  the same class of reason: every bearer is "unknown" when the framework issues
+  none.
+- **Consumers still get a token.** With no store entry to look up, the middleware
+  attaches the validated credential to the request (`RequestToken`), and
+  `resolve_token` prefers it over the store — so capability filters, access
+  validators and tool handlers see the same `StoredToken` as before (bearer +
+  decoded claims), with `refresh_token` permanently `None`. `ctx.token()` is added
+  to `RequestContextExt` because `ctx.token_store().get_token(ctx.session_id())`
+  now returns `None` on a perfectly authenticated request.
+- **`/oauth/token`, `/oauth/authorize` and the browser-flow routes stop proxying**
+  and answer `404` with a reason (an absent route would fall through to the
+  auth-wrapped MCP endpoint and answer a misleading `401`). `/oauth/authorize`
+  goes with the token endpoint because it rewrites `client_id`: the code it
+  returns would not be redeemable at Keycloak's own token endpoint. The browser
+  flow writes the grant into the store, which is the state this mode abolishes.
+- **`/oauth/register` stays** — Keycloak's registration endpoint sends no CORS
+  headers, so a browser-based client cannot call it directly. Its offline fallback
+  now returns the configured `OAUTH_CLIENT_ID` rather than a fabricated UUID,
+  since nothing rewrites `client_id` downstream any more.
+- **Discovery points at the authorization server.** The protected-resource
+  metadata (RFC 9728) advertises the Keycloak issuer, and
+  `/.well-known/oauth-authorization-server` — kept for MCP 2025-03-26 clients that
+  still probe the resource server for it — now describes Keycloak rather than this
+  server. Side effect: the advertised issuer finally matches the `iss` the tokens
+  carry (RFC 9207).
+
+Passthrough and opaque are unchanged. Migration notes, including what Keycloak
+needs and why forwarding the inbound bearer to an upstream API is not an option,
+are in `CLAUDE.md`.
+
 ### Added — `transport::loopback`, an in-process caller that is a real client
 
 An application embedding this framework often calls its own tools from inside

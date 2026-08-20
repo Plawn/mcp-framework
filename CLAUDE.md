@@ -55,20 +55,31 @@ Two modes selected via `--transport` CLI flag:
 `AuthProvider` enum drives which middleware and routes are registered:
 - **None**: no auth middleware
 - **Basic**: HTTP Basic auth middleware, credentials from `BASIC_AUTH_*` env vars
-- **OAuth**: Full OAuth2/OIDC proxy for Keycloak — includes RFC 8414/9728 metadata endpoints, RFC 7591 dynamic client registration, PKCE authorization flow, and token proxying. All OAuth routes live under `/oauth/`.
+- **OAuth**: OAuth2/OIDC for Keycloak — RFC 8414/9728 metadata endpoints, RFC 7591 dynamic client registration, PKCE authorization flow, and (in the proxying token modes) token proxying. All OAuth routes live under `/oauth/`. How much of the flow is actually proxied depends on `TokenMode` — see below.
 
 Key type: `TokenStore` — thread-safe token storage shared between auth middleware and the server handler via the factory closure. Supports automatic token refresh for OAuth mode.
 
-#### Opaque token mode (`TokenMode`)
+#### Token modes (`TokenMode`)
 
-When using OAuth, the framework supports two token modes controlled by `TokenMode` enum:
+When using OAuth, three modes are available. They differ on one question — **who holds the grant** — and everything else follows from the answer:
 
-- **Passthrough** (default): Keycloak tokens are forwarded directly to the MCP client. Simple, but the client holds real JWTs and a platform logout kills the MCP session.
-- **Opaque**: The framework emits its own opaque UUID tokens to MCP clients and keeps the real Keycloak tokens server-side. The client never sees a JWT. Refresh is handled internally.
+| | `Passthrough` (default) | `Opaque` | `ResourceServer` |
+|---|---|---|---|
+| What the client holds | the real Keycloak JWT | a framework UUID | the real Keycloak JWT |
+| What the server keeps | access + refresh token | access + refresh token | **nothing** |
+| Who refreshes | both (see below) | the framework | the client, alone |
+| `/oauth/token` | proxied | proxied, response rewritten | not proxied (`404`) |
+| `/oauth/authorize` | proxied | proxied | not proxied (`404`) |
+| Bearer validation | store, then `validate_unknown_bearer` | opaque → store | `validate_unknown_bearer` only |
+| Horizontal scaling | needs shared persistence | needs shared persistence | stateless |
+
+- **Passthrough**: simple, but client and server co-own the same refresh token. Keycloak rotates refresh tokens, so the first server-side refresh invalidates the client's copy and the link breaks one cycle later. A platform logout also kills the MCP session.
+- **Opaque**: the client never sees a JWT; the framework refreshes internally. Costs server-side state that every instance must share.
+- **ResourceServer**: what MCP 2025-06-18 and later actually specify — the MCP server is an OAuth *resource server*, not an authorization server. See below.
 
 Configurable via:
 - `OAuthConfig` field: `token_mode: TokenMode::Opaque`
-- Environment variable: `MCP_TOKEN_MODE=opaque` (default: `passthrough`, read by `OAuthConfig::from_env()`)
+- Environment variable: `MCP_TOKEN_MODE=passthrough|opaque|resource_server` (default: `passthrough`, read by `OAuthConfig::from_env()`; `resource-server` is accepted as an alias)
 
 `TokenMode` lives inside `OAuthConfig`, making misconfiguration structurally impossible (e.g. setting opaque mode with Basic auth).
 
@@ -76,13 +87,63 @@ Configurable via:
 
 In passthrough mode, the HTTP middleware treats tokens captured by `/oauth/token` as trusted grants and enforces the expiry recorded in `TokenStore`. A bearer unknown to the store (for example, a bring-your-own or token-exchange Keycloak token) goes through `TokenStore::validate_unknown_bearer` (see below). Inactive, malformed, expired, or unrefreshable credentials return `401` with the protected-resource `WWW-Authenticate` challenge before rmcp dispatches the request.
 
+#### Pure resource server mode (`TokenMode::ResourceServer`)
+
+The framework validates the inbound JWT locally and keeps **no** token state: no `TokenStore` entry, no server-side refresh, no proxied exchange. An expired or invalid bearer gets `401` plus the protected-resource `WWW-Authenticate` challenge; the client re-authenticates against the authorization server on its own, with a refresh token nobody else has touched.
+
+`TokenMode::is_stateful()` is the single predicate every stateful path keys off — the token proxy, the legacy login flow, `TokenStore` writes, server-side refresh.
+
+**Validation.** The middleware branches before any store access and calls the same `TokenStore::validate_unknown_bearer` described below, so the JWKS rules are unchanged: asymmetric algorithms only, keys cached by `kid`, rate-limited refetches, `iss` / `exp` / `nbf` / `aud` checked locally. `UnknownTokenValidation::Jwks` is the recommended policy — a pure resource server has no reason to ask the authorization server anything, and `reject` is refused outright (every bearer is "unknown" when the framework issues none).
+
+**`OAUTH_EXPECTED_AUDIENCE` is mandatory here**, and `OAuthConfig::validate()` fails at boot without it (called from `McpAppBuilder::validate` and from `run_http_mode`, since `McpApp` can be built without the builder). The reason is not pedantry: this mode accepts a bearer on the strength of a signature alone, so an unconstrained `aud` would accept *every* token the issuer ever signed, including one minted for a different service — the confused-deputy case RFC 8707 and the MCP spec require a resource server to refuse. In the proxying modes the audience is implied by the fact that this server performed the exchange itself, which is why the check is scoped to this mode.
+
+**What token consumers receive.** There is no store entry to look up, so the middleware attaches the validated credential to the request as a `RequestToken(StoredToken)` extension, and `resolve_token` (`src/capability/filter.rs`) prefers it over the store. rmcp injects the axum `http::request::Parts` — extensions included — into the MCP request context, which is how it survives the trip. Since every consumer path already funnels through `resolve_token`, capability filters, access validators and tool handlers see exactly what they see in the proxying modes:
+
+- `access_token` — the bearer the client sent, verbatim
+- `decoded_claims` — populated by the global claims decoder, as usual
+- `expires_at` — from the JWT's `exp`
+- `refresh_token` — **always `None`**. It belongs to the client and never reaches this process.
+
+From a `RequestContext`, use `ctx.token()` (`RequestContextExt`) rather than `ctx.token_store().get_token(ctx.session_id())`: the latter returns `None` in this mode even though the request is perfectly authenticated.
+
+**Session identity.** Unchanged from passthrough: `credential_session_key` derives a stable per-user key from the JWT's `sid` (else `sub`), injected under `MCP_FALLBACK_SESSION_HEADER`. `SessionStore<T>` therefore still works — it is application data, not credentials, and nothing about this mode says the application may not keep state.
+
+**Routing.** Five paths stop proxying: `/oauth/token`, `/oauth/authorize`, `/oauth/login`, `/oauth/callback`, `/oauth/status`. They answer `404` with a reason rather than being absent from the router — an absent path falls through to the auth-wrapped MCP fallback and answers `401`, blaming the client's credentials for a route that does not exist.
+
+`/oauth/token` is the point of the mode. `/oauth/authorize` goes with it for a reason worth stating: the proxy rewrites `client_id` to the configured `OAUTH_CLIENT_ID`, so the authorization code it returns is bound to *that* client, while the client then redeems it at Keycloak's token endpoint under its own `client_id` — `invalid_grant`. Half a proxied flow is worse than none. The legacy login routes perform the exchange server-side and write the grant into `TokenStore`, which is the state this mode abolishes.
+
+**`/oauth/register` stays.** Keycloak's `clients-registrations/openid-connect` endpoint sends no CORS headers, so a browser-based MCP client cannot perform RFC 7591 dynamic client registration against it directly; the framework's translation is still needed. Its offline fallback now returns the **configured** `OAUTH_CLIENT_ID` instead of a fabricated UUID — nothing rewrites `client_id` downstream any more, so an invented id would simply not exist at Keycloak. (As before, that Keycloak client must allow the client's `redirect_uri`.)
+
+**Discovery.** `/.well-known/oauth-protected-resource` (and `.../mcp`) advertises the Keycloak issuer in `authorization_servers` — RFC 9728, the resource server pointing at the AS instead of at itself. `/.well-known/oauth-authorization-server` is still served, because MCP 2025-03-26 clients probe the resource server for it and a `404` strands them, but it now describes **Keycloak**: `issuer`, `authorization_endpoint` and `token_endpoint` are Keycloak's, and only `registration_endpoint` remains ours (the CORS reason above). A welcome side effect: the advertised issuer finally matches the `iss` the tokens carry, which is the RFC 9207 mismatch rmcp's client reports as `AuthorizationServerIssuerMismatch` under passthrough.
+
+**Migrating from passthrough.** The framework side is three settings:
+
+```bash
+MCP_TOKEN_MODE=resource_server
+OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks
+OAUTH_EXPECTED_AUDIENCE=my-mcp-server   # mandatory; boot fails without it
+```
+
+What to check before flipping it:
+
+1. **Keycloak must put that audience in the token.** Add an audience mapper to the client (or a client scope) so `aud` contains the value above. Without it every request 401s — the failure is loud, and the accepted `aud` / `azp` are logged on every acceptance in the other modes, which is how to read the right value off real traffic first.
+2. **The client must handle its own refresh.** Any MCP client implementing 2025-06-18 does; a client that relied on the framework proxying `/oauth/token` will not.
+3. **The Keycloak client must allow the client's `redirect_uri` directly**, since `/oauth/authorize` no longer rewrites anything.
+4. **Server-side code that read `token.refresh_token` stops working** — that value is gone by design. Code reading `access_token` or `claims::<C>()` is unaffected.
+5. **Existing sessions are not migrated.** Tokens the store holds from the previous mode are simply ignored; clients re-authenticate once.
+
+**Calling an upstream API with the inbound bearer is forbidden, and the framework does not do it for you.** The MCP spec is explicit: a token issued for this resource server must not be forwarded to another service — that is the confused deputy the audience check exists to prevent, and it is exactly what "just pass the bearer through" does. Two supported paths:
+
+- **Token exchange (RFC 8693)** — the server exchanges the inbound token for one whose `aud` is the upstream service. Requires a confidential client; the framework does not implement this, a consumer that needs it does the exchange in its own tool handler using the credential from `ctx.token()`.
+- **An explicitly shared audience** — the deployment deliberately mints tokens carrying both services in `aud`, and both list each other in `OAUTH_EXPECTED_AUDIENCE`. Simpler, and correspondingly blunter: the two services become one trust boundary.
+
 #### Validating bearers the proxy did not issue (`UnknownTokenValidation`)
 
 RFC 7662 introspection used to be the only check available for such a bearer, and it is not always reachable: **Keycloak refuses the introspection endpoint to public clients**, answering `403 {"error":"invalid_request","error_description":"Client not allowed."}`. That refusal is a property of the configured `OAUTH_CLIENT_ID`, not of the token, so on a public-client deployment *every* unknown bearer was rejected — including a perfectly valid token-exchange token whose `aud` is the downstream service.
 
 Verifying the signature against the issuer's published keys has no such requirement, so `validate_unknown_bearer` tries, in order:
 
-1. **`TokenStore`** — a proxy-issued token is already trusted; it never causes a JWKS or introspection round-trip.
+1. **`TokenStore`** — a proxy-issued token is already trusted; it never causes a JWKS or introspection round-trip. (Not applicable in `ResourceServer` mode, where the store is always empty.)
 2. **JWKS** (`src/auth/jwks.rs`) — `jwks_uri` discovered from `{issuer}/.well-known/openid-configuration`, keys cached by `kid`, signature plus `iss` / `exp` / `nbf` (and `aud`, when configured) checked locally.
 3. **Introspection** — only if JWKS *could not answer*.
 
@@ -100,7 +161,7 @@ Two properties are worth knowing:
 - **A verdict from the issuer's own keys is final.** `JwksRejection::Invalid` (bad signature, wrong `iss`, expired) is *not* re-litigated through introspection; only `NotAJwt` / `UnknownKey` / `Unavailable` fall through. This is what keeps `jwks_then_introspection` as strict as `jwks`.
 - **Fetches are rate-limited.** An unknown `kid` triggers a refetch (Keycloak rotates signing keys) but at most once per `JWKS_REFRESH_COOLDOWN`, and the cooldown keys off the last *attempt* — so neither a forged `kid` nor an issuer that is down can turn one inbound request into one outbound request. Keys already fetched survive a failed refresh.
 
-`OAUTH_EXPECTED_AUDIENCE` (comma-separated) constrains `aud` on a locally validated token. It is empty by default: a token-exchange token legitimately carries an audience this server was never told about, so refusing it out of the box would break the case this path exists for. The observed `aud` / `azp` are logged on every acceptance, which is how a deployment tightens the list from real traffic.
+`OAUTH_EXPECTED_AUDIENCE` (comma-separated) constrains `aud` on a locally validated token. It is empty by default **except in `ResourceServer` mode, where it is mandatory** (see above). Elsewhere it is empty because: a token-exchange token legitimately carries an audience this server was never told about, so refusing it out of the box would break the case this path exists for. The observed `aud` / `azp` are logged on every acceptance, which is how a deployment tightens the list from real traffic.
 
 Rejections are typed (`BearerRejection`) so the logs separate the three cases the client cannot distinguish behind its uniform `401`: introspection not permitted (a server misconfiguration — warned once, then never retried), the token being genuinely invalid, and an unknown token validated locally via JWKS.
 
@@ -508,9 +569,9 @@ If you already have a `redis::aio::ConnectionManager` (e.g. shared with other pa
 | `BASIC_AUTH_USERNAME`, `BASIC_AUTH_PASSWORD` | Basic auth | — |
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth | `openid,profile,email` |
-| `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` |
+| `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` (also `opaque`, `resource_server`) |
 | `OAUTH_UNKNOWN_TOKEN_VALIDATION` | `OAuthConfig::from_env()` | `jwks_then_introspection` (also `jwks`, `introspection`, `reject`) |
-| `OAUTH_EXPECTED_AUDIENCE` | `OAuthConfig::from_env()` | — (comma-separated; empty = `aud` unconstrained) |
+| `OAUTH_EXPECTED_AUDIENCE` | `OAuthConfig::from_env()` | — (comma-separated; empty = `aud` unconstrained — **required** when `MCP_TOKEN_MODE=resource_server`) |
 | `MCP_METRICS_PATH` | `MetricsConfig::from_env()` (feature `metrics`) | `/metrics` (`off`/empty disables) |
 | `MCP_METRICS_NAMESPACE` | `MetricsConfig::from_env()` | `mcp` |
 | `MCP_METRICS_TRACK_SESSIONS` | `MetricsConfig::from_env()` | `true` |
