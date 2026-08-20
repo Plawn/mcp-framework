@@ -90,6 +90,22 @@ impl PersistenceBackend for RedisBackend {
         })
     }
 
+    fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, bool> {
+        let rkey = self.redis_key(ns, key);
+        let secs = ttl.as_secs().max(1);
+        let mut conn = self.conn.clone();
+        Box::pin(async move {
+            // EXPIRE answers 1 when the key existed and now carries the TTL,
+            // 0 when there was nothing to re-arm — one round-trip, atomic.
+            let armed: i64 = redis::cmd("EXPIRE")
+                .arg(&rkey)
+                .arg(secs)
+                .query_async(&mut conn)
+                .await?;
+            Ok(armed == 1)
+        })
+    }
+
     fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()> {
         let rkey = self.redis_key(ns, key);
         let idx = self.index_key(ns);

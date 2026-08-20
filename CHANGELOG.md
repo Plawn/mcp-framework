@@ -21,6 +21,12 @@ creation regardless of activity: the first failover past that point answered
 - A successful `load` now re-arms the entry's TTL, so a session that has been
   recovered once stays recoverable on the next failover. A failed re-arm is
   logged and does not fail the load.
+- `PersistenceBackend::touch(ns, key, ttl) -> bool` is the primitive behind
+  it: atomic, and honest about a key that is already gone. A `get` followed by
+  a `set` would have recreated a session a peer had just `DELETE`d. The
+  default implementation is a no-op reporting `true` (right for a backend
+  without expiry); `RedisBackend` maps it to `EXPIRE`, `InMemoryBackend` to a
+  presence check.
 - `CLAUDE.md` gains a "Transport session recovery" section stating which of
   the three session-keyed stores (`mcp_transport_sessions`, `sessions`,
   `tokens`) owns which data — one mechanism per datum.

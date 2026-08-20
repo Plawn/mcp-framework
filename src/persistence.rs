@@ -57,6 +57,20 @@ pub trait PersistenceBackend: Send + Sync + 'static {
 
     fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>>;
 
+    /// Re-arm the TTL of an existing entry without rewriting it, atomically:
+    /// returns `true` if the entry was present and its TTL is now `ttl`,
+    /// `false` if it no longer exists. A `get` followed by a `set` cannot give
+    /// that guarantee — a peer deleting the key between the two would see it
+    /// resurrected with a fresh TTL.
+    ///
+    /// The default does nothing and reports the entry as present, which is
+    /// correct for a backend without expiry. A backend that honours `ttl` in
+    /// `set` should override this with its native primitive (Redis `EXPIRE`).
+    fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, bool> {
+        let _ = (ns, key, ttl);
+        Box::pin(async { Ok(true) })
+    }
+
     /// Atomically acquire a distributed lock for `key` within `ns`, held for at
     /// most `ttl` (after which it auto-expires so a crashed holder can't deadlock
     /// the key). Returns `true` if the lock was acquired, `false` if another
@@ -152,6 +166,15 @@ impl PersistenceBackend for InMemoryBackend {
             let mut data = self.data.write().await;
             data.insert((ns, key), value);
             Ok(())
+        })
+    }
+
+    fn touch(&self, ns: &str, key: &str, _ttl: Duration) -> BoxFuture<'_, bool> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        Box::pin(async move {
+            let data = self.data.read().await;
+            Ok(data.contains_key(&(ns, key)))
         })
     }
 
