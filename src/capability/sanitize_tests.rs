@@ -958,3 +958,133 @@ fn data_keywords_are_not_treated_as_schemas() {
     assert_eq!(preset["examples"][0]["title"], "c");
     assert_eq!(preset["const"]["title"], "d");
 }
+
+/// Collect every `$ref` left anywhere in a schema. [`inline_defs`] drops `$defs`,
+/// so a surviving reference dangles — it must find nothing.
+fn remaining_refs(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(r)) = map.get("$ref") {
+                out.push(r.clone());
+            }
+            for v in map.values() {
+                remaining_refs(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                remaining_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A definition that references itself — what schemars emits for any recursive
+/// Rust type, e.g. `enum NodeOp { Map { template: Box<NodeOp> } }`. Inlining it
+/// blindly recursed until the thread's stack was gone, aborting the process on
+/// `tools/list`. The back-edge must be truncated, not followed.
+#[test]
+fn resolve_refs_truncates_self_referential_def() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "op": { "$ref": "#/$defs/NodeOp" } },
+        "$defs": {
+            "NodeOp": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "template": {
+                        "description": "The op replayed per item.",
+                        "$ref": "#/$defs/NodeOp"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize(&mut tools);
+    let root = tools[0].input_schema.as_ref();
+    let op = root["properties"]["op"].as_object().unwrap();
+
+    // The first expansion is untouched: the recursive type still shows its shape.
+    assert!(op["properties"].as_object().unwrap().contains_key("prompt"));
+    assert_eq!(op["required"][0], "prompt");
+
+    // The back-edge degrades to a permissive object, keeping its prose.
+    let template = op["properties"]["template"].as_object().unwrap();
+    assert_eq!(template["type"], "object");
+    assert_eq!(template["description"], "The op replayed per item.");
+    assert!(!template.contains_key("$ref"));
+
+    let mut refs = Vec::new();
+    remaining_refs(&Value::Object(root.clone()), &mut refs);
+    assert!(refs.is_empty(), "dangling refs left: {refs:?}");
+}
+
+/// The cycle need not be direct: `A -> B -> A` is the same trap, and the chain
+/// of names being inlined is what catches it.
+#[test]
+fn resolve_refs_truncates_mutually_recursive_defs() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "a": { "$ref": "#/$defs/A" } },
+        "$defs": {
+            "A": {
+                "type": "object",
+                "properties": { "to_b": { "$ref": "#/$defs/B" } }
+            },
+            "B": {
+                "type": "object",
+                "properties": { "back_to_a": { "$ref": "#/$defs/A" } }
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize(&mut tools);
+    let root = tools[0].input_schema.as_ref();
+
+    // A expanded, B expanded inside it, and B's edge back to A cut there.
+    let back = root["properties"]["a"]["properties"]["to_b"]["properties"]["back_to_a"]
+        .as_object()
+        .unwrap();
+    assert_eq!(back["type"], "object");
+    assert!(!back.contains_key("$ref"));
+
+    let mut refs = Vec::new();
+    remaining_refs(&Value::Object(root.clone()), &mut refs);
+    assert!(refs.is_empty(), "dangling refs left: {refs:?}");
+}
+
+/// A definition reached twice on *different* branches is not a cycle: the chain
+/// is a path, not a visited-set, so the second branch must still expand fully.
+#[test]
+fn resolve_refs_still_inlines_a_def_used_twice() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "left": { "$ref": "#/$defs/Shared" },
+            "right": { "$ref": "#/$defs/Shared" }
+        },
+        "$defs": {
+            "Shared": { "type": "object", "properties": { "v": { "type": "string" } } }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize(&mut tools);
+    let props = tools[0].input_schema.as_ref()["properties"].clone();
+
+    for side in ["left", "right"] {
+        assert!(
+            props[side]["properties"].as_object().unwrap().contains_key("v"),
+            "{side} was not inlined"
+        );
+    }
+}

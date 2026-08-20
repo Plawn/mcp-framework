@@ -129,13 +129,78 @@ fn sanitize_value_recursive(value: &mut Value) {
 /// `{ "type": "object", "properties": {"action": {"const": "add"}}, "$ref": "#/$defs/Variant", "required": ["action"] }`.
 /// A naive override would wipe out `Variant.properties` and `Variant.required`,
 /// losing all the variant's real fields.
+///
+/// # Recursive definitions
+///
+/// A `$defs` entry may reach itself — directly, or through other definitions.
+/// schemars emits exactly that for any recursive Rust type, e.g. an enum with a
+/// `Box<Self>` field. Such a schema **cannot** be fully inlined: every expansion
+/// of the definition reproduces the reference that led to it. Inlining it blindly
+/// is unbounded recursion, and it overflowed the stack of the thread serving
+/// `tools/list` — an abort, not an error the caller could see.
+///
+/// So a reference that closes a cycle is *truncated* rather than inlined: the
+/// `$ref` is dropped and the node degrades to a permissive `{"type": "object"}`,
+/// keeping whatever siblings it carried — its `description` above all, since for
+/// a recursive field that prose is usually the only remaining account of the
+/// shape. Truncating rather than leaving the `$ref` in place is what
+/// [`inline_defs`] requires: it drops `$defs` afterwards, so a surviving
+/// reference would dangle.
+///
+/// Only the back-edge is cut. The first expansion is untouched, so a recursive
+/// type still shows its full shape one level deep — what a caller reading the
+/// schema actually needs.
 fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
+    resolve_refs_inner(value, defs, &mut Vec::new());
+}
+
+/// Hard depth cap, enforced alongside cycle detection.
+///
+/// Cycle detection catches a definition that reaches itself. This catches the
+/// acyclic-but-pathological case — a long chain of distinct definitions — and
+/// whatever shape neither guard anticipates. Nothing hand-written or derived
+/// nests this deep, so it does not fire in practice; it is here so that no
+/// input at all can drive this function into unbounded recursion.
+const MAX_REF_DEPTH: usize = 64;
+
+/// Drop a `$ref` that must not be inlined, leaving a node every client can
+/// read: a permissive object, plus the siblings the reference carried.
+///
+/// `type` is only supplied when the node declares none — a sibling `type` is
+/// the schema author's, and more precise than ours.
+fn truncate_to_permissive_object(map: &mut serde_json::Map<String, Value>) {
+    map.remove("$ref");
+    if !map.contains_key("type") {
+        map.insert("type".to_string(), Value::String("object".to_string()));
+    }
+}
+
+/// [`resolve_refs`], carrying the chain of `$defs` names currently being
+/// inlined. A name already on the chain means this reference closes a cycle.
+fn resolve_refs_inner<'a>(
+    value: &mut Value,
+    defs: &'a serde_json::Map<String, Value>,
+    chain: &mut Vec<&'a str>,
+) {
     match value {
         Value::Object(map) => {
-            if let Some(Value::String(ref_str)) = map.get("$ref")
-                && let Some(name) = ref_str.strip_prefix("#/$defs/")
-                && let Some(def) = defs.get(name)
-            {
+            // Resolved before any mutation of `map`: the lookup borrows `map`,
+            // truncation needs it mutably, and the target borrows `defs` alone.
+            let target = match map.get("$ref") {
+                Some(Value::String(ref_str)) => ref_str
+                    .strip_prefix("#/$defs/")
+                    .and_then(|name| defs.get_key_value(name)),
+                _ => None,
+            };
+            if let Some((def_name, def)) = target {
+                let def_name = def_name.as_str();
+                if chain.contains(&def_name) || chain.len() >= MAX_REF_DEPTH {
+                    truncate_to_permissive_object(map);
+                    for v in map.values_mut() {
+                        resolve_refs_inner(v, defs, chain);
+                    }
+                    return;
+                }
                 let mut inlined = def.clone();
                 if let Value::Object(ref mut inlined_map) = inlined {
                     for (k, v) in map.iter() {
@@ -170,16 +235,18 @@ fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
                 }
                 *value = inlined;
                 // The inlined definition may itself contain $refs
-                resolve_refs(value, defs);
+                chain.push(def_name);
+                resolve_refs_inner(value, defs, chain);
+                chain.pop();
                 return;
             }
             for v in map.values_mut() {
-                resolve_refs(v, defs);
+                resolve_refs_inner(v, defs, chain);
             }
         }
         Value::Array(arr) => {
             for v in arr.iter_mut() {
-                resolve_refs(v, defs);
+                resolve_refs_inner(v, defs, chain);
             }
         }
         _ => {}
