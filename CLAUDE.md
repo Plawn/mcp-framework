@@ -247,6 +247,22 @@ Claims are read through `jwt_payload`, which first checks that the credential is
 
 Covered by `tests/session_identity.rs`, which drives the real `build_app` router (strip layer + auth middleware) through an `extra_routes` handler that echoes `session_id_from_parts`, and by `tests/oauth_passthrough_identity.rs` for the claims-derived key end to end (refresh keeps one identity, two SSO sessions of one user stay isolated).
 
+#### Transport session recovery (`src/transport/session_persistence.rs`)
+
+Three stores are keyed by the session id, and each owns exactly one kind of data — never duplicate one into another:
+
+| Store | Namespace | Holds | Written by |
+|---|---|---|---|
+| rmcp transport session (`TransportSessionStore`, adapts `rmcp::…::SessionStore`) | `mcp_transport_sessions` | the `initialize` parameters rmcp needs to rebuild a protocol session | rmcp, once at `initialize`; re-armed by the framework on `load` |
+| `SessionStore<T>` | `sessions` | consumer-defined application data | the consumer, through `update` |
+| `TokenStore` | `tokens` / `opaque*` / `grant_refresh` | credentials and grant material | the auth layer |
+
+The transport store is what turns a legacy-session request landing on an instance that did not create it into a restored session instead of a `404` → client re-`initialize`. It is mounted in `build_app` whenever a persistence backend is configured, with the same TTL as `SessionStore<T>`; without persistence rmcp keeps sessions in process memory as before. Sessionless revisions (2026-07-28) have no protocol session to restore and are unaffected.
+
+**TTL.** rmcp writes the entry once and never refreshes it while an instance that already holds the session in memory serves traffic, so the entry's lifetime is counted from creation, not from last activity. The framework re-arms the TTL on every successful `load` through `PersistenceBackend::touch` — atomic, so a session a peer deleted between the read and the re-arm is reported gone rather than resurrected; `Unsupported` (a backend without the primitive) restores without re-arming; an error answers "unknown session" (rmcp: `404`, the client re-initializes) rather than a `500` the client would retry. The remaining gap is a **warmed pool**: once every instance has restored the session, no `load` happens any more and the entry expires after one TTL of the last restore even under continuous traffic — an instance joining (or restarting) after that point re-initializes the client, exactly the pre-recovery behaviour. Touching the entry on every legacy-session request would close it at one backend round-trip per request; not done.
+
+Covered by `http_legacy_session_is_restored_on_another_instance` (`tests/http_integration.rs`, two `build_app` instances sharing one `InMemoryBackend`), the unit tests in `session_persistence.rs` (re-arm, delete-between-read-and-touch, touch error → unknown session, backend without `touch` → restores without re-arming) and `touch_re_arms_a_live_key_and_reports_a_deleted_one` against a real Redis.
+
 ### Audit logging (`src/audit/`)
 
 Pluggable tool call audit logging. Every `call_tool` invocation can be logged via a `ToolCallLogger` trait implementation. The framework ships two built-in loggers:
@@ -529,6 +545,8 @@ polling client would re-log the same finding on every call. So:
 - **Load-at-startup**: `load_persisted()` reads all keys from the backend and populates the in-memory store. Called automatically during `run()` before the listener starts
 - **Read-through**: on a memory miss, the read paths (`TokenStore::get_token_raw`, `TokenStore::resolve_opaque_*`, `SessionStore::get`) fall back to the backend, deserialize, and write-back into the in-memory cache. This is what makes **multi-instance / horizontal scaling without sticky sessions** work: a request that lands on an instance which did not create the session still resolves the token/opaque-mapping/session from Redis instead of returning a 401. A memory hit never touches the backend (zero overhead on the hot path).
 - **No backend = current behavior**: zero overhead, no serialization
+
+**`touch`**: `PersistenceBackend::touch(ns, key, ttl) -> Touch` re-arms an entry's TTL atomically and reports `Armed` / `Missing` (`RedisBackend`: `EXPIRE`; `InMemoryBackend`: presence check under its lock). The default answers `Unsupported` without doing anything: callers keep what they read but get no TTL extension — the behaviour of a backend written before the method existed, with no write and therefore no resurrection. It exists so that transport session recovery never resurrects a deleted session — see the session layer.
 
 **Distributed refresh lock**: the `PersistenceBackend` trait exposes `try_acquire_lock(ns, key, token, ttl)`/`release_lock(ns, key, token)` (default: no-op that always acquires; `RedisBackend` overrides with atomic `SET key token NX PX`, `InMemoryBackend` with an in-process lock map). The caller passes a unique per-acquisition `token` (a fresh UUID); `release_lock` is **compare-and-delete** (Redis: a Lua `GET==token then DEL` script) so a late release after TTL expiry cannot drop a lock a peer has since re-acquired. On token expiry, `TokenStore::get_token` first takes the process-local per-session lock, then the distributed lock (`NS_REFRESH_LOCK`) before refreshing — serializing refresh across instances so Keycloak refresh-token rotation isn't broken by concurrent refreshes (distributed thundering herd). While a peer holds the lock, the waiter polls persistence and **adopts** the peer's refreshed token instead of issuing a duplicate refresh. `REFRESH_LOCK_TTL` auto-expires a crashed holder's lock, and `REFRESH_LOCK_WAIT` is kept above it so a waiter eventually acquires rather than racing.
 

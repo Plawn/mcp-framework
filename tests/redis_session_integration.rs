@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_framework::auth::AuthProvider;
+use mcp_framework::persistence::Touch;
 use mcp_framework::prelude::*;
 use mcp_framework::session::{RequestContextExt, SessionStore};
 use mcp_framework::transport::{HttpAppConfig, build_app};
@@ -419,6 +420,67 @@ async fn new_session_after_restart_is_independent() -> anyhow::Result<()> {
 
     client2.cancel().await?;
     server2._server_handle.abort();
+    cleanup_redis_prefix(&prefix).await;
+    Ok(())
+}
+
+/// `touch` is the atomic primitive transport session recovery relies on: it
+/// must re-arm a live key and refuse to resurrect a deleted one.
+#[tokio::test]
+async fn touch_re_arms_a_live_key_and_reports_a_deleted_one() -> anyhow::Result<()> {
+    init_test_tracing();
+
+    if !redis_available().await {
+        eprintln!("Skipping: Redis not available at {}", redis_url());
+        return Ok(());
+    }
+
+    let prefix = format!("test_{}", uuid::Uuid::new_v4().simple());
+    let backend = RedisBackend::connect(&redis_url())
+        .await
+        .unwrap()
+        .with_prefix(&prefix);
+    let ns = "sessions";
+
+    backend
+        .set(ns, "k", b"v", Some(Duration::from_secs(30)))
+        .await
+        .map_err(anyhow::Error::from_boxed)?;
+    let armed = backend
+        .touch(ns, "k", Duration::from_secs(3000))
+        .await
+        .map_err(anyhow::Error::from_boxed)?;
+    assert_eq!(armed, Touch::Armed, "a live key is re-armed");
+
+    let client = redis::Client::open(redis_url().as_str())?;
+    let mut conn = redis::aio::ConnectionManager::new(client).await?;
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(format!("{prefix}:{ns}:k"))
+        .query_async(&mut conn)
+        .await?;
+    assert!(ttl > 30, "TTL must reflect the touch, got {ttl}s");
+
+    backend
+        .delete(ns, "k")
+        .await
+        .map_err(anyhow::Error::from_boxed)?;
+    let armed = backend
+        .touch(ns, "k", Duration::from_secs(3000))
+        .await
+        .map_err(anyhow::Error::from_boxed)?;
+    assert_eq!(
+        armed,
+        Touch::Missing,
+        "a deleted key is reported gone, not recreated"
+    );
+    assert!(
+        backend
+            .get(ns, "k")
+            .await
+            .map_err(anyhow::Error::from_boxed)?
+            .is_none()
+    );
+
     cleanup_redis_prefix(&prefix).await;
     Ok(())
 }

@@ -37,6 +37,18 @@ pub(crate) fn remaining_until_unix_millis(deadline_ms: u64) -> Duration {
 /// `Pin<Box<dyn Future<Output = Result<T, PersistenceError>> + Send + 'a>>`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PersistenceError>> + Send + 'a>>;
 
+/// Outcome of [`PersistenceBackend::touch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Touch {
+    /// The entry existed and now carries the requested TTL.
+    Armed,
+    /// There was no such entry — nothing was created.
+    Missing,
+    /// The backend does not implement the primitive; nothing was checked or
+    /// written.
+    Unsupported,
+}
+
 /// Async key-value persistence backend.
 ///
 /// Used by both [`SessionStore`](crate::session::SessionStore) and
@@ -56,6 +68,22 @@ pub trait PersistenceBackend: Send + Sync + 'static {
     fn delete(&self, ns: &str, key: &str) -> BoxFuture<'_, ()>;
 
     fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>>;
+
+    /// Re-arm the TTL of an existing entry without rewriting it, atomically.
+    ///
+    /// A `get` followed by a `set` cannot give that guarantee — a peer deleting
+    /// the key between the two would see it resurrected with a fresh TTL — so
+    /// this is a distinct primitive, mapped onto the backend's own (Redis
+    /// `EXPIRE`; a presence check under the store's lock for an in-process map).
+    ///
+    /// The default answers [`Touch::Unsupported`] without touching anything.
+    /// Callers then keep whatever they read but get no TTL extension — the
+    /// behaviour of a backend that predates this method — rather than either
+    /// an unsafe re-arm or a silent loss of function.
+    fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, Touch> {
+        let _ = (ns, key, ttl);
+        Box::pin(async { Ok(Touch::Unsupported) })
+    }
 
     /// Atomically acquire a distributed lock for `key` within `ns`, held for at
     /// most `ttl` (after which it auto-expires so a crashed holder can't deadlock
@@ -152,6 +180,19 @@ impl PersistenceBackend for InMemoryBackend {
             let mut data = self.data.write().await;
             data.insert((ns, key), value);
             Ok(())
+        })
+    }
+
+    fn touch(&self, ns: &str, key: &str, _ttl: Duration) -> BoxFuture<'_, Touch> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        Box::pin(async move {
+            let data = self.data.read().await;
+            Ok(if data.contains_key(&(ns, key)) {
+                Touch::Armed
+            } else {
+                Touch::Missing
+            })
         })
     }
 
