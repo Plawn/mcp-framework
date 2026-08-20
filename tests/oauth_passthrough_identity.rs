@@ -117,6 +117,144 @@ fn jwt_with_sub(sub: &str, nonce: &str) -> String {
     format!("{header}.{payload}.sig")
 }
 
+/// Same as [`jwt_with_sub`], plus the `sid` claim Keycloak puts on every token
+/// minted from one SSO session — the claim the session identity is derived from.
+fn jwt_with_sid(sub: &str, sid: &str, nonce: &str) -> String {
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = enc.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload =
+        enc.encode(format!(r#"{{"sub":"{sub}","sid":"{sid}","jti":"{nonce}"}}"#).as_bytes());
+    format!("{header}.{payload}.sig")
+}
+
+#[tokio::test]
+async fn sessionless_identity_survives_a_bearer_refresh() {
+    let (app, token_store) = app_with(oauth().await);
+
+    // A sessionless (MCP 2026-07-28) client whose bearer rotates every few
+    // minutes. Before the claims-derived key, each rotation produced a brand-new
+    // identity and orphaned everything the previous one keyed.
+    let t1 = jwt_with_sid("alice", "sso-1", "one");
+    let t2 = jwt_with_sid("alice", "sso-1", "two");
+    assert_ne!(t1, t2);
+
+    let (status1, id1) = whoami_request(&app, &[("authorization", &format!("Bearer {t1}"))]).await;
+    let (status2, id2) = whoami_request(&app, &[("authorization", &format!("Bearer {t2}"))]).await;
+
+    assert_eq!(status1, StatusCode::OK);
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(id1, id2, "a refreshed bearer must keep its session identity");
+    assert!(id1.starts_with("cred-sid-"), "got {id1}");
+
+    // One entry, holding the current bearer — not two half-live ones.
+    let stored = token_store.peek_token(&id1).await.expect("stored");
+    assert_eq!(stored.access_token, t2);
+}
+
+#[tokio::test]
+async fn sessionless_identity_isolates_two_sso_sessions_of_the_same_user() {
+    let (app, token_store) = app_with(oauth().await);
+
+    // Same `sub`, different `sid`: the same human logged in twice (two devices,
+    // or one device after a full re-login). They must not share token state.
+    let desktop = jwt_with_sid("alice", "sso-desktop", "one");
+    let mobile = jwt_with_sid("alice", "sso-mobile", "one");
+
+    let (_, id_desktop) =
+        whoami_request(&app, &[("authorization", &format!("Bearer {desktop}"))]).await;
+    let (_, id_mobile) =
+        whoami_request(&app, &[("authorization", &format!("Bearer {mobile}"))]).await;
+
+    assert_ne!(id_desktop, id_mobile);
+    assert_eq!(
+        token_store
+            .peek_token(&id_desktop)
+            .await
+            .map(|t| t.access_token),
+        Some(desktop)
+    );
+    assert_eq!(
+        token_store
+            .peek_token(&id_mobile)
+            .await
+            .map(|t| t.access_token),
+        Some(mobile)
+    );
+}
+
+/// The consequence of a stable key on the passthrough store/adopt path: a
+/// rotation now lands on the *same* entry the previous bearer wrote, so it goes
+/// through the principal check and replaces it — rather than silently forking a
+/// second entry as the byte-hash key did.
+#[tokio::test]
+async fn sessionless_rotation_replaces_the_grant_entry_and_drops_stale_refresh_material() {
+    let (app, token_store) = app_with(oauth().await);
+
+    let t1 = jwt_with_sid("alice", "sso-1", "one");
+    let (_, id) = whoami_request(&app, &[("authorization", &format!("Bearer {t1}"))]).await;
+
+    // Stand in for `/oauth/token`: it keys the grant the same way, so the
+    // refresh material lands on this very entry.
+    token_store
+        .store_token(
+            id.clone(),
+            StoredToken::new(t1.clone(), Some("refresh-alice".to_string()), None),
+        )
+        .await;
+
+    // The client rotates its bearer *without* going through this proxy's
+    // `/oauth/token` (bring-your-own-token). The refresh_token we hold belongs
+    // to the superseded credential — Keycloak's rotation has already invalidated
+    // it — so it must not be carried onto the new bearer.
+    let t2 = jwt_with_sid("alice", "sso-1", "two");
+    let (status, id2) = whoami_request(&app, &[("authorization", &format!("Bearer {t2}"))]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(id2, id);
+    let stored = token_store.peek_token(&id).await.expect("stored");
+    assert_eq!(stored.access_token, t2);
+    assert_eq!(stored.refresh_token, None);
+}
+
+/// A `sid`-carrying token and a `sub`-only token for the same user derive keys
+/// in different families. Landed on the same protocol session, the newcomer is
+/// still recognised as the same principal via `sub` rather than 401'd.
+#[tokio::test]
+async fn a_sid_token_and_a_sub_only_token_for_one_user_are_the_same_principal() {
+    let (app, token_store) = app_with(oauth().await);
+
+    let with_sid = jwt_with_sid("alice", "sso-1", "one");
+    let (status1, _) = whoami_request(
+        &app,
+        &[
+            ("authorization", &format!("Bearer {with_sid}")),
+            (MCP_SESSION_ID_HEADER, "sess-alice"),
+        ],
+    )
+    .await;
+    assert_eq!(status1, StatusCode::OK);
+
+    let without_sid = jwt_with_sub("alice", "two");
+    let (status2, _) = whoami_request(
+        &app,
+        &[
+            ("authorization", &format!("Bearer {without_sid}")),
+            (MCP_SESSION_ID_HEADER, "sess-alice"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(
+        token_store
+            .peek_token("sess-alice")
+            .await
+            .map(|t| t.access_token),
+        Some(without_sid)
+    );
+}
+
 #[tokio::test]
 async fn passthrough_accepts_a_rotated_bearer_for_the_same_principal() {
     let (app, token_store) = app_with(oauth().await);

@@ -99,6 +99,27 @@ any description the first variant did not happen to carry.
   real description from a later one, and it is never used as the discriminator's
   fallback. This is the rule the documentation audit already applied.
 
+### Changed — sessionless identity derives from `sid`/`sub`, not from the bearer bytes
+
+`credential_session_key` hashed the credential itself, which only holds while
+the credential does. In a resource-server deployment the client's access token
+rotates every 5-15 minutes: the derived identity changed with it, and the
+`SessionStore<T>` entry it keyed was orphaned for its whole TTL.
+
+The key now comes from the most stable claim the credential carries —
+`cred-sid-{hash}` (Keycloak SSO session), falling back to `cred-sub-{hash}`
+(the principal), and only then to the previous `cred-{hash}` byte scheme for
+credentials that are not JWTs at all (opaque bearers, Basic auth passwords).
+The three families carry distinct prefixes, so no value can collapse two
+identities into one. Claims are read with the new `jwt_claim` (payload decode,
+no signature check) — the value only partitions state; `validate_unknown_bearer`
+still decides whether the bearer may be used at all.
+
+Two consequences: sessionless sessions get a new key at deploy, so their
+`SessionStore<T>` data is lost once (stale entries expire within the 30 min
+TTL); and two clients of one user in the same SSO session now share an
+identity — intended, since a transparent refresh is the same property.
+
 ### Dependencies
 
 - added `futures` `0.3` — the `Sink`/`Stream` halves of the loopback transport

@@ -22,23 +22,54 @@ use crate::constants::{
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
+/// Truncated sha256 hex of an arbitrary string — the hashing scheme shared by
+/// every [`credential_session_key`] family.
+fn short_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..16].iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
 /// Derive a stable session identity from a credential.
 ///
-/// The credential is hashed, so the derived id is safe to log and cannot be
-/// reversed into the token it came from. The same credential always maps to the
-/// same id, which is what lets a sessionless client be recognised across
-/// requests and what lets the `/oauth/token` exchange pre-register an entry the
-/// auth middleware will later find (see [`bearer_auth_middleware`]).
+/// The identity is taken from the most *stable* thing the credential carries,
+/// so that it survives the client rotating its bearer:
+///
+/// | source | key | stability |
+/// |---|---|---|
+/// | `sid` claim | `cred-sid-{hash}` | Keycloak SSO session — unchanged across every refresh |
+/// | `sub` claim | `cred-sub-{hash}` | the principal — stable, but shared by all their sessions |
+/// | raw bytes | `cred-{hash}` | changes on every rotation (non-JWT credentials only) |
+///
+/// Hashing the bearer bytes was the original scheme, and it breaks as soon as
+/// the client refreshes: a resource-server bearer rotates every few minutes, so
+/// the derived identity would change with it and the [`SessionStore`] entry it
+/// keyed would be orphaned for its whole TTL. `sid` (with `sub` as a fallback)
+/// keeps one identity for the whole SSO session. The byte hash remains for
+/// credentials that are not JWTs at all (opaque bearers, Basic auth passwords).
+///
+/// The three families carry distinct prefixes, so a `sid` value that happens to
+/// equal another token's `sub` can never collapse two identities into one.
+/// Every value is hashed, so the derived id is safe to log and cannot be
+/// reversed into the claim (or token) it came from.
+///
+/// The same credential always maps to the same id, which is what lets a
+/// sessionless client be recognised across requests and what lets the
+/// `/oauth/token` exchange pre-register an entry the auth middleware will later
+/// find (see [`bearer_auth_middleware`]).
+///
+/// [`SessionStore`]: crate::session::SessionStore
 pub(crate) fn credential_session_key(credential: &str) -> String {
-    let digest = Sha256::digest(credential.as_bytes());
-    format!(
-        "cred-{}",
-        digest[..16].iter().fold(String::new(), |mut acc, b| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-    )
+    if let Some(sid) = jwt_claim(credential, "sid") {
+        return format!("cred-sid-{}", short_hash(&sid));
+    }
+    if let Some(sub) = jwt_claim(credential, "sub") {
+        return format!("cred-sub-{}", short_hash(&sub));
+    }
+    format!("cred-{}", short_hash(credential))
 }
 
 /// Bind a request to a framework session identity.
@@ -77,7 +108,8 @@ pub async fn strip_framework_session_header(mut request: Request<Body>, next: Ne
 /// absent for clients on that revision. Falling back to a single shared
 /// `"default"` id would make every concurrent client read and overwrite the
 /// same `TokenStore` entry — one user's bearer token served to another. Instead
-/// we derive a stable id from the credential and inject it under
+/// we derive a stable id from the credential's claims (see
+/// [`credential_session_key`]) and inject it under
 /// [`MCP_FALLBACK_SESSION_HEADER`] so the rest of the framework
 /// (`resolve_session_id`, `resolve_token`) resolves it uniformly.
 fn resolve_or_derive_session_id(request: &mut Request<Body>, credential: &str) -> String {
@@ -227,6 +259,11 @@ pub async fn bearer_auth_middleware(
         // `refresh_token` it captured is unreachable and server-side refresh can
         // never fire. When the id was derived from the credential the two keys
         // coincide and this is a no-op.
+        //
+        // Since the key is derived from `sid`/`sub` rather than the bearer bytes,
+        // a refreshed grant re-exchanged through `/oauth/token` overwrites the
+        // same entry instead of creating a new one — so the adoption below finds
+        // the *current* refresh material rather than a stale sibling.
         let grant_key = credential_session_key(&token);
         let session_token = state.token_store.peek_token(&session_id).await;
         let matching_session_token = session_token
@@ -260,13 +297,20 @@ pub async fn bearer_auth_middleware(
             && matching_session_token.is_none()
             && matching_grant_token.is_none()
         {
-            let same_principal = jwt_subject(&token)
-                .zip(
-                    session_token
-                        .as_ref()
-                        .and_then(|stored| jwt_subject(&stored.access_token)),
-                )
+            let previous_credential = session_token
+                .as_ref()
+                .map(|stored| stored.access_token.as_str());
+            let same_subject = jwt_subject(&token)
+                .zip(previous_credential.and_then(jwt_subject))
                 .is_some_and(|(new_sub, prev_sub)| new_sub == prev_sub);
+            // A token carrying `sid` but no `sub` still has a stable identity:
+            // two credentials deriving the same session key are the same SSO
+            // session by construction. The byte-hash family can never match here
+            // (identical bytes would have been caught as `matching_session_token`),
+            // so this only ever accepts a claims-derived match.
+            let same_derived_identity = previous_credential
+                .is_some_and(|prev| credential_session_key(&token) == credential_session_key(prev));
+            let same_principal = same_subject || same_derived_identity;
 
             if !same_principal {
                 tracing::warn!(
@@ -402,21 +446,31 @@ fn jwt_is_expired(token: &str) -> Option<bool> {
     Some(now >= exp)
 }
 
-/// Decode the JWT payload (without signature verification) and return the
-/// `sub` (subject) claim.
+/// Decode the JWT payload (without signature verification) and return a string
+/// claim from it.
 ///
-/// Returns `None` when the token is not a parseable JWT or carries no string
-/// `sub`. Like [`jwt_is_expired`], this reads the payload directly rather than
-/// going through the consumer's `claims_decoder`, so the middleware stays
-/// agnostic of the concrete claims type while still able to compare principals
-/// across a bearer rotation.
-fn jwt_subject(token: &str) -> Option<String> {
+/// Returns `None` when the token is not a parseable JWT or carries no such
+/// string claim. Like [`jwt_is_expired`], this reads the payload directly rather
+/// than going through the consumer's `claims_decoder`, so the middleware stays
+/// agnostic of the concrete claims type.
+///
+/// **No signature is verified here.** The value is only ever used to *partition*
+/// state (session identity, principal comparison); whether the token may be used
+/// at all is decided separately by `validate_unknown_bearer` — JWKS signature
+/// check or introspection — before any of that state is written.
+fn jwt_claim(token: &str, claim: &str) -> Option<String> {
     let payload_b64 = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    json.get("sub")?.as_str().map(str::to_string)
+    json.get(claim)?.as_str().map(str::to_string)
+}
+
+/// The `sub` (subject) claim of a JWT, used to compare principals across a
+/// bearer rotation. See [`jwt_claim`].
+fn jwt_subject(token: &str) -> Option<String> {
+    jwt_claim(token, "sub")
 }
 
 /// Returns a 401 response with WWW-Authenticate header for OAuth discovery
@@ -554,6 +608,18 @@ fn basic_unauthorized_response() -> Response {
 mod tests {
     use super::*;
 
+    /// Build a JWT-shaped token (`header.payload.sig`) whose payload is the
+    /// given JSON object body, base64url-encoded like a real one. No signature
+    /// is produced: nothing under test verifies one.
+    fn jwt(payload: &str) -> String {
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.sig",
+            enc.encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+            enc.encode(payload.as_bytes())
+        )
+    }
+
     fn request_with(headers: &[(&'static str, &str)]) -> Request<Body> {
         let mut builder = Request::builder().uri("/mcp");
         for (k, v) in headers {
@@ -596,6 +662,101 @@ mod tests {
         // any MCP session exists, and this is the only reason the middleware can
         // find it again later from the bearer alone.
         assert_eq!(id_a1, credential_session_key("token-a"));
+    }
+
+    #[test]
+    fn sessionless_identity_survives_a_bearer_rotation_within_one_sso_session() {
+        // Two distinct JWTs — different `jti`, different `exp`, different bytes —
+        // for the same Keycloak SSO session. This is what a resource-server
+        // client looks like every 5-15 minutes.
+        let mut r1 = request_with(&[]);
+        let mut r2 = request_with(&[]);
+        let t1 = jwt(r#"{"sub":"alice","sid":"sso-1","jti":"a","exp":1}"#);
+        let t2 = jwt(r#"{"sub":"alice","sid":"sso-1","jti":"b","exp":2}"#);
+        assert_ne!(t1, t2);
+
+        let id1 = resolve_or_derive_session_id(&mut r1, &t1);
+        let id2 = resolve_or_derive_session_id(&mut r2, &t2);
+
+        // The whole point of the ticket: the rotation must not orphan the
+        // SessionStore entry keyed by this id.
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("cred-sid-"));
+        // The claim value itself never appears in the id.
+        assert!(!id1.contains("sso-1"));
+    }
+
+    #[test]
+    fn a_different_sso_session_is_a_different_identity() {
+        let alice_a = credential_session_key(&jwt(r#"{"sub":"alice","sid":"sso-1"}"#));
+        let alice_b = credential_session_key(&jwt(r#"{"sub":"alice","sid":"sso-2"}"#));
+        let bob = credential_session_key(&jwt(r#"{"sub":"bob","sid":"sso-3"}"#));
+
+        assert_ne!(alice_a, alice_b);
+        assert_ne!(alice_a, bob);
+    }
+
+    #[test]
+    fn a_jwt_without_sid_falls_back_to_sub() {
+        let t1 = credential_session_key(&jwt(r#"{"sub":"alice","jti":"a"}"#));
+        let t2 = credential_session_key(&jwt(r#"{"sub":"alice","jti":"b"}"#));
+        let other = credential_session_key(&jwt(r#"{"sub":"bob"}"#));
+
+        assert!(t1.starts_with("cred-sub-"));
+        assert_eq!(t1, t2);
+        assert_ne!(t1, other);
+    }
+
+    #[test]
+    fn a_non_jwt_credential_falls_back_to_the_byte_hash() {
+        // Opaque bearers and Basic auth passwords carry no claims at all.
+        let opaque = credential_session_key("6f1c1f6e-0f37-4f1e-9f0a-1d2c3b4a5968");
+        assert!(opaque.starts_with("cred-"));
+        assert!(!opaque.starts_with("cred-sid-"));
+        assert!(!opaque.starts_with("cred-sub-"));
+
+        // A JWT-shaped token whose payload carries neither claim, and one whose
+        // payload is not decodable, both land here too.
+        let claimless = credential_session_key(&jwt(r#"{"jti":"a"}"#));
+        assert!(!claimless.starts_with("cred-sid-"));
+        assert!(!claimless.starts_with("cred-sub-"));
+        assert_eq!(
+            credential_session_key("not.a.jwt"),
+            credential_session_key("not.a.jwt")
+        );
+    }
+
+    #[test]
+    fn the_sid_sub_and_bytes_families_never_collide() {
+        // Same value in all three positions: only the family prefix separates
+        // them, which is exactly why the prefixes exist.
+        let by_sid = credential_session_key(&jwt(r#"{"sid":"same-value"}"#));
+        let by_sub = credential_session_key(&jwt(r#"{"sub":"same-value"}"#));
+        let by_bytes = credential_session_key("same-value");
+
+        assert_ne!(by_sid, by_sub);
+        assert_ne!(by_sid, by_bytes);
+        assert_ne!(by_sub, by_bytes);
+
+        // And `sid` outranks `sub` when both are present.
+        assert_eq!(
+            credential_session_key(&jwt(r#"{"sub":"alice","sid":"same-value"}"#)),
+            by_sid
+        );
+    }
+
+    #[test]
+    fn jwt_claim_reads_string_claims_only() {
+        let token = jwt(r#"{"sub":"alice","sid":"sso-1","exp":123,"aud":["a","b"]}"#);
+
+        assert_eq!(jwt_claim(&token, "sid").as_deref(), Some("sso-1"));
+        assert_eq!(jwt_subject(&token).as_deref(), Some("alice"));
+        // Non-string and absent claims are indistinguishable to callers, which
+        // is what keeps `credential_session_key` falling through cleanly.
+        assert_eq!(jwt_claim(&token, "exp"), None);
+        assert_eq!(jwt_claim(&token, "aud"), None);
+        assert_eq!(jwt_claim(&token, "nope"), None);
+        assert_eq!(jwt_claim("opaque-token", "sid"), None);
     }
 
     #[test]
