@@ -356,7 +356,14 @@ pub async fn bearer_auth_middleware(
             .clone()
             .unwrap_or_else(|| StoredToken::new(token.clone(), None, validated_expiry));
         let token_is_expired = candidate.is_expired() || jwt_is_expired(&token).unwrap_or(false);
-        let has_refresh = candidate.refresh_token.is_some();
+        // An expired bearer may still be served when refresh material is
+        // reachable under this key — including material captured for a sibling
+        // credential of the same grant, which is exactly what the stable
+        // `sid`/`sub` key makes reachable.
+        let has_refresh = candidate.refresh_token.is_some()
+            || session_token
+                .as_ref()
+                .is_some_and(|previous| previous.refresh_token.is_some());
 
         // Expired credentials are never passed to the MCP handler. They may only
         // continue after the framework has successfully refreshed them.
@@ -365,24 +372,60 @@ pub async fn bearer_auth_middleware(
             return unauthorized_response(&state.resource_metadata_url);
         }
 
+        // Decide what the store should hold.
+        //
+        // **Invariant: an observed bearer never downgrades proxy-issued grant
+        // material.** `/oauth/token` is the only place a `refresh_token` is ever
+        // captured, and it keys by this same stable id, so an entry carrying one
+        // is authoritative. HTTP guarantees no delivery order: once the grant has
+        // been refreshed to `t2 + rt2`, a delayed request still holding the
+        // superseded `t1` must not replace that entry with `t1 + None` and leave
+        // the grant permanently unrefreshable.
+        let replacement = if let Some(previous) = matching_token.as_ref() {
+            // The bearer *is* a known entry — carry its material onto this key.
+            Some(StoredToken {
+                access_token: token.clone(),
+                refresh_token: previous.refresh_token.clone(),
+                expires_at: previous.expires_at,
+                decoded_claims: None,
+            })
+        } else if let Some(previous) = session_token
+            .as_ref()
+            .filter(|previous| previous.refresh_token.is_some())
+        {
+            // A rotation the store has not seen, landing on a grant that holds
+            // refresh material. Advance the access token only when this bearer
+            // is demonstrably the newer of the two, and never without carrying
+            // the refresh token over. An older or unorderable bearer leaves the
+            // stored entry exactly as it is.
+            jwt_is_strictly_newer(&token, &previous.access_token)
+                .unwrap_or(false)
+                .then(|| StoredToken {
+                    access_token: token.clone(),
+                    refresh_token: previous.refresh_token.clone(),
+                    expires_at: validated_expiry.or(previous.expires_at),
+                    decoded_claims: None,
+                })
+        } else {
+            // Nothing to preserve: a first sighting, or a grant that never had
+            // refresh material (a bring-your-own-token client).
+            Some(StoredToken {
+                access_token: token.clone(),
+                refresh_token: None,
+                expires_at: validated_expiry,
+                decoded_claims: None,
+            })
+        };
+
         // Materialize the entry under `session_id` *before* attempting refresh:
-        // refresh_token() operates on the store keyed by session id. Preserve
-        // refresh_token + expires_at so an expired bearer can still be
-        // refreshed. Only write back when something actually changed.
+        // refresh_token() operates on the store keyed by session id. Only write
+        // back when something actually changed.
         let needs_store = session_token
             .as_ref()
             .is_none_or(|previous| previous.access_token != token);
-        if needs_store {
-            let (refresh_token, expires_at) = matching_token
-                .as_ref()
-                .map(|prev| (prev.refresh_token.clone(), prev.expires_at))
-                .unwrap_or((None, validated_expiry));
-            let stored_token = StoredToken {
-                access_token: token.clone(),
-                refresh_token,
-                expires_at,
-                decoded_claims: None,
-            };
+        if needs_store
+            && let Some(stored_token) = replacement
+        {
             state
                 .token_store
                 .store_token(session_id.clone(), stored_token)
@@ -425,20 +468,87 @@ pub async fn bearer_auth_middleware(
     next.run(request).await
 }
 
-/// Decode the JWT payload (without signature verification) and return
-/// whether the `exp` claim is in the past.
+/// Decode one base64url JWT segment into a JSON **object**.
 ///
-/// Returns `None` when the token is not a parseable JWT or has no `exp`
-/// claim — callers should treat that as "unknown, don't refresh".
-/// The actual signature is validated by the downstream API; the middleware
-/// only needs `exp` to decide whether a server-side refresh is warranted.
-fn jwt_is_expired(token: &str) -> Option<bool> {
-    let payload_b64 = token.split('.').nth(1)?;
+/// Anything that is not a non-empty segment decoding to a JSON object — a
+/// number, a string, an array, raw bytes, an opaque handle — yields `None`.
+fn decode_jwt_segment(segment: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if segment.is_empty() {
+        return None;
+    }
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
+        .decode(segment)
         .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp = json.get("exp")?.as_u64()?;
+    match serde_json::from_slice::<serde_json::Value>(&decoded).ok()? {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// Return the payload claims of a token that is actually shaped like a JWT.
+///
+/// The shape is checked before anything is read from it, because the callers
+/// treat "has claims" as "is a JWT" and route everything else to the byte-hash
+/// identity. Decoding only the second segment is not enough to tell the two
+/// apart: plenty of opaque credentials contain dots, and one whose middle
+/// segment happens to be base64 JSON (`opaque.<b64 json>.handle`) would be
+/// mistaken for a JWT and keyed by claims it does not really assert.
+///
+/// A token qualifies only when it has exactly three non-empty dot-separated
+/// segments, its header decodes to a JSON object carrying a string `alg`, and
+/// its payload decodes to a JSON object. The signature segment is required to
+/// be present but is never inspected — see the note on verification below.
+///
+/// **No signature is verified here.** The claims are only ever used to
+/// *partition* state (session identity, principal comparison, refresh
+/// ordering); whether the token may be used at all is decided separately by
+/// `validate_unknown_bearer` — JWKS signature check or introspection — before
+/// any of that state is written.
+fn jwt_payload(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut segments = token.split('.');
+    let (header, payload, signature) = (segments.next()?, segments.next()?, segments.next()?);
+    if segments.next().is_some() || signature.is_empty() {
+        return None;
+    }
+    // `typ` is optional (RFC 7519 §5.1) but `alg` is not (RFC 7515 §4.1.1).
+    if !decode_jwt_segment(header)?
+        .get("alg")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        return None;
+    }
+    decode_jwt_segment(payload)
+}
+
+/// A string claim of a JWT. See [`jwt_payload`] for what qualifies as one and
+/// why no signature is checked.
+///
+/// Reads the payload directly rather than going through the consumer's
+/// `claims_decoder`, so the middleware stays agnostic of the concrete claims
+/// type.
+fn jwt_claim(token: &str, claim: &str) -> Option<String> {
+    jwt_payload(token)?.get(claim)?.as_str().map(str::to_string)
+}
+
+/// A numeric (seconds-since-epoch) claim of a JWT. See [`jwt_payload`].
+fn jwt_timestamp(token: &str, claim: &str) -> Option<u64> {
+    jwt_payload(token)?.get(claim)?.as_u64()
+}
+
+/// The `sub` (subject) claim of a JWT, used to compare principals across a
+/// bearer rotation. See [`jwt_claim`].
+fn jwt_subject(token: &str) -> Option<String> {
+    jwt_claim(token, "sub")
+}
+
+/// Whether the `exp` claim of a JWT is in the past.
+///
+/// Returns `None` when the token is not a JWT or has no `exp` claim — callers
+/// should treat that as "unknown, don't refresh". The actual signature is
+/// validated by the downstream API; the middleware only needs `exp` to decide
+/// whether a server-side refresh is warranted.
+fn jwt_is_expired(token: &str) -> Option<bool> {
+    let exp = jwt_timestamp(token, "exp")?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -446,31 +556,26 @@ fn jwt_is_expired(token: &str) -> Option<bool> {
     Some(now >= exp)
 }
 
-/// Decode the JWT payload (without signature verification) and return a string
-/// claim from it.
+/// Whether `candidate` was issued strictly after `incumbent`.
 ///
-/// Returns `None` when the token is not a parseable JWT or carries no such
-/// string claim. Like [`jwt_is_expired`], this reads the payload directly rather
-/// than going through the consumer's `claims_decoder`, so the middleware stays
-/// agnostic of the concrete claims type.
+/// Ordering two bearers matters because HTTP gives no delivery order: a request
+/// carrying a superseded — but still unexpired — token can arrive after the
+/// grant has already been refreshed. `iat` is the direct answer; `exp` stands in
+/// when the issuer omits `iat`, since two tokens of one grant share a lifetime.
 ///
-/// **No signature is verified here.** The value is only ever used to *partition*
-/// state (session identity, principal comparison); whether the token may be used
-/// at all is decided separately by `validate_unknown_bearer` — JWKS signature
-/// check or introspection — before any of that state is written.
-fn jwt_claim(token: &str, claim: &str) -> Option<String> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    json.get(claim)?.as_str().map(str::to_string)
-}
-
-/// The `sub` (subject) claim of a JWT, used to compare principals across a
-/// bearer rotation. See [`jwt_claim`].
-fn jwt_subject(token: &str) -> Option<String> {
-    jwt_claim(token, "sub")
+/// `None` means the question cannot be answered (either token is not a JWT, or
+/// neither timestamp is comparable), and callers must then treat the incoming
+/// bearer as *not* newer — the conservative direction, which keeps whatever the
+/// store already holds.
+fn jwt_is_strictly_newer(candidate: &str, incumbent: &str) -> Option<bool> {
+    for claim in ["iat", "exp"] {
+        if let Some(new) = jwt_timestamp(candidate, claim)
+            && let Some(old) = jwt_timestamp(incumbent, claim)
+        {
+            return Some(new > old);
+        }
+    }
+    None
 }
 
 /// Returns a 401 response with WWW-Authenticate header for OAuth discovery
@@ -743,6 +848,98 @@ mod tests {
             credential_session_key(&jwt(r#"{"sub":"alice","sid":"same-value"}"#)),
             by_sid
         );
+    }
+
+    #[test]
+    fn an_opaque_credential_containing_dots_is_not_mistaken_for_a_jwt() {
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        // The dangerous shape: three segments whose *middle* one really is
+        // base64 JSON. Decoding only that segment would key this credential by
+        // claims it does not assert — and, worse, by claims its bearer chose.
+        let payload = enc.encode(r#"{"sub":"victim","sid":"victim-session"}"#.as_bytes());
+        let disguised = format!("opaque.{payload}.handle");
+
+        assert_eq!(jwt_claim(&disguised, "sid"), None);
+        assert_eq!(jwt_subject(&disguised), None);
+        assert_eq!(jwt_is_expired(&disguised), None);
+        let key = credential_session_key(&disguised);
+        assert!(!key.starts_with("cred-sid-"), "got {key}");
+        assert!(!key.starts_with("cred-sub-"), "got {key}");
+        // It lands in the byte-hash family, i.e. is treated as opaque.
+        assert_eq!(key, credential_session_key(&disguised));
+
+        // A real JWT with the same payload is of course still read.
+        let real = jwt(r#"{"sub":"victim","sid":"victim-session"}"#);
+        assert_eq!(jwt_claim(&real, "sid").as_deref(), Some("victim-session"));
+    }
+
+    #[test]
+    fn only_a_three_segment_token_with_a_json_header_qualifies_as_a_jwt() {
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = enc.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = enc.encode(br#"{"sub":"alice"}"#);
+
+        let rejected = [
+            // Not base64 / not JSON at all.
+            "a.b.c".to_string(),
+            // Two segments: no signature.
+            format!("{header}.{payload}"),
+            // Four segments (a JWE-shaped token is not a JWS).
+            format!("{header}.{payload}.sig.extra"),
+            // Empty segments.
+            format!("{header}.{payload}."),
+            format!(".{payload}.sig"),
+            // Header decodes, but to a JSON array rather than an object.
+            format!("{}.{payload}.sig", enc.encode(br#"["RS256"]"#)),
+            // Header is a JSON object without the mandatory `alg`.
+            format!("{}.{payload}.sig", enc.encode(br#"{"typ":"JWT"}"#)),
+            // `alg` present but not a string.
+            format!("{}.{payload}.sig", enc.encode(br#"{"alg":256}"#)),
+            // Payload decodes to a JSON scalar rather than an object.
+            format!("{header}.{}.sig", enc.encode(b"42")),
+            // No dots whatsoever.
+            "plain-opaque-token".to_string(),
+        ];
+        for token in rejected {
+            assert_eq!(jwt_subject(&token), None, "should not parse: {token}");
+            assert!(
+                credential_session_key(&token).starts_with("cred-")
+                    && !credential_session_key(&token).starts_with("cred-sub-"),
+                "should be byte-keyed: {token}"
+            );
+        }
+
+        // `typ` is optional — only `alg` is mandatory.
+        let no_typ = format!("{}.{payload}.sig", enc.encode(br#"{"alg":"RS256"}"#));
+        assert_eq!(jwt_subject(&no_typ).as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn strict_ordering_prefers_iat_and_refuses_to_guess() {
+        let older = jwt(r#"{"sub":"alice","iat":100,"exp":3700}"#);
+        let newer = jwt(r#"{"sub":"alice","iat":200,"exp":3800}"#);
+
+        assert_eq!(jwt_is_strictly_newer(&newer, &older), Some(true));
+        assert_eq!(jwt_is_strictly_newer(&older, &newer), Some(false));
+        // Equal `iat` is not *strictly* newer.
+        assert_eq!(jwt_is_strictly_newer(&older, &older), Some(false));
+
+        // `exp` stands in when the issuer omits `iat`.
+        let exp_only_old = jwt(r#"{"sub":"alice","exp":100}"#);
+        let exp_only_new = jwt(r#"{"sub":"alice","exp":200}"#);
+        assert_eq!(
+            jwt_is_strictly_newer(&exp_only_new, &exp_only_old),
+            Some(true)
+        );
+
+        // Unanswerable: no comparable timestamp, or not a JWT at all. Callers
+        // must read this as "not newer" and keep what the store holds.
+        assert_eq!(
+            jwt_is_strictly_newer(&jwt(r#"{"sub":"a"}"#), &jwt(r#"{"sub":"a"}"#)),
+            None
+        );
+        assert_eq!(jwt_is_strictly_newer("opaque", &older), None);
+        assert_eq!(jwt_is_strictly_newer(&newer, "opaque"), None);
     }
 
     #[test]

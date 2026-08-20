@@ -115,10 +115,23 @@ identities into one. Claims are read with the new `jwt_claim` (payload decode,
 no signature check) — the value only partitions state; `validate_unknown_bearer`
 still decides whether the bearer may be used at all.
 
+Because several bearers of one grant now map to one entry and HTTP orders
+none of them, the store gained an invariant: **an observed bearer never
+downgrades proxy-issued grant material.** When the entry under the key already
+carries a `refresh_token`, an arriving bearer that does not match it
+byte-for-byte may only advance it — the access token is replaced solely when
+`iat` (or `exp`) says it is strictly newer, and the `refresh_token` is carried
+over either way. A delayed request holding the superseded token therefore
+cannot strand the grant without refresh material.
+
 Two consequences: sessionless sessions get a new key at deploy, so their
 `SessionStore<T>` data is lost once (stale entries expire within the 30 min
 TTL); and two clients of one user in the same SSO session now share an
 identity — intended, since a transparent refresh is the same property.
+
+Note on the hashing: it keeps the literal claim out of logs and keys, nothing
+more. A truncated, unsalted sha256 of a low-entropy `sub` is dictionary-testable;
+unlinkability would require an HMAC under a server secret, which is not done.
 
 ### Dependencies
 

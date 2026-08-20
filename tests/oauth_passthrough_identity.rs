@@ -128,6 +128,28 @@ fn jwt_with_sid(sub: &str, sid: &str, nonce: &str) -> String {
     format!("{header}.{payload}.sig")
 }
 
+/// Seconds since the epoch, for building orderable tokens.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A JWT of one grant, stamped with `iat` (and a live `exp`). Two of these can
+/// be ordered the way the middleware orders them, which is what decides whether
+/// an arriving bearer may advance the stored entry.
+fn jwt_issued_at(sub: &str, sid: &str, iat: u64) -> String {
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = enc.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let exp = iat + 3600;
+    let payload = enc.encode(
+        format!(r#"{{"sub":"{sub}","sid":"{sid}","iat":{iat},"exp":{exp}}}"#).as_bytes(),
+    );
+    format!("{header}.{payload}.sig")
+}
+
 #[tokio::test]
 async fn sessionless_identity_survives_a_bearer_refresh() {
     let (app, token_store) = app_with(oauth().await);
@@ -184,14 +206,15 @@ async fn sessionless_identity_isolates_two_sso_sessions_of_the_same_user() {
 }
 
 /// The consequence of a stable key on the passthrough store/adopt path: a
-/// rotation now lands on the *same* entry the previous bearer wrote, so it goes
-/// through the principal check and replaces it — rather than silently forking a
-/// second entry as the byte-hash key did.
+/// rotation now lands on the *same* entry the previous bearer wrote, so it
+/// advances that entry in place rather than silently forking a second one as the
+/// byte-hash key did — and the grant's refresh material rides along.
 #[tokio::test]
-async fn sessionless_rotation_replaces_the_grant_entry_and_drops_stale_refresh_material() {
+async fn sessionless_rotation_advances_the_grant_entry_in_place() {
     let (app, token_store) = app_with(oauth().await);
 
-    let t1 = jwt_with_sid("alice", "sso-1", "one");
+    let issued = now();
+    let t1 = jwt_issued_at("alice", "sso-1", issued - 100);
     let (_, id) = whoami_request(&app, &[("authorization", &format!("Bearer {t1}"))]).await;
 
     // Stand in for `/oauth/token`: it keys the grant the same way, so the
@@ -203,18 +226,16 @@ async fn sessionless_rotation_replaces_the_grant_entry_and_drops_stale_refresh_m
         )
         .await;
 
-    // The client rotates its bearer *without* going through this proxy's
-    // `/oauth/token` (bring-your-own-token). The refresh_token we hold belongs
-    // to the superseded credential — Keycloak's rotation has already invalidated
-    // it — so it must not be carried onto the new bearer.
-    let t2 = jwt_with_sid("alice", "sso-1", "two");
+    // The client rotates its bearer. One entry, advanced — not two, and not one
+    // stripped of the only thing that can refresh it.
+    let t2 = jwt_issued_at("alice", "sso-1", issued);
     let (status, id2) = whoami_request(&app, &[("authorization", &format!("Bearer {t2}"))]).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(id2, id);
     let stored = token_store.peek_token(&id).await.expect("stored");
     assert_eq!(stored.access_token, t2);
-    assert_eq!(stored.refresh_token, None);
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-alice"));
 }
 
 /// A `sid`-carrying token and a `sub`-only token for the same user derive keys
@@ -296,13 +317,19 @@ async fn passthrough_accepts_a_rotated_bearer_for_the_same_principal() {
     assert!(stored.expires_at.is_some());
 }
 
+/// A rotation advances the stored access token but keeps the grant's refresh
+/// material. The material is not "the previous credential's" — `/oauth/token`
+/// captured it for the *grant*, and both bearers belong to that one grant (same
+/// principal, already validated). Dropping it was the bug: it left the entry
+/// unrefreshable while the client believed the framework could still refresh.
 #[tokio::test]
-async fn passthrough_rotation_never_inherits_previous_refresh_material() {
+async fn passthrough_rotation_carries_the_stored_refresh_material_forward() {
     let (app, token_store) = app_with(oauth().await);
 
     // Seed the session with a JWT that *does* carry refresh material, as if the
     // grant had been adopted from `/oauth/token`.
-    let t1 = jwt_with_sub("alice", "one");
+    let issued = now();
+    let t1 = jwt_issued_at("alice", "sso-1", issued - 100);
     token_store
         .store_token(
             "sess-alice".to_string(),
@@ -310,9 +337,8 @@ async fn passthrough_rotation_never_inherits_previous_refresh_material() {
         )
         .await;
 
-    // Same principal rotates its bearer. The refresh_token belongs to the old
-    // credential and must not follow the new one.
-    let t2 = jwt_with_sub("alice", "two");
+    // Same principal, demonstrably newer bearer.
+    let t2 = jwt_issued_at("alice", "sso-1", issued);
     let (status, _) = whoami_request(
         &app,
         &[
@@ -325,7 +351,71 @@ async fn passthrough_rotation_never_inherits_previous_refresh_material() {
     assert_eq!(status, StatusCode::OK);
     let stored = token_store.peek_token("sess-alice").await.expect("stored");
     assert_eq!(stored.access_token, t2);
-    assert_eq!(stored.refresh_token, None);
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-alice"));
+}
+
+/// The out-of-order case. HTTP orders nothing: once `/oauth/token` has refreshed
+/// the grant to `t2 + rt2`, a request that was already in flight with the
+/// superseded `t1` still arrives. It must not roll the entry back to `t1 + None`
+/// and strand the grant without refresh material.
+#[tokio::test]
+async fn a_delayed_bearer_older_than_the_stored_grant_never_downgrades_it() {
+    let (app, token_store) = app_with(oauth().await);
+
+    let issued = now();
+    let t1 = jwt_issued_at("alice", "sso-1", issued - 100);
+    let t2 = jwt_issued_at("alice", "sso-1", issued);
+
+    // Learn the grant key the way the middleware derives it, then stand in for
+    // `/oauth/token` having stored the refreshed pair under it.
+    let (_, key) = whoami_request(&app, &[("authorization", &format!("Bearer {t2}"))]).await;
+    token_store
+        .store_token(
+            key.clone(),
+            StoredToken::new(t2.clone(), Some("rt2".to_string()), None),
+        )
+        .await;
+
+    // The straggler lands.
+    let (status, late_key) =
+        whoami_request(&app, &[("authorization", &format!("Bearer {t1}"))]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(late_key, key, "same grant, same identity");
+    let stored = token_store.peek_token(&key).await.expect("stored");
+    assert_eq!(stored.access_token, t2, "must not roll back to t1");
+    assert_eq!(stored.refresh_token.as_deref(), Some("rt2"));
+}
+
+/// Two bearers of one grant that cannot be ordered (no `iat`, no `exp`) are
+/// treated as "not newer", which keeps the stored entry rather than gambling on
+/// arrival order.
+#[tokio::test]
+async fn an_unorderable_bearer_leaves_the_stored_grant_untouched() {
+    let (app, token_store) = app_with(oauth().await);
+
+    let t1 = jwt_with_sub("alice", "one");
+    token_store
+        .store_token(
+            "sess-alice".to_string(),
+            StoredToken::new(t1.clone(), Some("refresh-alice".to_string()), None),
+        )
+        .await;
+
+    let t2 = jwt_with_sub("alice", "two");
+    let (status, _) = whoami_request(
+        &app,
+        &[
+            ("authorization", &format!("Bearer {t2}")),
+            (MCP_SESSION_ID_HEADER, "sess-alice"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let stored = token_store.peek_token("sess-alice").await.expect("stored");
+    assert_eq!(stored.access_token, t1);
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-alice"));
 }
 
 #[tokio::test]
