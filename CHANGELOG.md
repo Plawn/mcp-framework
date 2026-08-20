@@ -10,6 +10,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] — Unreleased
 
+### Added — an OAuth lifecycle harness against a real Keycloak
+
+`TokenMode::ResourceServer` had unit coverage for its decisions and none for the
+cycle those decisions live in: discovery from a `401`, PKCE, expiry, client-side
+refresh, session loss, revocation. Those are exactly the parts that cannot be
+faked convincingly — a stub AS proves nothing about Keycloak, and a hand-rolled
+client proves nothing about the client rmcp actually ships.
+
+- `tests/oauth_lifecycle_rmcp.rs` drives the framework with rmcp's own
+  `OAuthState` / `AuthClient` / `StreamableHttpClientTransport` against an
+  ephemeral Keycloak 26.3 (testcontainers), covering: reactive discovery and
+  full authorization, transparent refresh past expiry with session state intact,
+  reconnection after protocol-session loss, and revocation →
+  `AuthError::AuthorizationRequired` → re-authorization. Every scenario also
+  asserts the `tokens` namespace stays empty — the mode's central claim.
+- The two protocol revisions are covered separately because they *differ*:
+  sessionless (2026-07-28) identity is claims-derived and survives a reconnect;
+  on 2025-11-25 the identity is the `mcp-session-id`, so it does not.
+- `#[ignore]`d by default (they need Docker and take ~2 min); CI runs them in a
+  dedicated `integration-keycloak` job, and `release` now waits on it. The
+  shared container is labelled and reaped by the following run — testcontainers
+  0.27 has no reaper and a `static` fixture never drops.
+
+### Added — `keycloak/mcp-realm.json`, a realm ready for resource-server mode
+
+Documentation said "set `OAUTH_EXPECTED_AUDIENCE`" without saying how to make
+Keycloak emit that audience — it has no RFC 8707 `resource` parameter, so the
+answer is a hardcoded audience mapper, which is not guessable.
+
+- A public PKCE (S256) `mcp-client` with the loopback and hosted-client redirect
+  URI families, an `mcp-audience` default client scope carrying the mapper,
+  `mcp:tools` / `mcp:resources` aligned with the framework's PRM, Client
+  Registration Policies for DCR, MCP-length lifetimes, and two test users.
+- `keycloak/README.md` states what must be substituted per deployment, which
+  values are proposals rather than settled, and the one ordering constraint that
+  bites: refresh-token rotation must not be enabled before the switch to
+  `ResourceServer`, because it breaks passthrough.
+
+
 ### Changed — transport session recovery re-arms its TTL on failover
 
 `TransportSessionStore` (the adapter that lets rmcp rebuild a legacy protocol

@@ -141,6 +141,11 @@ OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks
 OAUTH_EXPECTED_AUDIENCE=my-mcp-server   # mandatory; boot fails without it
 ```
 
+`keycloak/mcp-realm.json` is an import-ready realm for exactly this shape — a
+public PKCE client, the audience mapper Keycloak needs in place of RFC 8707
+`resource`, DCR policies and MCP-length lifetimes; `keycloak/README.md` explains
+what to substitute per deployment and which values are still proposals.
+
 What to check before flipping it:
 
 1. **Keycloak must put that audience in the token.** Add an audience mapper to the client (or a client scope) so `aud` contains the value above. Without it every request 401s — the failure is loud, and the accepted `aud` / `azp` are logged on every acceptance in the other modes, which is how to read the right value off real traffic first.
@@ -153,6 +158,61 @@ What to check before flipping it:
 
 - **Token exchange (RFC 8693)** — the server exchanges the inbound token for one whose `aud` is the upstream service. Requires a confidential client; the framework does not implement this, a consumer that needs it does the exchange in its own tool handler using the credential from `ctx.token()`.
 - **An explicitly shared audience** — the deployment deliberately mints tokens carrying both services in `aud`, and both list each other in `OAUTH_EXPECTED_AUDIENCE`. Simpler, and correspondingly blunter: the two services become one trust boundary.
+
+#### OAuth lifecycle harness (`tests/oauth_lifecycle_rmcp.rs`)
+
+The mode above is the one where the framework does the *least*, which makes it the
+one hardest to test with fakes: everything that matters happens between a real
+authorization server and a real MCP client. So this binary runs both. An
+ephemeral **Keycloak 26.3** (testcontainers, importing `keycloak/mcp-realm.json`)
+plays the AS, the framework runs in-process behind `build_app` on `127.0.0.1:0`,
+and the client is rmcp's own `OAuthState` / `AuthorizationManager` / `AuthClient`
+stack over `StreamableHttpClientTransport` — the same code path a real MCP client
+executes, PKCE and automatic refresh included.
+
+Every test is `#[ignore]`d (`run with --ignored`) and the CI job
+`integration-keycloak` runs them with `--test-threads=1`. A missing Docker daemon
+skips; a daemon that is present but produces a broken Keycloak **panics** — a
+silent skip once hid a real failure.
+
+**Fixture.** One container per test binary, behind a `tokio::sync::OnceCell`
+holding a leaked `ContainerAsync`. The realm JSON is patched at test time before
+the bind mount: `accessTokenLifespan` down to 5 s (expiry has to be observable)
+and the `mcp-audience` mapper rewritten to the audience the framework is
+configured with. Readiness is **not** a log line — Quarkus logs to stderr and
+"Listening on:" does not mean the import landed — it is a poll of
+`{issuer}/.well-known/openid-configuration` asserting the `issuer` field.
+
+**What the scenarios pin.**
+
+| Test | Property |
+|---|---|
+| `lifecycle_discovery_auth_and_refresh_{legacy_session,sessionless}` | 401 → `WWW-Authenticate` → PRM discovery → PKCE → tool call; past expiry the *client* refreshes and the same session's counter continues at 2. The access token is asserted to have **rotated**, so "the client refreshed" cannot be confused with "the old token still worked". |
+| `expired_bearer_is_refused_once_the_skew_leeway_passes` | the framework's own side of that: a bearer well past `exp` gets `401`. Split out because `JWKS_CLOCK_SKEW_LEEWAY` (30 s) means "expired" and "refused" are half a minute apart, which scenario 1 cannot pay on every run. |
+| `lifecycle_session_loss_then_reinitialize_{sessionless,legacy_session}` | reconnecting with the same bearer after the protocol session is gone. **The two revisions differ, deliberately**: sessionless (2026-07-28) identity is `credential_session_key`, so the `SessionStore<T>` entry survives and the counter continues; on 2025-11-25 the identity *is* the `mcp-session-id`, so a new one is a new identity and the counter restarts. Then two consecutive refresh cycles. |
+| `lifecycle_revoked_grant_requires_reauthorization` | admin-side revocation → `AuthError::AuthorizationRequired` → full re-auth succeeds, with a **new** identity (new Keycloak `sid`, per the claims-derived key above). |
+| `realm_injects_the_expected_audience` | the realm actually mints `aud` containing `OAUTH_EXPECTED_AUDIENCE` — without it every other test would fail for the wrong reason. |
+
+All of them assert the `tokens` namespace of the wired `InMemoryBackend` stays
+**empty**: the mode's central claim is that it keeps no token state, and that is
+the only assertion that can catch a regression reintroducing it.
+
+Three implementation notes that are not obvious:
+
+- **The container is reaped by the *next* run.** testcontainers 0.27 ships no
+  reaper — removal happens in `ContainerAsync::drop`, and a `static` fixture is
+  never dropped. Paying a 30 s boot per test to get a droppable local is the
+  only alternative, so instead every container is labelled
+  `app.mcp-framework.harness=oauth-lifecycle` and each run removes the previous
+  one's before starting. Steady state is one idle Keycloak between runs.
+- **Revocation needs the consent deleted too.** rmcp appends `offline_access`
+  when the AS advertises it, so `POST /admin/realms/mcp/users/{id}/logout` leaves
+  the offline grant — and the refresh token — perfectly usable. The harness pairs
+  it with `DELETE …/consents/mcp-client`.
+- **Two reqwest majors coexist.** rmcp 3.1 is built on reqwest 0.13, the
+  framework on 0.12, and `AuthClient::new` wants rmcp's. The dev-dependency is
+  renamed `reqwest13` so only this binary sees it and every other test keeps
+  resolving `reqwest` to 0.12.
 
 #### Validating bearers the proxy did not issue (`UnknownTokenValidation`)
 
