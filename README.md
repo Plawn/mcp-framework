@@ -7,7 +7,7 @@ Handles transport selection, authentication, CLI parsing, and tracing so you onl
 ## Features
 
 - **Triple transport** — HTTP (Streamable HTTP), SSE (Server-Sent Events), and stdio
-- **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE, dynamic client registration)
+- **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE and dynamic client registration, or a stateless pure resource server)
 - **Automatic token refresh** — expired OAuth tokens are refreshed lazily on access
 - **Dynamic capabilities** — add/remove tools, prompts, and resources at runtime
 - **Typed session storage** — generic `SessionStore<T>` for per-session data with TTL and automatic cleanup
@@ -176,6 +176,58 @@ OAuth mode exposes:
 - `/oauth/authorize`, `/oauth/token` (Keycloak proxy)
 - `/oauth/login`, `/oauth/callback`, `/oauth/status` (browser flow)
 
+#### Token modes
+
+`MCP_TOKEN_MODE` (or `OAuthConfig::token_mode`) picks who holds the grant:
+
+| Mode | The client holds | The server keeps | Refresh |
+|---|---|---|---|
+| `passthrough` (default) | the Keycloak JWT | access + refresh token | both sides — and Keycloak's refresh-token rotation makes them fight |
+| `opaque` | a framework UUID | access + refresh token | the framework |
+| `resource_server` | the Keycloak JWT | nothing | the client, alone |
+
+`resource_server` is what MCP 2025-06-18 and later specify: the MCP server is an
+OAuth *resource server*, not an authorization server. It validates the inbound
+JWT against the issuer's published keys and keeps no token state — so it scales
+horizontally without shared persistence, and a rotated refresh token can no
+longer break the session. In that mode `/oauth/token`, `/oauth/authorize` and
+the browser-flow routes stop proxying (they answer `404`); `/oauth/register`
+stays, because Keycloak's registration endpoint sends no CORS headers. Discovery
+points clients at Keycloak directly.
+
+```bash
+MCP_TOKEN_MODE=resource_server
+OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks
+OAUTH_EXPECTED_AUDIENCE=my-mcp-server   # mandatory in this mode; boot fails without it
+```
+
+The audience is mandatory here and only here: without it the server would accept
+every token the issuer ever signed, for any service. Keycloak must be configured
+to put that value in `aud` (audience mapper on the client or a client scope).
+Boot fails without it — `build_app` returns `Result<_, ConfigError>` and
+`run_http` validates before binding, so the guard cannot be routed around.
+
+Validation in this mode is JWKS-only by construction: introspection tells the
+server that a token is active, not that it was minted *for* this server, so it
+cannot enforce the audience. `OAUTH_UNKNOWN_TOKEN_VALIDATION=introspection` (and
+`reject`) are refused at boot; the default `jwks_then_introspection` is coerced
+to `jwks` with a startup warning, so an env file written for passthrough still
+boots.
+
+Because no token is bound to a session, the framework binds each protocol
+session id to the identity that opened it (a hash of the JWT's `sid`/`sub`, never
+token material) and refuses a request presenting a different one — otherwise any
+authenticated client could enter another user's session by sending its
+`mcp-session-id`. The bindings expire with the session TTL and are written
+through to persistence, so the check holds across instances.
+
+Capability filters, access validators and tool handlers see the credential as
+usual — use `ctx.token()` rather than `ctx.token_store().get_token(...)`, which
+has nothing to find in this mode. `refresh_token` is always `None`: it belongs
+to the client. Forwarding the inbound bearer to an upstream API is forbidden by
+the spec; use RFC 8693 token exchange, or an audience the deployment
+deliberately shares.
+
 ## Session storage
 
 `SessionStore<T>` provides typed, per-session data with automatic TTL expiration. The generic `T` defaults to `()` — consumers that don't need sessions can ignore it entirely.
@@ -284,8 +336,9 @@ When using CLI mode (`settings: None`):
 | `OAUTH_ISSUER_URL` | Keycloak realm URL | — |
 | `OAUTH_REDIRECT_URL` | OAuth redirect URL | — |
 | `OAUTH_SCOPES` | Comma-separated scopes | `openid,profile,email` |
-| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | How to check a bearer the proxy did not issue: `jwks`, `introspection`, `jwks_then_introspection`, `reject` | `jwks_then_introspection` |
-| `OAUTH_EXPECTED_AUDIENCE` | Comma-separated audiences a locally validated JWT must carry | — (unconstrained) |
+| `MCP_TOKEN_MODE` | `passthrough`, `opaque`, or `resource_server` | `passthrough` |
+| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | How to check a bearer the proxy did not issue: `jwks`, `introspection`, `jwks_then_introspection`, `reject`. In `resource_server` mode only `jwks` is honoured (the default is coerced to it; the other two fail at boot) | `jwks_then_introspection` |
+| `OAUTH_EXPECTED_AUDIENCE` | Comma-separated audiences a locally validated JWT must carry. Required when `MCP_TOKEN_MODE=resource_server` | — (unconstrained) |
 
 A `.env` file is loaded automatically in CLI mode.
 

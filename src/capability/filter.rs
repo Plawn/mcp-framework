@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use rmcp::model::{Extensions, Prompt, Resource, Tool};
 
-use crate::auth::{StoredToken, TokenStore};
+use crate::auth::{RequestToken, StoredToken, TokenStore};
 use crate::session::resolve_session_id;
 
 /// Trait for filtering capabilities based on the session's authentication token.
@@ -96,10 +96,22 @@ where
 ///
 /// In stdio mode, resolves the shared [`DEFAULT_SESSION_ID`](crate::constants::DEFAULT_SESSION_ID)
 /// used by `stdio_token_env`.
+///
+/// In [`TokenMode::ResourceServer`](crate::auth::TokenMode::ResourceServer)
+/// there is no server-side token state to look up: the auth middleware attaches
+/// the validated credential to the request as a [`RequestToken`] instead, and it
+/// takes precedence over the store. Consumers see the same `StoredToken` shape
+/// either way (bearer + decoded claims); only `refresh_token` is always `None`,
+/// because in that mode the refresh token never reaches this process.
 pub(crate) async fn resolve_token(
     extensions: &Extensions,
     token_store: &TokenStore,
 ) -> Option<StoredToken> {
+    if let Some(parts) = extensions.get::<http::request::Parts>()
+        && let Some(request_token) = parts.extensions.get::<RequestToken>()
+    {
+        return Some(request_token.0.clone());
+    }
     token_store.get_token(resolve_session_id(extensions)).await
 }
 

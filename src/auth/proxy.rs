@@ -213,10 +213,31 @@ fn build_passthrough_response(
     builder.body(axum::body::Body::from(body.to_vec())).unwrap()
 }
 
+/// Answer for the OAuth endpoints a pure resource server does not proxy.
+///
+/// They are mounted rather than simply left out: an unmounted path falls
+/// through to the auth-wrapped MCP fallback and answers `401`, which tells a
+/// client that its credentials were wrong when the truth is that the endpoint
+/// does not exist here. `404` plus a reason is what a misconfigured client
+/// needs to read in a log.
+pub async fn not_proxied_handler() -> HttpError {
+    HttpError::oauth_error(
+        axum::http::StatusCode::NOT_FOUND,
+        "invalid_request",
+        "This server is a pure OAuth resource server (MCP_TOKEN_MODE=resource_server) and \
+         proxies no part of the authorization flow. Use the endpoints advertised by the \
+         authorization server named in this server's protected-resource metadata.",
+    )
+}
+
 /// Handler for `/oauth/token` — proxies to Keycloak.
 ///
 /// Dispatches to [`passthrough_token_handler`] or [`opaque_token_handler`]
 /// depending on the configured [`TokenMode`].
+///
+/// Not reachable in [`TokenMode::ResourceServer`]: `mcp_oauth_router` does not
+/// mount the route at all, so the request 404s in the router rather than
+/// arriving here. The arm exists because the match must be exhaustive.
 pub async fn token_handler(
     State(state): State<Arc<McpOAuthState>>,
     headers: HeaderMap,
@@ -225,6 +246,12 @@ pub async fn token_handler(
     match state.token_mode {
         TokenMode::Opaque => opaque_token_handler(state, headers, body).await,
         TokenMode::Passthrough => passthrough_token_handler(state, headers, body).await,
+        TokenMode::ResourceServer => Err(HttpError::oauth_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "invalid_request",
+            "This server is a pure OAuth resource server and does not proxy token \
+             requests. Use the token endpoint advertised by the authorization server.",
+        )),
     }
 }
 

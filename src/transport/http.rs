@@ -8,16 +8,18 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::audit::ToolCallLogger;
 use crate::auth::{
-    AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig,
-    OAuthState, RefreshConfig, TokenStore, WellKnownState, authorization_server_metadata_handler,
-    basic_auth_middleware, bearer_auth_middleware, mcp_oauth_router, oauth_router,
-    protected_resource_metadata_handler, strip_framework_session_header,
+    AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, ConfigError, McpOAuthState,
+    OAuthConfig, OAuthState, RefreshConfig, SessionBindings, TokenStore, WellKnownState,
+    authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
+    mcp_oauth_router, not_proxied_handler, oauth_router, protected_resource_metadata_handler,
+    strip_framework_session_header,
 };
 use crate::capability::{
     AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
 };
 use crate::constants::{
-    CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, HTTP_REQUEST_TIMEOUT, OAUTH_MOUNT,
+    CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, HTTP_REQUEST_TIMEOUT, OAUTH_CALLBACK_PATH,
+    OAUTH_LOGIN_PATH, OAUTH_MOUNT, OAUTH_STATUS_PATH,
 };
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
@@ -67,12 +69,25 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     pub public_routes: Option<Router>,
 }
 
+/// Whether this configuration keeps server-side token state.
+///
+/// `false` only for [`TokenMode::ResourceServer`](crate::auth::TokenMode::ResourceServer),
+/// where the framework validates a bearer and forgets it: no refresh
+/// configuration, no token persistence, no load-at-startup, no expiry sweep.
+fn keeps_token_state(auth: &AuthProvider) -> bool {
+    match auth {
+        AuthProvider::OAuth(oauth_config) => oauth_config.token_mode.is_stateful(),
+        _ => true,
+    }
+}
+
 /// Wrap a router with the appropriate auth middleware based on the auth provider.
 fn wrap_auth_middleware(
     router: Router,
     auth: &AuthProvider,
     public_url: &str,
     token_store: &TokenStore,
+    session_bindings: SessionBindings,
 ) -> Router {
     let router = match auth {
         AuthProvider::None => router,
@@ -95,6 +110,7 @@ fn wrap_auth_middleware(
                 ),
                 token_store: token_store.clone(),
                 token_mode: oauth_config.token_mode.clone(),
+                session_bindings,
             });
             router.layer(axum::middleware::from_fn_with_state(
                 auth_middleware_state,
@@ -123,9 +139,18 @@ fn setup_oauth_routes(
         .build()
         .expect("Failed to build HTTP client");
 
+    // RFC 9728: where clients are told to authenticate. A pure resource server
+    // proxies nothing, so it names the real authorization server; the proxying
+    // modes name themselves, because they front the authorize/token endpoints.
+    let authorization_server = if oauth_config.token_mode.is_stateful() {
+        public_url.to_string()
+    } else {
+        oauth_config.issuer_url.trim_end_matches('/').to_string()
+    };
+
     let well_known_state = Arc::new(WellKnownState {
         resource_url: format!("{}/mcp", public_url),
-        authorization_server: public_url.to_string(),
+        authorization_server,
         scopes: oauth_config.scopes.clone(),
     });
 
@@ -136,11 +161,25 @@ fn setup_oauth_routes(
         http_client.clone(),
     );
 
-    let oauth_state = OAuthState {
-        config: oauth_config.clone(),
-        store: token_store.clone(),
-        http_client,
-        app_name: app_name.to_string(),
+    // The browser login flow (`/oauth/login`, `/oauth/callback`, `/oauth/status`)
+    // performs a server-side code exchange and writes the grant into the
+    // `TokenStore` — exactly the state a pure resource server abolishes. It is
+    // therefore not mounted in `TokenMode::ResourceServer`.
+    let oauth_routes = if oauth_config.token_mode.is_stateful() {
+        let oauth_state = OAuthState {
+            config: oauth_config.clone(),
+            store: token_store.clone(),
+            http_client,
+            app_name: app_name.to_string(),
+        };
+        mcp_oauth_router(mcp_oauth_state.clone()).merge(oauth_router(oauth_state))
+    } else {
+        mcp_oauth_router(mcp_oauth_state.clone()).merge(
+            Router::new()
+                .route(OAUTH_LOGIN_PATH, get(not_proxied_handler))
+                .route(OAUTH_CALLBACK_PATH, get(not_proxied_handler))
+                .route(OAUTH_STATUS_PATH, get(not_proxied_handler)),
+        )
     };
 
     Router::new()
@@ -157,27 +196,44 @@ fn setup_oauth_routes(
             get(authorization_server_metadata_handler)
                 .with_state(Arc::new(mcp_oauth_state.clone())),
         )
-        .nest(
-            OAUTH_MOUNT,
-            mcp_oauth_router(mcp_oauth_state).merge(oauth_router(oauth_state)),
-        )
+        .nest(OAUTH_MOUNT, oauth_routes)
 }
 
 /// Build the axum router with all routes configured.
 ///
-/// Returns `(Router, TokenStore)` so the caller can start a cleanup task on
-/// the token store and abort it on shutdown.
-pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore, CapabilityRegistry)
+/// Returns `(Router, TokenStore, CapabilityRegistry)` so the caller can start a
+/// cleanup task on the token store and abort it on shutdown.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] for an [`AuthProvider::OAuth`] configuration that
+/// cannot work — see [`OAuthConfig::validate`]. The check lives here rather than
+/// only in [`McpAppBuilder`](crate::McpAppBuilder) because `HttpAppConfig` is a
+/// plain public struct: a caller assembling one by hand (as the integration
+/// tests do) would otherwise get a router that answers `401` to everything
+/// instead of a startup failure.
+pub fn build_app<F, S, T>(
+    config: HttpAppConfig<F, T>,
+) -> Result<(Router, TokenStore, CapabilityRegistry), ConfigError>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    if let AuthProvider::OAuth(oauth_config) = &config.auth {
+        oauth_config.validate()?;
+    }
+
     let transport_session_ttl = config.session_store.ttl();
     let transport_persistence = config.persistence.clone();
 
+    // Whether this deployment keeps token state at all. A pure resource server
+    // validates and forgets: giving it a refresh configuration or a persistence
+    // backend would hand it back the very state the mode exists to abolish.
+    let keeps_token_state = keeps_token_state(&config.auth);
+
     let mut token_store = match &config.auth {
-        AuthProvider::OAuth(oauth_config) => {
+        AuthProvider::OAuth(oauth_config) if keeps_token_state => {
             let refresh_config = RefreshConfig {
                 client_id: oauth_config.client_id.clone(),
                 client_secret: oauth_config.client_secret.clone(),
@@ -193,6 +249,13 @@ where
             store.configure_unknown_bearer_validation(oauth_config);
             store
         }
+        AuthProvider::OAuth(oauth_config) => {
+            // Validation only: the issuer's public keys, and nothing that could
+            // refresh, store or resurrect a grant.
+            let mut store = TokenStore::new();
+            store.configure_unknown_bearer_validation(oauth_config);
+            store
+        }
         _ => TokenStore::new(),
     };
 
@@ -200,10 +263,21 @@ where
         token_store.claims_decoder = Some(decoder);
     }
 
+    // Expires with the session it protects, and is shared across instances so a
+    // peer that never saw the session still refuses a second principal
+    // presenting its id.
+    let mut session_bindings = SessionBindings::new(transport_session_ttl);
+
     let mut registry = config.capability_registry.unwrap_or_default();
     if let Some(ref backend) = config.persistence {
-        token_store.set_persistence(backend.clone());
+        // Sessions, capabilities and session bindings still persist — only the
+        // *token* namespace is left alone in resource-server mode, so a grant a
+        // previous passthrough deployment wrote is neither loaded nor touched.
+        if keeps_token_state {
+            token_store.set_persistence(backend.clone());
+        }
         registry.set_persistence(backend.clone());
+        session_bindings.set_persistence(backend.clone());
     }
 
     let mut app = Router::new();
@@ -303,7 +377,13 @@ where
             .extra_routes
             .unwrap_or_default()
             .fallback_service(mcp_fallback);
-        wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
+        wrap_auth_middleware(
+            base,
+            &config.auth,
+            &config.public_url,
+            &token_store,
+            session_bindings,
+        )
     };
 
     // Use fallback_service so the MCP handler responds at ANY path (/, /mcp, etc.).
@@ -361,11 +441,11 @@ where
             },
         );
 
-    (
+    Ok((
         app.layer(cors).layer(trace_layer),
         token_store,
         registry_ref,
-    )
+    ))
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
@@ -375,6 +455,12 @@ where
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    // Before anything is bound or spawned: a configuration that cannot work is
+    // a startup failure, not a server that answers 401 to every request.
+    if let AuthProvider::OAuth(oauth_config) = &config.auth {
+        oauth_config.validate()?;
+    }
+
     let bind_addr: std::net::SocketAddr = config.bind_addr.parse()?;
 
     let public_url = config.public_url.clone();
@@ -400,8 +486,21 @@ where
                 "OAuth server:    {}/.well-known/oauth-authorization-server",
                 public_url
             );
-            tracing::info!("OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token");
-            tracing::info!("Legacy OAuth:    /oauth/login, /oauth/callback, /oauth/status");
+            if oauth_config.token_mode.is_stateful() {
+                tracing::info!("OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token");
+                tracing::info!("Legacy OAuth:    /oauth/login, /oauth/callback, /oauth/status");
+            } else {
+                tracing::info!("OAuth endpoints: /oauth/register (DCR translation only)");
+                tracing::info!(
+                    "Pure resource server: authorize/token/login are NOT proxied; clients \
+                     authenticate directly against {}",
+                    oauth_config.issuer_url
+                );
+                tracing::info!(
+                    "Accepted audiences: {}",
+                    oauth_config.expected_audiences.join(", ")
+                );
+            }
         }
     }
 
@@ -411,20 +510,24 @@ where
     // Start session cleanup task
     let session_cleanup = config.session_store.start_cleanup_task();
 
-    let (app, token_store, registry) = build_app(config);
+    let keeps_token_state = keeps_token_state(&config.auth);
+    let (app, token_store, registry) = build_app(config)?;
 
-    token_store
-        .load_persisted()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to load persisted tokens: {e}"))?;
+    if keeps_token_state {
+        token_store
+            .load_persisted()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load persisted tokens: {e}"))?;
+    }
 
     registry
         .load_persisted_versions()
         .await
         .map_err(|e| anyhow::anyhow!("failed to load persisted capability versions: {e}"))?;
 
-    // Start token cleanup task (purge expired tokens every 5 minutes)
-    let token_cleanup = token_store.start_cleanup_task(CLEANUP_INTERVAL);
+    // Purge expired tokens every 5 minutes — there are none to purge when the
+    // store is never written to.
+    let token_cleanup = keeps_token_state.then(|| token_store.start_cleanup_task(CLEANUP_INTERVAL));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
@@ -435,7 +538,9 @@ where
 
         // Stop cleanup tasks
         session_cleanup.abort();
-        token_cleanup.abort();
+        if let Some(token_cleanup) = token_cleanup {
+            token_cleanup.abort();
+        }
 
         // Give connections 5 seconds to close gracefully, then force exit
         tokio::spawn(async {

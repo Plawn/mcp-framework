@@ -32,16 +32,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::channel::mpsc;
+use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{QuitReason, RoleClient, RunningService};
-use rmcp::ServiceExt;
 use tokio::task::JoinHandle;
 
-use crate::auth::{StoredToken, TokenMode, TokenStore};
-use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
-use crate::capability::AccessValidator;
 use crate::audit::ToolCallLogger;
+use crate::auth::{StoredToken, TokenMode, TokenStore};
+use crate::capability::AccessValidator;
+use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::session::{SessionData, SessionStore};
 
 /// Messages buffered in each direction before the sender waits.
@@ -163,8 +163,13 @@ pub enum LoopbackConnectError {
     ///
     /// A caller that gets this can retry anonymously — a de-escalation, safe by construction —
     /// as long as it says so in its logs.
-    #[error("loopback cannot resolve the credential presented for session '{session_id}': {reason}")]
-    UnresolvableCredential { session_id: String, reason: &'static str },
+    #[error(
+        "loopback cannot resolve the credential presented for session '{session_id}': {reason}"
+    )]
+    UnresolvableCredential {
+        session_id: String,
+        reason: &'static str,
+    },
     /// The MCP `initialize` handshake failed.
     ///
     /// Boxed: rmcp's error is several hundred bytes, and it is the rarest variant of the three —
@@ -399,7 +404,10 @@ where
                 return Err(e.into());
             }
         };
-        Ok(LoopbackSession { client: Some(client), server })
+        Ok(LoopbackSession {
+            client: Some(client),
+            server,
+        })
     }
 
     /// Drop everything this endpoint holds for `session_id`.
@@ -428,13 +436,7 @@ pub trait DynLoopback: Send + Sync {
     fn connect_session(
         &self,
         identity: LoopbackIdentity,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>>
-                + Send
-                + '_,
-        >,
-    >;
+    ) -> Pin<Box<dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>> + Send + '_>>;
 
     /// See [`LoopbackEndpoint::forget_session`].
     fn forget_session_dyn<'a>(
@@ -452,13 +454,8 @@ where
     fn connect_session(
         &self,
         identity: LoopbackIdentity,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<LoopbackSession, LoopbackConnectError>> + Send + '_>>
+    {
         Box::pin(self.connect(identity))
     }
 

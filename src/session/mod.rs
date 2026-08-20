@@ -29,7 +29,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::auth::TokenStore;
+use crate::auth::{StoredToken, TokenStore};
 use crate::constants::{
     DEFAULT_SESSION_ID, DEFAULT_SESSION_TTL, MCP_FALLBACK_SESSION_HEADER, MCP_SESSION_ID_HEADER,
     NS_SESSION_LOCK, NS_SESSIONS, SESSION_LOCK_POLL, SESSION_LOCK_TTL, SESSION_LOCK_WAIT,
@@ -566,6 +566,25 @@ pub trait RequestContextExt {
     ///
     /// Panics if `TokenStore` was not injected into the context.
     fn token_store(&self) -> &TokenStore;
+
+    /// The credential bound to the current request, wherever it happens to live.
+    ///
+    /// Prefer this over `ctx.token_store().get_token(ctx.session_id())`: in
+    /// [`TokenMode::ResourceServer`](crate::auth::TokenMode::ResourceServer) the
+    /// framework keeps no token state, so a store lookup returns `None` even
+    /// though the request is perfectly authenticated. This accessor reads the
+    /// request-scoped credential the auth middleware attached after validating
+    /// it, and falls back to the store in the proxying modes.
+    ///
+    /// The returned [`StoredToken`] carries the same `access_token` and decoded
+    /// claims either way; only `refresh_token` is always `None` in
+    /// resource-server mode, because the refresh token never reaches this
+    /// process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `TokenStore` was not injected into the context.
+    fn token(&self) -> impl std::future::Future<Output = Option<StoredToken>> + Send;
 }
 
 impl RequestContextExt for RequestContext<RoleServer> {
@@ -586,6 +605,10 @@ impl RequestContextExt for RequestContext<RoleServer> {
         self.extensions
             .get::<TokenStore>()
             .expect("TokenStore not in context")
+    }
+
+    async fn token(&self) -> Option<StoredToken> {
+        crate::capability::filter::resolve_token(&self.extensions, self.token_store()).await
     }
 }
 

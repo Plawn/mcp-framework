@@ -12,6 +12,7 @@ use axum::{
 };
 use std::sync::Arc;
 
+use super::binding::SessionBindings;
 use super::config::TokenMode;
 use super::{BasicAuthConfig, StoredToken, TokenStore};
 use crate::constants::{
@@ -133,11 +134,34 @@ pub struct AuthMiddlewareState {
     pub resource_metadata_url: String,
     pub token_store: TokenStore,
     pub token_mode: TokenMode,
+    /// Protocol session id → the identity that opened it.
+    ///
+    /// Only consulted in [`TokenMode::ResourceServer`], which is the one mode
+    /// with no per-session token to compare a new bearer against — see
+    /// [`SessionBindings`].
+    pub session_bindings: SessionBindings,
 }
 
 /// Extension to store the Bearer token for downstream handlers
 #[derive(Clone, Debug)]
 pub struct BearerToken(pub String);
+
+/// A validated credential attached to the request instead of to the
+/// [`TokenStore`].
+///
+/// [`TokenMode::ResourceServer`] keeps no server-side token state, so there is
+/// nothing for `resolve_token` to look up by session id. The middleware builds a
+/// transient [`StoredToken`] (bearer + decoded claims, no refresh material) and
+/// attaches it here; it is read back through `http::request::Parts::extensions`,
+/// which rmcp injects into the MCP request context. Everything a capability
+/// filter, an access validator or a tool handler sees is therefore identical to
+/// the stateful modes — minus `refresh_token`, which by design never reaches
+/// this process.
+///
+/// The extension is *only* ever written by the auth middleware, after the
+/// credential has been validated.
+#[derive(Clone, Debug)]
+pub struct RequestToken(pub StoredToken);
 
 /// Middleware that extracts Bearer token from Authorization header
 /// and stores it in request extensions for handlers to use.
@@ -151,6 +175,11 @@ pub struct BearerToken(pub String);
 /// In **Opaque** mode: the Bearer token is an opaque UUID issued by this
 /// framework. The middleware resolves it to the real Keycloak token
 /// (auto-refreshing if needed) and injects that for downstream handlers.
+///
+/// In **ResourceServer** mode: the bearer is validated locally against the
+/// issuer's keys and attached to the request. Nothing is read from or written to
+/// the `TokenStore`, and nothing is refreshed — see
+/// [`authorize_as_resource_server`].
 ///
 /// If no token is present, returns 401 with WWW-Authenticate header
 /// pointing to the OAuth protected resource metadata.
@@ -205,6 +234,14 @@ pub async fn bearer_auth_middleware(
     if token.is_empty() {
         tracing::warn!("Auth middleware: empty Bearer token, returning 401");
         return unauthorized_response(&state.resource_metadata_url);
+    }
+
+    if state.token_mode == TokenMode::ResourceServer {
+        // Pure resource server: validate locally, store nothing, refresh nothing.
+        return match authorize_as_resource_server(&state, &mut request, &token).await {
+            Ok(()) => next.run(request).await,
+            Err(response) => response,
+        };
     }
 
     if state.token_mode == TokenMode::Opaque {
@@ -464,6 +501,104 @@ pub async fn bearer_auth_middleware(
 
     // Continue to next handler
     next.run(request).await
+}
+
+/// Authorize a request in [`TokenMode::ResourceServer`].
+///
+/// The whole mode is this function: **validate, derive an identity, attach —
+/// and touch no shared state**.
+///
+/// 1. **Validate** the bearer against the issuer's published keys — signature,
+///    `iss`, `exp`, `nbf` and `aud`, with the same asymmetric-algorithm
+///    restriction and fetch cooldown as everywhere else. The [`TokenStore`] is
+///    never consulted (no `peek_token`, no adoption) and never written.
+///
+///    This path is JWKS-**only**, deliberately ignoring
+///    [`UnknownTokenValidation`](super::UnknownTokenValidation): RFC 7662
+///    introspection reports whether a token is active, not who it was minted
+///    for, so falling back to it would wave through a token whose audience is
+///    another service — defeating the mandatory `OAUTH_EXPECTED_AUDIENCE`
+///    check that makes this mode safe. `OAuthConfig::validate` already refuses
+///    `introspection` at boot and coerces `jwks_then_introspection`; calling
+///    [`TokenStore::validate_bearer_via_jwks`] here makes the guarantee
+///    structural instead of configuration-dependent.
+/// 2. **Derive** the session identity from the credential's stable claims
+///    (`sid`, then `sub`) when the protocol supplies none, exactly as the other
+///    modes do — see [`credential_session_key`]. This is what lets a
+///    `SessionStore` entry survive the client rotating its bearer, which it now
+///    does entirely on its own.
+///
+///    When the protocol *does* supply a session id, the same derived identity
+///    is claimed against it (see [`SessionBindings`]): a valid bearer proves who
+///    the caller is, never that the session they named is theirs. The proxying
+///    modes get that comparison for free from the token they keep per session;
+///    this mode keeps none.
+/// 3. **Attach** the credential to the request: [`BearerToken`] for handlers
+///    that want the raw string, and [`RequestToken`] carrying a transient
+///    [`StoredToken`] (with decoded claims) for everything that reads tokens
+///    through `resolve_token`.
+///
+/// There is deliberately no refresh path. An expired bearer is a `401` with the
+/// protected-resource challenge; refreshing it is the client's business, and
+/// only the client still holds a refresh token that Keycloak has not rotated
+/// out from under it.
+async fn authorize_as_resource_server(
+    state: &AuthMiddlewareState,
+    request: &mut Request<Body>,
+    token: &str,
+) -> Result<(), Response> {
+    let validated = match state.token_store.validate_bearer_via_jwks(token).await {
+        Ok(validated) => validated,
+        Err(rejection) => {
+            // As everywhere else, the client only ever sees an opaque 401; the
+            // cause is for the operator's logs.
+            tracing::warn!("Rejecting bearer in resource-server mode: {rejection}");
+            return Err(unauthorized_response(&state.resource_metadata_url));
+        }
+    };
+
+    // Whether the *protocol* supplied the id, i.e. whether it is a value the
+    // client could have copied from somebody else. A derived id is a function of
+    // this very credential, so it needs no binding.
+    let protocol_supplied = request.headers().contains_key(MCP_SESSION_ID_HEADER);
+    let session_id = resolve_or_derive_session_id(request, token);
+
+    // A valid bearer says who you are; it does not say that this session is
+    // yours. Without this check Bob, holding his own perfectly valid JWT, enters
+    // Alice's session — and her `SessionStore` entry — simply by sending her
+    // `mcp-session-id`. The proxying modes get this from the token they keep per
+    // session; this mode keeps none, so the binding is explicit.
+    if protocol_supplied {
+        let identity = credential_session_key(token);
+        if !state.session_bindings.claim(&session_id, &identity).await {
+            tracing::warn!(
+                session = %session_id,
+                "bearer does not belong to the principal bound to this protocol session, returning 401"
+            );
+            // 401 rather than 403, as the passthrough principal check does: the
+            // client's way out is to re-initialize and be given a session id of
+            // its own, and an unauthenticated caller learns nothing about
+            // whether the session it guessed exists.
+            return Err(unauthorized_response(&state.resource_metadata_url));
+        }
+    }
+
+    tracing::debug!(
+        session = %session_id,
+        source = ?validated.source,
+        subject = validated.subject.as_deref().unwrap_or("<none>"),
+        "Accepted a bearer as a pure resource server (no token state kept)"
+    );
+
+    let transient = state
+        .token_store
+        .transient_token(token.to_string(), validated.expires_at);
+    request.extensions_mut().insert(RequestToken(transient));
+    request
+        .extensions_mut()
+        .insert(BearerToken(token.to_string()));
+
+    Ok(())
 }
 
 /// Decode one base64url JWT segment into a JSON **object**.

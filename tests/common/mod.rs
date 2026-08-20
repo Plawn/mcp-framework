@@ -57,7 +57,7 @@ fn app_with_optional_persistence(
         extra_routes: Some(Router::new().route("/whoami", get(whoami))),
         public_routes: None,
     };
-    let (app, token_store, _registry) = build_app(config);
+    let (app, token_store, _registry) = build_app(config).expect("valid test configuration");
     (app, token_store)
 }
 

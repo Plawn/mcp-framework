@@ -147,9 +147,7 @@ async fn a_registry_call_is_audited() -> anyhow::Result<()> {
     let (endpoint, mut rx) = endpoint_with_logger().await;
     let client = endpoint.connect(LoopbackIdentity::new("thread-a")).await?;
 
-    let result = client
-        .call_tool(CallToolRequestParams::new("ping"))
-        .await?;
+    let result = client.call_tool(CallToolRequestParams::new("ping")).await?;
     let text = result
         .content
         .first()
@@ -164,7 +162,10 @@ async fn a_registry_call_is_audited() -> anyhow::Result<()> {
     assert!(
         matches!(
             record.outcome,
-            ToolCallOutcome::Success { is_error: false, .. }
+            ToolCallOutcome::Success {
+                is_error: false,
+                ..
+            }
         ),
         "unexpected outcome: {:?}",
         record.outcome
@@ -236,7 +237,10 @@ async fn a_session_reopened_without_a_token_loses_the_previous_rights() -> anyho
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(names.contains(&"admin_reset".to_string()), "premise broken: {names:?}");
+    assert!(
+        names.contains(&"admin_reset".to_string()),
+        "premise broken: {names:?}"
+    );
     authed.cancel().await?;
 
     let anon = endpoint.connect(LoopbackIdentity::new("shared")).await?;
@@ -276,7 +280,10 @@ async fn forgetting_a_session_drops_its_token() -> anyhow::Result<()> {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.contains(&"admin_reset".to_string()), "token survived forget: {names:?}");
+    assert!(
+        !names.contains(&"admin_reset".to_string()),
+        "token survived forget: {names:?}"
+    );
 
     after.cancel().await?;
     Ok(())
@@ -301,7 +308,10 @@ async fn an_identity_the_protocol_cannot_carry_is_refused() -> anyhow::Result<()
         .await
         .expect_err("a session id no header can hold should be refused");
     assert!(
-        matches!(err, mcp_framework::transport::LoopbackConnectError::InvalidIdentity(_)),
+        matches!(
+            err,
+            mcp_framework::transport::LoopbackConnectError::InvalidIdentity(_)
+        ),
         "unexpected error: {err}"
     );
     Ok(())
@@ -395,7 +405,10 @@ async fn configuring_the_builder_after_loopback_is_refused_at_build() -> anyhow:
         .err()
         .expect("a filter set after `loopback()` should be refused");
     let msg = err.to_string();
-    assert!(msg.contains("capability_filter"), "the error must name the field: {msg}");
+    assert!(
+        msg.contains("capability_filter"),
+        "the error must name the field: {msg}"
+    );
     Ok(())
 }
 
@@ -445,7 +458,10 @@ async fn the_access_validator_can_deny_a_loopback_call() -> anyhow::Result<()> {
     // control and not only the audit record: the same tool is denied to one session and served
     // to another.
     let validator: Arc<dyn AccessValidator> = Arc::new(ToolCallValidator(
-        |name: &str, _args: Option<&serde_json::Map<String, serde_json::Value>>, _token: Option<&StoredToken>, session_id: &str| {
+        |name: &str,
+         _args: Option<&serde_json::Map<String, serde_json::Value>>,
+         _token: Option<&StoredToken>,
+         session_id: &str| {
             if name == "admin_reset" && session_id != "root" {
                 AccessDecision::Deny("not root".to_string())
             } else {

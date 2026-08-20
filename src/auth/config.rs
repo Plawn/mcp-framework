@@ -17,6 +17,34 @@ pub type ConfiguredClient = oauth2::Client<
     oauth2::EndpointSet,
 >;
 
+/// A configuration combination the framework refuses to start with.
+///
+/// Returned by [`OAuthConfig::validate`] and propagated by
+/// [`build_app`](crate::transport::build_app) / [`run_http`](crate::transport::run_http),
+/// so a misconfiguration is a startup failure on every entry point — not only
+/// through [`McpAppBuilder`](crate::McpAppBuilder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError(String);
+
+impl ConfigError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The explanation, for callers that want to re-wrap it.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// OAuth configuration for Keycloak OIDC
 #[derive(Clone)]
 pub struct OAuthConfig {
@@ -85,6 +113,81 @@ impl OAuthConfig {
         })
     }
 
+    /// Check the configuration for combinations that cannot work.
+    ///
+    /// Called at boot (`McpAppBuilder::validate` and `run()` in HTTP mode) so a
+    /// deployment fails loudly at startup rather than by answering `401` to
+    /// every request.
+    ///
+    /// [`TokenMode::ResourceServer`] is the only mode with hard requirements:
+    /// it accepts a bearer purely on the strength of a local signature check,
+    /// so an unconstrained `aud` would make this server accept **any** token
+    /// the issuer ever signed — including one minted for a different service,
+    /// which is exactly the confused-deputy case RFC 8707 / the MCP spec
+    /// require a resource server to refuse. In the proxying modes the audience
+    /// is implied by the fact that this server performed the exchange itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.token_mode != TokenMode::ResourceServer {
+            return Ok(());
+        }
+
+        if self.expected_audiences.is_empty() {
+            return Err(ConfigError::new(
+                "MCP_TOKEN_MODE=resource_server requires OAUTH_EXPECTED_AUDIENCE to be set \
+                 (comma-separated). A pure resource server accepts a bearer on its signature \
+                 alone, so without an audience it would accept every token the issuer signs, \
+                 for any service. Set it to the audience Keycloak puts in this server's tokens.",
+            ));
+        }
+
+        match self.unknown_token_validation {
+            UnknownTokenValidation::Reject => {
+                return Err(ConfigError::new(
+                    "MCP_TOKEN_MODE=resource_server is incompatible with \
+                     OAUTH_UNKNOWN_TOKEN_VALIDATION=reject: every bearer is an 'unknown' bearer \
+                     in resource-server mode (the framework issues none), so nothing would ever \
+                     be accepted. Use jwks.",
+                ));
+            }
+            UnknownTokenValidation::Introspection => {
+                return Err(ConfigError::new(
+                    "MCP_TOKEN_MODE=resource_server is incompatible with \
+                     OAUTH_UNKNOWN_TOKEN_VALIDATION=introspection: RFC 7662 answers whether a \
+                     token is active, not who it was minted for, so it cannot enforce \
+                     OAUTH_EXPECTED_AUDIENCE — any token the issuer ever signed, for any \
+                     service, introspects as active. Use jwks.",
+                ));
+            }
+            UnknownTokenValidation::JwksThenIntrospection => {
+                // The default value of the env var, so refusing it outright
+                // would break every deployment that never set it. Coerced
+                // instead — loudly, because the operator asked for a fallback
+                // that this mode cannot honour.
+                tracing::warn!(
+                    "OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks_then_introspection is coerced to `jwks` \
+                     in resource-server mode: an introspection fallback would accept tokens \
+                     whose audience is another service. Set it to `jwks` to silence this."
+                );
+            }
+            UnknownTokenValidation::Jwks => {}
+        }
+
+        Ok(())
+    }
+
+    /// The validation policy actually applied, after resource-server coercion.
+    ///
+    /// [`TokenMode::ResourceServer`] is JWKS-only by construction (see
+    /// [`validate`](Self::validate) for why); every other mode uses the
+    /// configured value verbatim.
+    pub fn effective_unknown_token_validation(&self) -> UnknownTokenValidation {
+        if self.token_mode == TokenMode::ResourceServer {
+            UnknownTokenValidation::Jwks
+        } else {
+            self.unknown_token_validation
+        }
+    }
+
     /// Build the OAuth2 client for Keycloak
     pub fn build_client(&self) -> Result<ConfiguredClient, String> {
         // Keycloak OIDC endpoints follow a standard pattern
@@ -142,21 +245,40 @@ impl BasicAuthConfig {
 /// - **Opaque**: The framework emits its own opaque UUID tokens to the client
 ///   and keeps the real Keycloak tokens server-side. The client never sees a
 ///   JWT, and the framework handles refresh internally.
+/// - **ResourceServer**: The framework is a pure OAuth 2.0 resource server
+///   (MCP 2025-06-18+). It validates the inbound JWT locally and keeps **no**
+///   token state at all: no `TokenStore` entry, no server-side refresh, no
+///   `/oauth/token` proxy. An expired or invalid bearer yields `401` plus the
+///   protected-resource `WWW-Authenticate` challenge, and the client refreshes
+///   on its own against the authorization server.
 ///
-/// Configurable via `MCP_TOKEN_MODE=passthrough|opaque` (default: `passthrough`).
+/// Configurable via `MCP_TOKEN_MODE=passthrough|opaque|resource_server`
+/// (default: `passthrough`; `resource-server` is accepted as an alias).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TokenMode {
     #[default]
     Passthrough,
     Opaque,
+    ResourceServer,
 }
 
 impl TokenMode {
     pub fn from_env() -> Self {
-        match std::env::var("MCP_TOKEN_MODE").as_deref() {
+        match std::env::var("MCP_TOKEN_MODE").as_deref().map(str::trim) {
             Ok("opaque") => TokenMode::Opaque,
+            Ok("resource_server") | Ok("resource-server") => TokenMode::ResourceServer,
             _ => TokenMode::Passthrough,
         }
+    }
+
+    /// Whether this mode keeps OAuth tokens server-side.
+    ///
+    /// `false` only for [`ResourceServer`](Self::ResourceServer), and that
+    /// single property is what every stateful code path keys off: the
+    /// `/oauth/token` proxy, the legacy login/callback flow, `TokenStore`
+    /// writes, and server-side refresh.
+    pub fn is_stateful(&self) -> bool {
+        !matches!(self, Self::ResourceServer)
     }
 }
 

@@ -564,6 +564,12 @@ where
             if oauth.redirect_url.is_empty() {
                 anyhow::bail!("McpAppBuilder: OAuth redirect_url must not be empty");
             }
+            // Combinations that cannot work at all (currently: resource-server
+            // mode without a constrained audience). Fail at boot rather than
+            // answering 401 to every request.
+            oauth
+                .validate()
+                .map_err(|e| anyhow::anyhow!("McpAppBuilder: {e}"))?;
         }
 
         // A loopback endpoint is a *snapshot* of the builder, and nothing in the API stops a
@@ -783,6 +789,12 @@ where
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    // `run()` can be reached without ever going through `McpAppBuilder`
+    // (`McpApp` is a plain struct), so the OAuth sanity check runs here too.
+    if let AuthProvider::OAuth(ref oauth) = app.auth {
+        oauth.validate().map_err(|e| anyhow::anyhow!(e))?;
+    }
+
     let (bind_addr, public_url) = resolve_http_addrs(app.settings.as_ref());
     let mut session_store = resolve_session_store(&app.session_store, &app.settings);
     let persistence = app.persistence;

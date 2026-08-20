@@ -5,7 +5,7 @@
 //! (e.g., based on the authenticated user's token or role).
 //! Use [`AccessValidator`] to control which capabilities can be *executed* per session.
 
-mod filter;
+pub(crate) mod filter;
 mod handler;
 mod registry;
 mod sanitize;

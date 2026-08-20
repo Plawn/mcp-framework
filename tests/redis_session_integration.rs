@@ -172,7 +172,7 @@ async fn start_server(redis: Arc<RedisBackend>) -> TestServer {
         public_routes: None,
     };
 
-    let (app, _token_store, _registry) = build_app(config);
+    let (app, _token_store, _registry) = build_app(config).expect("valid test configuration");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 

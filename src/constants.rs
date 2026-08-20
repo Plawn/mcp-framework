@@ -57,6 +57,19 @@ pub const NS_GRANT_REFRESH: &str = "grant_refresh";
 pub const NS_REFRESH_LOCK: &str = "refresh_lock";
 /// Distributed session mutation locks used to serialize replicas.
 pub const NS_SESSION_LOCK: &str = "session_lock";
+/// Protocol session id → the verified identity that opened it.
+///
+/// Shared across instances so a peer that never saw the session still refuses a
+/// second principal presenting its id. See [`crate::auth`] for the attack.
+pub const NS_SESSION_BINDING: &str = "session_binding";
+
+/// Upper bound on the in-memory session→identity table.
+///
+/// Entries expire with the session TTL, so this only bites when concurrent
+/// sessions genuinely exceed it; it is set far above any plausible count
+/// because evicting a live binding un-protects that session until its next
+/// request re-establishes it.
+pub const SESSION_BINDING_MAX_ENTRIES: usize = 100_000;
 
 // === Opaque token mode ===
 pub const OPAQUE_ACCESS_TTL: Duration = Duration::from_secs(3600);
