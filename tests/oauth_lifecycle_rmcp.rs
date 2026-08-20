@@ -124,11 +124,21 @@ impl Keycloak {
 
 static KEYCLOAK: OnceCell<Option<&'static Keycloak>> = OnceCell::const_new();
 
-/// The shared container, or `None` when Docker is not reachable.
+/// The shared container, or `None` when Docker is not reachable **locally**.
+///
+/// On CI there is no such thing as "not reachable": the `integration-keycloak`
+/// job exists to run these tests, so a missing daemon there is the job silently
+/// passing without having tested anything. `CI` (set by GitHub Actions, and by
+/// every other runner worth the name) turns the skip into a panic.
 async fn keycloak() -> Option<&'static Keycloak> {
     *KEYCLOAK
         .get_or_init(|| async {
             if !docker_is_available() {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "CI is set but the Docker daemon does not answer — these tests \
+                     cannot be skipped here, they are the whole point of the job",
+                );
                 eprintln!("{DOCKER_HINT}");
                 return None;
             }
@@ -190,7 +200,11 @@ fn docker_is_available() -> bool {
 /// 2. every audience mapper — rewritten to the audience this binary uses.
 /// 3. `sslRequired` — `external` shipped; the container speaks plain HTTP.
 /// 4. `users` — alice and bob, with permanent passwords equal to their names.
-/// 5. the trusted-hosts DCR policy — see [`relax_trusted_hosts`].
+///
+/// The DCR policies are **not** patched: `trusted-hosts` is exercised as
+/// shipped, which is what makes
+/// [`direct_registration_from_an_untrusted_redirect_host_is_refused`] mean
+/// anything.
 fn write_patched_realm() -> anyhow::Result<PathBuf> {
     let mut realm: Value = serde_json::from_str(include_str!("../keycloak/mcp-realm.json"))?;
 
@@ -199,7 +213,6 @@ fn write_patched_realm() -> anyhow::Result<PathBuf> {
     realm["users"] = json!([test_user("alice"), test_user("bob")]);
 
     rewrite_audience(&mut realm)?;
-    relax_trusted_hosts(&mut realm)?;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -231,53 +244,40 @@ fn test_user(name: &str) -> Value {
 
 /// Point every `oidc-audience-mapper` in the realm at [`AUDIENCE`].
 ///
-/// Three scopes carry one: `mcp-audience`, which preregistered clients get as a
-/// default scope, and `mcp:tools` / `mcp:resources`, which is how a
-/// *dynamically registered* client gets the audience at all — see
-/// [`lifecycle_dynamic_client_registration`]. Rewriting them one by one would
-/// silently miss a fourth, so this walks the whole array and insists on finding
-/// at least one.
+/// Exactly three scopes must carry one, and the test insists on all three by
+/// name: `mcp-audience`, which preregistered clients get as a default scope,
+/// and `mcp:tools` / `mcp:resources`, which is how a *dynamically registered*
+/// client gets the audience at all — see
+/// [`lifecycle_dynamic_client_registration`]. A "at least one mapper found"
+/// check would pass a realm where two of the three lost theirs, and the
+/// resulting failure would surface three tests later as an unexplained `401`.
 fn rewrite_audience(realm: &mut Value) -> anyhow::Result<()> {
+    const AUDIENCE_SCOPES: [&str; 3] = ["mcp-audience", "mcp:tools", "mcp:resources"];
+
     let scopes = realm["clientScopes"]
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("realm has no clientScopes array"))?;
-    let mut rewritten = 0;
-    for scope in scopes {
-        let Some(mappers) = scope["protocolMappers"].as_array_mut() else {
-            continue;
-        };
+
+    for expected in AUDIENCE_SCOPES {
+        let scope = scopes
+            .iter_mut()
+            .find(|scope| scope["name"] == json!(expected))
+            .ok_or_else(|| anyhow::anyhow!("realm has no `{expected}` client scope"))?;
+        let mappers = scope["protocolMappers"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("client scope `{expected}` has no protocolMappers"))?;
+        let mut rewritten = 0;
         for mapper in mappers {
-            if mapper["protocolMapper"] == "oidc-audience-mapper" {
+            if mapper["protocolMapper"] == json!("oidc-audience-mapper") {
                 mapper["config"]["included.custom.audience"] = json!(AUDIENCE);
                 rewritten += 1;
             }
         }
+        anyhow::ensure!(
+            rewritten == 1,
+            "client scope `{expected}` carries {rewritten} audience mappers, expected exactly 1",
+        );
     }
-    anyhow::ensure!(rewritten > 0, "realm carries no audience mapper");
-    Ok(())
-}
-
-/// Turn off the *sender* half of the trusted-hosts DCR policy for the fixture.
-///
-/// The policy has two independent checks. `client-uris-must-match` is left on
-/// and is the one worth exercising: the redirect URI a client registers has to
-/// resolve to a trusted host, and [`REDIRECT_URI`] is `127.0.0.1`, which the
-/// shipped realm trusts. `host-sending-registration-request-must-match` is the
-/// one that cannot hold here: the framework proxies `/oauth/register` from the
-/// *host*, so Keycloak sees the Docker bridge gateway as the source address —
-/// an address that exists only because the AS runs in a container, and whose
-/// value differs across Docker runtimes. In a real deployment the framework and
-/// Keycloak see each other by their real addresses and the check stays on.
-fn relax_trusted_hosts(realm: &mut Value) -> anyhow::Result<()> {
-    let policies = realm["components"]
-        ["org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy"]
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("realm has no client registration policies"))?;
-    let trusted = policies
-        .iter_mut()
-        .find(|policy| policy["providerId"] == "trusted-hosts")
-        .ok_or_else(|| anyhow::anyhow!("realm has no `trusted-hosts` policy"))?;
-    trusted["config"]["host-sending-registration-request-must-match"] = json!(["false"]);
     Ok(())
 }
 
@@ -391,9 +391,14 @@ impl Framework {
     /// so. It has to look in *both* places: the persistence backend catches a
     /// write-through, but in this mode the `TokenStore` is built without a
     /// backend at all, so an in-memory `store_token` would leave the namespace
-    /// empty and slip past a backend-only check. `identities` are the session
-    /// keys the test actually observed — the only keys a regression could
-    /// plausibly write under.
+    /// empty and slip past a backend-only check.
+    ///
+    /// The in-memory half is checked twice over. `token_count` is the honest
+    /// one — it sees an entry under *any* key, including one keyed by something
+    /// no test ever observes. `identities` then names the keys the requests
+    /// actually ran under, so that the common regression (a grant stored under
+    /// the caller's own identity) fails with that identity in the message
+    /// rather than as a bare count.
     async fn assert_no_token_state(&self, identities: &[&str]) {
         let keys = self
             .backend
@@ -410,6 +415,11 @@ impl Framework {
                 "resource-server mode kept a token in memory for {identity:?}",
             );
         }
+        assert_eq!(
+            self.tokens.token_count().await,
+            0,
+            "resource-server mode kept a token in memory under a key no test observed",
+        );
     }
 }
 
@@ -942,6 +952,67 @@ async fn admin_client_record(keycloak: &Keycloak, client_id: &str) -> anyhow::Re
         .ok_or_else(|| anyhow::anyhow!("realm `{REALM}` has no client `{client_id}`"))
 }
 
+/// The names of every client scope in the realm that carries an
+/// `oidc-audience-mapper` pointing at [`AUDIENCE`], read from the running
+/// Keycloak rather than from the file on disk — the point being to check what
+/// the import produced, not what the export said.
+async fn audience_carrying_scopes(keycloak: &Keycloak) -> anyhow::Result<Vec<String>> {
+    let token = admin_token(keycloak).await?;
+    let scopes: Value = reqwest13::Client::new()
+        .get(format!(
+            "{}/admin/realms/{REALM}/client-scopes",
+            keycloak.base_url
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let scopes = scopes
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("admin API returned no client-scope array"))?;
+    Ok(scopes
+        .iter()
+        .filter(|scope| {
+            scope["protocolMappers"]
+                .as_array()
+                .is_some_and(|mappers| mappers.iter().any(is_audience_mapper))
+        })
+        .filter_map(|scope| scope["name"].as_str().map(str::to_string))
+        .collect())
+}
+
+fn is_audience_mapper(mapper: &Value) -> bool {
+    mapper["protocolMapper"] == json!("oidc-audience-mapper")
+        && mapper["config"]["included.custom.audience"] == json!(AUDIENCE)
+}
+
+/// Post an RFC 7591 registration straight at Keycloak's own endpoint — the one
+/// the protected-resource metadata sends a spec-current client to — and return
+/// the raw response, status included.
+async fn register_directly(
+    keycloak: &Keycloak,
+    client_name: &str,
+    redirect_uris: &[&str],
+) -> anyhow::Result<reqwest13::Response> {
+    Ok(reqwest13::Client::new()
+        .post(format!(
+            "{}/clients-registrations/openid-connect",
+            keycloak.issuer()
+        ))
+        .json(&json!({
+            "client_name": client_name,
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "scope": SCOPES.join(" "),
+        }))
+        .send()
+        .await?)
+}
+
 // ── Test plumbing ───────────────────────────────────────────────────
 
 /// The claims of a JWT, decoded without verifying anything — these tests only
@@ -1386,9 +1457,113 @@ async fn lifecycle_dynamic_client_registration() -> anyhow::Result<()> {
              fallback, so the proxy to Keycloak did not go through",
         );
         assert_dynamic_client(keycloak, &proxied).await?;
+        assert_registered_scopes(keycloak, &proxied).await?;
 
         Ok(())
     })
+}
+
+/// The proxy forwards RFC 7591 `scope`, and the client Keycloak minted really
+/// carries those scopes — with an audience among them.
+///
+/// Both halves matter and neither implies the other. Forwarding is what makes
+/// an authorization request for `mcp:tools` succeed instead of failing
+/// `invalid_scope`; but forwarding a `scope` at all is also what makes Keycloak
+/// **replace** the client's default scopes, dropping `mcp-audience` with them.
+/// That is the reason `mcp:tools` / `mcp:resources` carry the audience mapper
+/// too, and this is where that reason is checked rather than asserted in prose:
+/// whatever scopes the client ended up with, at least one of them must inject
+/// [`AUDIENCE`], or the resource server would `401` every token it ever mints.
+///
+/// Observed against Keycloak 26.3: a registration carrying `scope` leaves the
+/// client with `basic` as its only *default* scope and everything it asked for
+/// as *optional* — so the check is on the union, not on `defaultClientScopes`.
+/// An optional scope is one the client must request per authorization, which
+/// rmcp does, which is how the audience gets in.
+async fn assert_registered_scopes(keycloak: &Keycloak, client_id: &str) -> anyhow::Result<()> {
+    let record = admin_client_record(keycloak, client_id).await?;
+    let names = |field: &str| -> Vec<String> {
+        record[field]
+            .as_array()
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(|scope| scope.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let default_scopes = names("defaultClientScopes");
+    let optional_scopes = names("optionalClientScopes");
+    let attached = [default_scopes.clone(), optional_scopes.clone()].concat();
+
+    for requested in ["mcp:tools", "mcp:resources"] {
+        assert!(
+            attached.iter().any(|scope| scope == requested),
+            "the proxy dropped the RFC 7591 `scope`: client {client_id} carries \
+             default {default_scopes:?} / optional {optional_scopes:?}, none of them \
+             {requested:?}",
+        );
+    }
+
+    let audience_scopes = audience_carrying_scopes(keycloak).await?;
+    assert!(
+        attached.iter().any(|scope| audience_scopes.contains(scope)),
+        "no scope attached to {client_id} injects {AUDIENCE:?} — its tokens would \
+         carry no `aud` and the resource server would refuse every one of them \
+         (attached {attached:?}, audience-carrying {audience_scopes:?})",
+    );
+    Ok(())
+}
+
+/// The `trusted-hosts` registration policy, exercised as shipped.
+///
+/// The shipped realm turns `host-sending-registration-request-must-match`
+/// **off** and leaves `client-uris-must-match` **on**, and this is the test
+/// that says the remaining half still bites: an anonymous registration asking
+/// for a `redirect_uri` on a host the realm does not trust is refused (`403`,
+/// "URI doesn't match any trusted host or trusted domain"). Without it, "we
+/// disabled a check" and "we disabled the policy" would look the same from
+/// here.
+///
+/// The accepted case is covered by [`lifecycle_dynamic_client_registration`],
+/// which registers with [`REDIRECT_URI`] — `127.0.0.1`, a trusted host.
+#[tokio::test]
+#[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
+async fn direct_registration_from_an_untrusted_redirect_host_is_refused() -> anyhow::Result<()> {
+    init_tracing();
+    let Some(keycloak) = keycloak().await else {
+        eprintln!("{DOCKER_HINT}");
+        return Ok(());
+    };
+
+    let response = register_directly(
+        keycloak,
+        "mcp-framework harness (untrusted)",
+        &["https://attacker.example.net/callback"],
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest13::StatusCode::FORBIDDEN,
+        "Keycloak accepted a registration whose redirect URI is on an untrusted \
+         host: HTTP {status} — {}",
+        excerpt(&body),
+    );
+    // Named explicitly: a `403` from `Max Clients Limit` or `Allowed Client
+    // Scopes` would prove nothing about the host list. Keycloak 26.3 answers
+    // `insufficient_scope` with "Policy '<name>' rejected request …", and the
+    // name is the one this realm gives the policy.
+    assert!(
+        body.contains("Trusted Hosts"),
+        "the registration was refused by something other than the trusted-hosts \
+         policy: {}",
+        excerpt(&body),
+    );
+    Ok(())
 }
 
 /// Keycloak holds a real, public client under `client_id`, carrying the
@@ -1486,6 +1661,11 @@ async fn expired_bearer_is_refused_once_the_skew_leeway_passes() -> anyhow::Resu
             reqwest13::StatusCode::UNAUTHORIZED,
             "the framework kept accepting a bearer well past its `exp`",
         );
+
+        // The accepted request above is the one that could have written a
+        // grant; it ran under an identity this test never reads back, which is
+        // exactly what `token_count` is for.
+        framework.assert_no_token_state(&[]).await;
         Ok(())
     })
 }

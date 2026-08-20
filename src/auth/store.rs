@@ -938,6 +938,20 @@ impl TokenStore {
         self.get_token_raw(session_id).await
     }
 
+    /// How many tokens this store holds **in memory**, for diagnostics and
+    /// tests.
+    ///
+    /// Deliberately not a read-through: it counts what this instance has, not
+    /// what a persistence backend holds. That is exactly what makes it the
+    /// right check for [`TokenMode::ResourceServer`](super::TokenMode::ResourceServer),
+    /// which builds the store without a backend — a stray `store_token` there
+    /// leaves nothing to scan, and only this counter sees it. It is also why
+    /// it must not be read as "how many sessions are authenticated": on a
+    /// multi-instance deployment that number lives in the backend.
+    pub async fn token_count(&self) -> usize {
+        self.tokens.read().await.len()
+    }
+
     /// Get a token for a session, automatically refreshing if expired.
     ///
     /// Uses per-session locking to prevent concurrent refreshes (thundering herd).

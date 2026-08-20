@@ -115,8 +115,10 @@ décoratif : voir « Enregistrement dynamique » plus bas. Un client enregistré
 dynamiquement perd les default client scopes du realm — donc `mcp-audience` —
 et ne récupère l'audience que par les scopes qu'il a demandés. Les trois
 copies doivent donc porter la **même** valeur `included.custom.audience` ; le
-harness les réécrit toutes d'un coup, en refusant de démarrer s'il n'en trouve
-aucune.
+harness les réécrit toutes d'un coup, en exigeant **exactement un** mapper
+d'audience dans chacun des trois scopes — un realm où deux d'entre eux auraient
+perdu le leur passerait sinon l'import pour échouer trois tests plus loin en
+`401` inexpliqué.
 
 ### Client scopes intégrés
 
@@ -179,10 +181,19 @@ renvoie aucun en-tête CORS.
 > client scopes.** Un enregistrement *sans* `scope` donne au client les default
 > client scopes du realm (`mcp-audience` compris). Un enregistrement *avec*
 > `scope` — ce que fait rmcp — ne lui laisse que `basic` en default, tout le
-> reste passant en optionnel. Le client obtenu n'a donc plus `mcp-audience`, ses
-> tokens n'ont plus d'`aud`, et le serveur MCP les refuse en `401`. C'est la
-> raison pour laquelle le mapper d'audience est *aussi* posé sur `mcp:tools` et
-> `mcp:resources` : ces scopes-là, le client les a demandés, donc il les garde.
+> reste passant en optionnel (vérifié contre Keycloak 26.3). Le client obtenu
+> n'a donc plus `mcp-audience`, ses tokens n'ont plus d'`aud`, et le serveur MCP
+> les refuse en `401`. C'est la raison pour laquelle le mapper d'audience est
+> *aussi* posé sur `mcp:tools` et `mcp:resources` : ces scopes-là, le client les
+> a demandés, donc il les garde — en optionnel, ce qui suffit puisqu'il les
+> redemande à chaque autorisation.
+
+Le proxy `/oauth/register` **transmet le `scope`** de la demande RFC 7591. Un
+client enregistré à travers le proxy obtient donc exactement la même forme
+qu'un client enregistré directement — et notamment les scopes MCP qu'il a
+demandés, sans quoi son autorisation échouerait plus tard en `invalid_scope`.
+Le prix est celui du piège ci-dessus, assumé : c'est le comportement de
+Keycloak, identique sur les deux chemins.
 
 **Les deux moitiés de `trusted-hosts` ne se valent pas.**
 `client-uris-must-match: true` valide les `redirect_uri` (et autres URI) que la

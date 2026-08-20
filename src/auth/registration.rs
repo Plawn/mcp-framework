@@ -22,7 +22,6 @@ pub struct ClientRegistrationRequest {
     pub grant_types: Option<Vec<String>>,
     pub response_types: Option<Vec<String>>,
     pub token_endpoint_auth_method: Option<String>,
-    #[allow(dead_code)]
     pub scope: Option<String>,
 }
 
@@ -97,13 +96,30 @@ pub async fn register_handler(
     );
 
     // Build request body for Keycloak using standard OIDC DCR fields (RFC 7591)
-    let keycloak_request = serde_json::json!({
+    let mut keycloak_request = serde_json::json!({
         "client_name": request.client_name.clone().unwrap_or_else(|| "mcp-client".to_string()),
         "redirect_uris": request.redirect_uris,
         "grant_types": request.grant_types.clone().unwrap_or_else(|| vec!["authorization_code".to_string(), "refresh_token".to_string()]),
         "response_types": request.response_types.clone().unwrap_or_else(|| vec!["code".to_string()]),
         "token_endpoint_auth_method": request.token_endpoint_auth_method.clone().unwrap_or_else(|| "none".to_string()),
     });
+
+    // RFC 7591 §2 `scope`: what the client declares it will ask for, and what
+    // Keycloak turns into the client's scope assignment. Dropping it was
+    // invisible as long as the realm's default client scopes were a superset of
+    // what the client wanted; it stops being invisible the moment a deployment
+    // makes its MCP scopes *optional* (as `keycloak/mcp-realm.json` does), since
+    // the registered client then does not carry them and the authorization
+    // request asking for them fails `invalid_scope`.
+    //
+    // Forwarded only when non-empty: sending `"scope": ""` is not the same
+    // request as sending none — Keycloak replaces the client's default scopes
+    // as soon as the field is present, so an empty string would strip the
+    // realm's defaults instead of leaving them alone (see
+    // `keycloak/README.md`, "Enregistrement dynamique").
+    if let Some(scope) = request.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+        keycloak_request["scope"] = serde_json::json!(scope);
+    }
 
     // Try to register with Keycloak
     let result = state

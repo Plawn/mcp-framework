@@ -44,6 +44,13 @@ actually ships.
   dedicated `integration-keycloak` job, and `release` now waits on it. The
   shared container is labelled and reaped by the following run — testcontainers
   0.27 has no reaper and a `static` fixture never drops.
+- A missing Docker daemon skips **locally only**. With `CI` set the fixture
+  panics: a job that exists to run these tests must not go green having run
+  none of them.
+- `TokenStore::token_count()` — a diagnostic accessor beside `peek_token`,
+  counting the in-memory map without reading through to persistence. It is what
+  makes "this mode stores no token" checkable at all in resource-server mode
+  (no backend to scan), including under a key no test ever observes.
 
 ### Added — `keycloak/mcp-realm.json`, a realm ready for resource-server mode
 
@@ -87,6 +94,22 @@ answer is a hardcoded audience mapper, which is not guessable.
   values are proposals rather than settled, and the one ordering constraint that
   bites: refresh-token rotation must not be enabled before the switch to
   `ResourceServer`, because it breaks passthrough.
+
+### Changed — `/oauth/register` forwards the RFC 7591 `scope`
+
+The DCR proxy parsed `scope` and dropped it. That was invisible while the
+realm's default client scopes were a superset of what clients ask for; it stops
+being invisible as soon as the MCP scopes are *optional* (as
+`keycloak/mcp-realm.json` makes them), since the registered client then does not
+carry them and its authorization request fails `invalid_scope`.
+
+- The field is forwarded when non-empty. Empty or absent is *not* forwarded:
+  Keycloak replaces the client's default scopes the moment the field is
+  present, so `"scope": ""` would strip the realm's defaults rather than leave
+  them alone.
+- A client registered through the proxy therefore ends up shaped exactly like
+  one registered directly with Keycloak — asserted in the harness through the
+  admin API, scopes and audience mapper included.
 
 ### Changed — OAuth metadata advertises the configured scopes
 

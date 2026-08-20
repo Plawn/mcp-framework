@@ -129,7 +129,7 @@ From a `RequestContext`, use `ctx.token()` (`RequestContextExt`) rather than `ct
 
 `/oauth/token` is the point of the mode. `/oauth/authorize` goes with it for a reason worth stating: the proxy rewrites `client_id` to the configured `OAUTH_CLIENT_ID`, so the authorization code it returns is bound to *that* client, while the client then redeems it at Keycloak's token endpoint under its own `client_id` — `invalid_grant`. Half a proxied flow is worse than none. The legacy login routes perform the exchange server-side and write the grant into `TokenStore`, which is the state this mode abolishes.
 
-**`/oauth/register` stays.** Keycloak's `clients-registrations/openid-connect` endpoint sends no CORS headers, so a browser-based MCP client cannot perform RFC 7591 dynamic client registration against it directly; the framework's translation is still needed. Its offline fallback now returns the **configured** `OAUTH_CLIENT_ID` instead of a fabricated UUID — nothing rewrites `client_id` downstream any more, so an invented id would simply not exist at Keycloak. (As before, that Keycloak client must allow the client's `redirect_uri`.)
+**`/oauth/register` stays.** Keycloak's `clients-registrations/openid-connect` endpoint sends no CORS headers, so a browser-based MCP client cannot perform RFC 7591 dynamic client registration against it directly; the framework's translation is still needed. It forwards the request's `scope` (RFC 7591 §2) — a client registered without the scopes it asked for is refused `invalid_scope` at authorization time, and dropping the field silently gave it the realm's defaults instead. Empty or absent `scope` is *not* forwarded: Keycloak replaces the client's default scopes the moment the field is present. Its offline fallback now returns the **configured** `OAUTH_CLIENT_ID` instead of a fabricated UUID — nothing rewrites `client_id` downstream any more, so an invented id would simply not exist at Keycloak. (As before, that Keycloak client must allow the client's `redirect_uri`.)
 
 **Discovery.** `/.well-known/oauth-protected-resource` (and `.../mcp`) advertises the Keycloak issuer in `authorization_servers` — RFC 9728, the resource server pointing at the AS instead of at itself. `/.well-known/oauth-authorization-server` is still served, because MCP 2025-03-26 clients probe the resource server for it and a `404` strands them, but it now describes **Keycloak**: `issuer`, `authorization_endpoint` and `token_endpoint` are Keycloak's, and only `registration_endpoint` remains ours (the CORS reason above). A welcome side effect: the advertised issuer finally matches the `iss` the tokens carry, which is the RFC 9207 mismatch rmcp's client reports as `AuthorizationServerIssuerMismatch` under passthrough.
 
@@ -174,18 +174,22 @@ executes, PKCE and automatic refresh included.
 
 Every test is `#[ignore]`d (`run with --ignored`) and the CI job
 `integration-keycloak` runs them with `--test-threads=1`. A missing Docker daemon
-skips; a daemon that is present but produces a broken Keycloak **panics** — a
-silent skip once hid a real failure.
+skips **locally only**: with `CI` set it panics, since a job whose whole purpose
+is to run these tests passing without a container is the same green-for-nothing
+failure as before. A daemon that is present but produces a broken Keycloak
+**panics** everywhere — a silent skip once hid a real failure.
 
 **Fixture.** One container per test binary, behind a `tokio::sync::OnceCell`
 holding a leaked `ContainerAsync`. The shipped realm is deliberately *not* a test
 fixture — it demands TLS and ships no users — so `write_patched_realm` injects
 everything a test needs and a deployment must not have, keeping the harness
 pointed at the artefact that is actually released: `accessTokenLifespan` down to
-5 s (expiry has to be observable), **every** `oidc-audience-mapper` in the realm
-rewritten to the audience the framework is configured with (three scopes carry
-one — see the DCR note below), `sslRequired: none`, the users `alice` and `bob`,
-and the sender half of the `trusted-hosts` registration policy turned off.
+5 s (expiry has to be observable), every `oidc-audience-mapper` rewritten to the
+audience the framework is configured with — **exactly one** demanded in each of
+`mcp-audience`, `mcp:tools` and `mcp:resources` (see the DCR note below), since a
+realm that lost two of the three would otherwise fail three tests later as an
+unexplained `401` — `sslRequired: none`, and the users `alice` and `bob`. The
+DCR policies are patched **not at all**: they are exercised as shipped.
 Readiness is **not** a log line — Quarkus logs to stderr and
 "Listening on:" does not mean the import landed — it is a poll of
 `{issuer}/.well-known/openid-configuration` asserting the `issuer` field.
@@ -199,17 +203,24 @@ Readiness is **not** a log line — Quarkus logs to stderr and
 | `lifecycle_session_loss_then_reinitialize_legacy_session` | the **server-side** session really disappearing under a running client: a raw `DELETE /mcp` with that `mcp-session-id`, then another call through the *same* rmcp client. rmcp 3.1 defaults to `reinit_on_expired_session`, so the `404` is absorbed — `perform_reinitialization` aborts the old streams and replays the message, and the caller sees a result, not a `SessionExpired`. On 2025-11-25 the identity *is* the `mcp-session-id`, so the new session is a new identity and the counter restarts at 1. Then two consecutive refresh cycles. |
 | `lifecycle_session_loss_then_reinitialize_sessionless` | the same reconnect on 2026-07-28, where identity is `credential_session_key`: the `SessionStore<T>` entry survives a full client teardown and the counter continues. |
 | `lifecycle_revoked_grant_requires_reauthorization` | admin-side revocation → `AuthError::AuthorizationRequired` → full re-auth succeeds, with a **new** identity. Run sessionless on purpose: only there is the identity derived from the credential's `sid`, so "the grant was revoked" and "the identity changed" are causally linked — on 2025-11-25 the assertion would only be observing that a new `initialize` returns a new session id. |
-| `lifecycle_dynamic_client_registration` | the RFC 7591 path, with no client id configured anywhere on the client side: rmcp registers, authorizes (answering the consent form the realm's `Consent Required` policy imposes), and calls a tool. Keycloak's admin API is asked whether the client really exists, with the redirect URI it asked for. The framework's own `/oauth/register` proxy is exercised separately in the same test, since a spec-current client does not go through it — see below. |
+| `lifecycle_dynamic_client_registration` | the RFC 7591 path, with no client id configured anywhere on the client side: rmcp registers, authorizes (answering the consent form the realm's `Consent Required` policy imposes), and calls a tool. Keycloak's admin API is asked whether the client really exists, with the redirect URI it asked for. The framework's own `/oauth/register` proxy is exercised separately in the same test, since a spec-current client does not go through it — and the client *it* created is read back from the admin API too: it must carry the `mcp:tools` / `mcp:resources` it asked for (proof the proxy forwards `scope`) and at least one scope injecting the expected audience (proof that forwarding did not cost it its `aud`). |
+| `direct_registration_from_an_untrusted_redirect_host_is_refused` | the other half of the `trusted-hosts` policy, as shipped: a registration posted straight at Keycloak asking for a `redirect_uri` on an untrusted host gets `403` naming that policy. `client-uris-must-match` is what the realm relies on once the sender-IP half is off (see below), so it is checked rather than assumed. |
 | `realm_injects_the_expected_audience_and_scopes` | the realm actually mints `aud` containing `OAUTH_EXPECTED_AUDIENCE`, and a `scope` claim containing the MCP scopes — without it every other test would fail for the wrong reason. Also asserts the PRM advertises them. |
 
 `assert_no_token_state` is what catches a regression reintroducing token state,
 and it looks in **both** places: the `tokens` namespace of the wired
-`InMemoryBackend` *and* `TokenStore::peek_token` for each identity the test
-observed — this mode builds the store without a persistence backend, so an
-in-memory `store_token` would leave the namespace empty and slip past a
-backend-only check. The four lifecycle scenarios and the DCR test call it; the
-expiry and audience tests do not (neither reaches a successful tool call under
-an identity worth naming).
+`InMemoryBackend` *and* the in-memory store — this mode builds the store without
+a persistence backend, so an in-memory `store_token` would leave the namespace
+empty and slip past a backend-only check. In memory it checks twice:
+`TokenStore::token_count` (a diagnostic accessor next to `peek_token`, counting
+the map and deliberately not reading through to persistence) must be 0, which
+catches an entry under *any* key including one no test ever observes, and
+`TokenStore::peek_token` is asked for each identity the test did observe, so the
+likely regression fails with that identity in the message rather than as a bare
+count. Every scenario that gets a request accepted calls it — the four lifecycle
+ones, the DCR test, and the expiry test (which accepts a bearer before proving
+the expired one is refused, and passes an empty identity list: `token_count` is
+the assertion there). Only the audience test does not.
 
 Four implementation notes that are not obvious:
 
@@ -230,16 +241,22 @@ Four implementation notes that are not obvious:
   `/oauth/register` stays served — and is still needed — for browser clients and
   for MCP 2025-03-26 clients that probe the resource server itself, because
   Keycloak's endpoint sends no CORS headers; the test asserts both documents say
-  so, then exercises the proxy by hand. Two Keycloak behaviours had to be
-  accommodated in the realm for the direct path to work at all, both documented
+  so, then exercises the proxy by hand. Three Keycloak behaviours had to be
+  accommodated in the realm for the direct path to work at all, all documented
   in `keycloak/README.md`: a registration request carrying `scope` (rmcp always
-  sends one) makes Keycloak **replace** the client's default scopes, dropping
-  `mcp-audience` and with it the `aud` the resource server requires — hence the
-  audience mapper is also attached to `mcp:tools` / `mcp:resources`; and
-  declaring the `offline_access` client scope in an export suppresses Keycloak's
-  own offline-token setup, leaving the realm role uncreated so that the
-  `offline_access` rmcp appends (SEP-2207) fails the exchange — hence the export
-  omits that scope and lets Keycloak build it.
+  sends one, and `/oauth/register` now forwards it) makes Keycloak **replace**
+  the client's default scopes — leaving `basic` as the only default and
+  everything requested as optional, dropping `mcp-audience` and with it the
+  `aud` the resource server requires — hence the audience mapper is also
+  attached to `mcp:tools` / `mcp:resources`; declaring the `offline_access`
+  client scope in an export suppresses Keycloak's own offline-token setup,
+  leaving the realm role uncreated so that the `offline_access` rmcp appends
+  (SEP-2207) fails the exchange — hence the export omits that scope and lets
+  Keycloak build it; and `trusted-hosts` has a sender-IP half
+  (`host-sending-registration-request-must-match`) which, in this mode, rejects
+  every legitimate client — the registration comes from the MCP client itself,
+  from anywhere — so the realm ships it **off** and leans on
+  `client-uris-must-match`, which the test above pins.
 - **Two reqwest majors coexist.** rmcp 3.1 is built on reqwest 0.13, the
   framework on 0.12, and `AuthClient::new` wants rmcp's. The dev-dependency is
   renamed `reqwest13` so only this binary sees it and every other test keeps
