@@ -301,6 +301,18 @@ wrong tool or the wrong argument.
   description is already there. It was sometimes the only doc a type carried.
   The audit runs after sanitization, so a folded title counts as documentation.
 
+### Fixed — a parameter named `title` no longer vanishes from `tools/list`
+
+`sanitize_tool_schemas` walked every JSON object as if it were a schema node,
+including the `properties` map itself — so a tool parameter literally named
+`title`, `$schema` or `definitions` was stripped as a meta-field, and an
+`enum` / `default` / `examples` / `const` value carrying such a key was
+rewritten. The walker is now schema-aware: the containers whose keys are
+user-chosen names (`properties`, `patternProperties`, `$defs`, `definitions`,
+`dependentSchemas`) are traversed without being treated as nodes, and data
+keywords are left verbatim. Meta-fields inside the parameter's *own* schema
+are still folded and removed as before.
+
 ### Fixed — descriptions survive the tagged-enum flattening
 
 `sanitize_tool_schemas` flattens the root-level `oneOf` schemars emits for
