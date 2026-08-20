@@ -25,8 +25,26 @@ jobs:
       - name: Test
         run: cargo test
 
+  # The OAuth lifecycle harness (`tests/oauth_lifecycle_rmcp.rs`) drives a real
+  # Keycloak in a testcontainer, so its tests are `#[ignore]`d by default and get
+  # their own job: one container boot (~30 s) plus deliberate waits on token
+  # expiry put the binary at a couple of minutes, which does not belong in
+  # `check`. `--test-threads=1` because the container is a shared fixture and the
+  # scenarios revoke sessions out from under each other otherwise.
+  integration-keycloak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: OAuth lifecycle against Keycloak
+        run: cargo test --test oauth_lifecycle_rmcp -- --ignored --test-threads=1
+
   release:
-    needs: check
+    needs: [check, integration-keycloak]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:

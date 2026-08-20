@@ -45,6 +45,10 @@ pub struct McpOAuthState {
     pub http_client: reqwest::Client,
     pub token_store: TokenStore,
     pub token_mode: TokenMode,
+    /// The scopes this deployment declares (`OAUTH_SCOPES`). Advertised
+    /// verbatim in the RFC 8414 document, so a deployment that defines
+    /// MCP-specific scopes can make clients ask for them.
+    pub scopes: Vec<String>,
 }
 
 impl McpOAuthState {
@@ -62,6 +66,7 @@ impl McpOAuthState {
             http_client,
             token_store,
             token_mode: oauth_config.token_mode.clone(),
+            scopes: oauth_config.scopes.clone(),
         }
     }
 }

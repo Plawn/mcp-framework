@@ -43,7 +43,7 @@ redis = ["dep:redis"]
 metrics = []
 
 [dev-dependencies]
-rmcp = { version = "3.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.1", features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
 anyhow = "1"
@@ -54,6 +54,17 @@ tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 # Mint genuinely signed JWTs against a mock JWKS in the bearer-validation tests.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+# Ephemeral Keycloak for the OAuth lifecycle harness (`tests/oauth_lifecycle_rmcp.rs`).
+# No `http_wait*` feature: the harness polls the realm's discovery document itself,
+# which is the only signal that says the realm import actually landed.
+testcontainers = "0.27"
+# Scrape the `action` URL out of Keycloak's login form (no HTML parser needed).
+regex = "1"
+# rmcp 3.1 is built on reqwest 0.13 while the framework itself still depends on
+# 0.12. `AuthClient::new` takes rmcp's `reqwest::Client`, so the OAuth lifecycle
+# harness needs that exact crate — renamed, so every other test binary keeps
+# resolving `reqwest` to the framework's own 0.12.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "form", "charset", "http2", "rustls"] }
 
 [profile.release]
 strip = true

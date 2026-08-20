@@ -10,6 +10,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] — Unreleased
 
+### Added — an OAuth lifecycle harness against a real Keycloak
+
+`TokenMode::ResourceServer` had unit coverage for its decisions and none for the
+cycle those decisions live in: discovery from a `401`, PKCE, expiry, client-side
+refresh, session loss, revocation, dynamic client registration. Those are
+exactly the parts that cannot be faked convincingly — a stub AS proves nothing
+about Keycloak, and a hand-rolled client proves nothing about the client rmcp
+actually ships.
+
+- `tests/oauth_lifecycle_rmcp.rs` drives the framework with rmcp's own
+  `OAuthState` / `AuthClient` / `StreamableHttpClientTransport` against an
+  ephemeral Keycloak 26.3 (testcontainers), covering: reactive discovery and
+  full authorization, transparent refresh past expiry with session state intact,
+  reconnection after a protocol session the server really did drop (a raw
+  `DELETE /mcp` mid-flight, then the same client), revocation →
+  re-authorization under a new `cred-sid-*` identity, an expired bearer refused
+  once the JWKS skew leeway has passed, and an authorization flow with **no**
+  preregistered client — real RFC 7591 registration against Keycloak's own
+  endpoint, verified through the admin API.
+- The scenarios that make a claim about token state assert it on both sides:
+  the `tokens` persistence namespace stays empty *and*
+  `TokenStore::peek_token` answers `None` for every identity the request
+  actually used — the mode's central claim, checked where a regression would
+  land.
+- The two protocol revisions are covered separately because they *differ*:
+  sessionless (2026-07-28) identity is claims-derived and survives a reconnect;
+  on 2025-11-25 the identity is the `mcp-session-id`, so it does not. Session
+  loss is exercised on both, and the test states rmcp 3.1's real contract:
+  `reinit_on_expired_session` absorbs the `404`, so the caller sees a working
+  call, not `SessionExpired`.
+- `#[ignore]`d by default (they need Docker and take ~2 min); CI runs them in a
+  dedicated `integration-keycloak` job, and `release` now waits on it. The
+  shared container is labelled and reaped by the following run — testcontainers
+  0.27 has no reaper and a `static` fixture never drops.
+- A missing Docker daemon skips **locally only**. With `CI` set the fixture
+  panics: a job that exists to run these tests must not go green having run
+  none of them.
+- `TokenStore::token_count()` — a diagnostic accessor beside `peek_token`,
+  counting the in-memory map without reading through to persistence. It is what
+  makes "this mode stores no token" checkable at all in resource-server mode
+  (no backend to scan), including under a key no test ever observes.
+
+### Added — `keycloak/mcp-realm.json`, a realm ready for resource-server mode
+
+Documentation said "set `OAUTH_EXPECTED_AUDIENCE`" without saying how to make
+Keycloak emit that audience — it has no RFC 8707 `resource` parameter, so the
+answer is a hardcoded audience mapper, which is not guessable.
+
+- A public PKCE (S256) `mcp-client` with the loopback and hosted-client redirect
+  URI families, an `mcp-audience` default client scope carrying the mapper,
+  `mcp:tools` / `mcp:resources` aligned with the framework's PRM, Client
+  Registration Policies for DCR, and MCP-length lifetimes.
+- **The versioned realm is safe by default**: `sslRequired: "external"` and no
+  users. The harness patches a *copy* before importing it into its throwaway
+  container — `sslRequired: "none"`, two test users, a shortened access-token
+  lifespan, a rewritten audience — so the fixture's conveniences cannot be
+  imported into a deployment by accident. The client registration policies are
+  patched *not at all*, and are exercised exactly as shipped.
+- `mcp-client` carries `fullScopeAllowed: false`. With the full scope, every
+  realm role the user holds lands in every token the MCP client is issued —
+  claims the resource server has no use for and a stolen token every reason to
+  want. What the client legitimately needs comes through its client scopes'
+  role mappings, `offline_access` included.
+- Four Keycloak behaviours the realm now accommodates, each found the hard way
+  against a live container: the `Allowed Client Scopes` policy validates every
+  name in a DCR `scope` against realm client scopes, so `openid` must be listed
+  explicitly; a DCR request carrying `scope` **replaces** the client's default
+  scopes (leaving `basic` and pushing everything requested to optional), so
+  `mcp:tools` / `mcp:resources` carry the audience mapper too or a dynamically
+  registered client gets no `aud`; declaring the `offline_access` client scope
+  in an export suppresses Keycloak's own offline-token setup, so the export
+  leaves it to Keycloak (rmcp requests that scope per SEP-2207); and the
+  `trusted-hosts` policy's `host-sending-registration-request-must-match`
+  compares the **source IP** of the registration request against the host list
+  — which in resource-server mode is the MCP client's own address, from
+  anywhere on the internet, so the check rejects every legitimate client. The
+  realm ships it `false` and keeps `client-uris-must-match: true`, the half
+  that actually protects (a client registered with an arbitrary
+  `redirect_uri` is an authorization-code theft waiting to happen); the harness
+  asserts an untrusted redirect host still gets a `403`.
+- `keycloak/README.md` states what must be substituted per deployment, which
+  values are proposals rather than settled, and the one ordering constraint that
+  bites: refresh-token rotation must not be enabled before the switch to
+  `ResourceServer`, because it breaks passthrough.
+
+### Changed — `/oauth/register` forwards the RFC 7591 `scope`
+
+The DCR proxy parsed `scope` and dropped it. That was invisible while the
+realm's default client scopes were a superset of what clients ask for; it stops
+being invisible as soon as the MCP scopes are *optional* (as
+`keycloak/mcp-realm.json` makes them), since the registered client then does not
+carry them and its authorization request fails `invalid_scope`.
+
+- The field is forwarded when non-empty. Empty or absent is *not* forwarded:
+  Keycloak replaces the client's default scopes the moment the field is
+  present, so `"scope": ""` would strip the realm's defaults rather than leave
+  them alone.
+- A client registered through the proxy therefore ends up shaped exactly like
+  one registered directly with Keycloak — asserted in the harness through the
+  admin API, scopes and audience mapper included.
+
+### Changed — OAuth metadata advertises the configured scopes
+
+`scopes_supported` was hardcoded to `openid profile email` in both the RFC 8414
+authorization-server document and the RFC 9728 protected-resource document, so a
+deployment that configured `OAUTH_SCOPES` advertised something it did not use —
+and a client reading the PRM to decide what to ask for could not discover the
+MCP-specific scopes at all.
+
+- Both documents now advertise `OAuthConfig::scopes`, in every token mode. The
+  default (`openid,profile,email`) is unchanged, so nothing moves unless
+  `OAUTH_SCOPES` is set.
+- `keycloak/README.md` documents
+  `OAUTH_SCOPES=openid,profile,email,mcp:tools,mcp:resources` as the value that
+  matches the shipped realm.
+
+
 ### Changed — transport session recovery re-arms its TTL on failover
 
 `TransportSessionStore` (the adapter that lets rmcp rebuild a legacy protocol

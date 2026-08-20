@@ -74,6 +74,12 @@ pub struct WellKnownState {
 pub async fn authorization_server_metadata_handler(
     State(state): State<Arc<McpOAuthState>>,
 ) -> impl IntoResponse {
+    Json(authorization_server_metadata(&state))
+}
+
+/// The document itself, split out from the handler so the mode-dependent
+/// choices above are testable without an HTTP round-trip.
+fn authorization_server_metadata(state: &McpOAuthState) -> AuthorizationServerMetadata {
     let realm = state.keycloak_realm_url.trim_end_matches('/');
     let (issuer, authorization_endpoint, token_endpoint) = if state.token_mode.is_stateful() {
         (
@@ -89,16 +95,17 @@ pub async fn authorization_server_metadata_handler(
         )
     };
 
-    let metadata = AuthorizationServerMetadata {
+    AuthorizationServerMetadata {
         issuer,
         authorization_endpoint,
         token_endpoint,
         registration_endpoint: format!("{}/oauth/register", state.public_url),
-        scopes_supported: vec![
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-        ],
+        // The configured `OAUTH_SCOPES`, not a fixed list: a deployment that
+        // defines MCP-specific scopes (`mcp:tools`, …) needs clients to *ask*
+        // for them, and a client asks for what discovery advertises. The
+        // default value of `OAUTH_SCOPES` is `openid,profile,email`, so an
+        // untouched deployment sees exactly what it saw before.
+        scopes_supported: state.scopes.clone(),
         response_types_supported: vec!["code".to_string()],
         grant_types_supported: vec![
             "authorization_code".to_string(),
@@ -110,9 +117,7 @@ pub async fn authorization_server_metadata_handler(
             "client_secret_post".to_string(),
             "none".to_string(),
         ],
-    };
-
-    Json(metadata)
+    }
 }
 
 /// Handler for `/.well-known/oauth-protected-resource`
@@ -127,4 +132,83 @@ pub async fn protected_resource_metadata_handler(
     };
 
     Json(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{OAuthConfig, TokenMode, TokenStore, UnknownTokenValidation};
+
+    fn oauth_config(scopes: &[&str], token_mode: TokenMode) -> OAuthConfig {
+        OAuthConfig {
+            client_id: "mcp-client".to_string(),
+            client_secret: None,
+            issuer_url: "https://kc.example.com/realms/mcp".to_string(),
+            redirect_url: "http://127.0.0.1:1/callback".to_string(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            token_mode,
+            unknown_token_validation: UnknownTokenValidation::Jwks,
+            expected_audiences: vec!["https://mcp.example.com/mcp".to_string()],
+        }
+    }
+
+    fn state(config: &OAuthConfig) -> McpOAuthState {
+        McpOAuthState::from_oauth_config(
+            config,
+            "https://mcp.example.com".to_string(),
+            TokenStore::new(),
+            reqwest::Client::new(),
+        )
+    }
+
+    /// The out-of-the-box document is unchanged: `OAUTH_SCOPES` defaults to
+    /// `openid,profile,email`, and that is what discovery says.
+    #[test]
+    fn default_scopes_are_advertised_as_before() {
+        let config = oauth_config(&["openid", "profile", "email"], TokenMode::Passthrough);
+        let metadata = authorization_server_metadata(&state(&config));
+
+        assert_eq!(metadata.scopes_supported, ["openid", "profile", "email"]);
+    }
+
+    /// A deployment that defines MCP-specific scopes needs clients to *request*
+    /// them, and a client requests what discovery advertises. Hard-coding the
+    /// list meant `mcp:tools` could be configured, mapped in Keycloak and still
+    /// never end up in a token.
+    #[test]
+    fn configured_scopes_reach_the_authorization_server_metadata() {
+        let config = oauth_config(
+            &["openid", "profile", "email", "mcp:tools", "mcp:resources"],
+            TokenMode::ResourceServer,
+        );
+        let metadata = authorization_server_metadata(&state(&config));
+
+        assert_eq!(
+            metadata.scopes_supported,
+            ["openid", "profile", "email", "mcp:tools", "mcp:resources"],
+        );
+        // And the rest of the resource-server document still describes Keycloak.
+        assert_eq!(metadata.issuer, "https://kc.example.com/realms/mcp");
+        assert_eq!(
+            metadata.registration_endpoint,
+            "https://mcp.example.com/oauth/register",
+        );
+    }
+
+    /// The protected-resource document has always used the configured scopes;
+    /// pinned here so the two documents cannot drift apart again.
+    #[test]
+    fn protected_resource_metadata_advertises_the_same_scopes() {
+        let config = oauth_config(&["openid", "mcp:tools"], TokenMode::ResourceServer);
+        let well_known = WellKnownState {
+            resource_url: "https://mcp.example.com/mcp".to_string(),
+            authorization_server: config.issuer_url.clone(),
+            scopes: config.scopes.clone(),
+        };
+
+        assert_eq!(
+            authorization_server_metadata(&state(&config)).scopes_supported,
+            well_known.scopes,
+        );
+    }
 }
