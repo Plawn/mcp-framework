@@ -247,6 +247,22 @@ Claims are read through `jwt_payload`, which first checks that the credential is
 
 Covered by `tests/session_identity.rs`, which drives the real `build_app` router (strip layer + auth middleware) through an `extra_routes` handler that echoes `session_id_from_parts`, and by `tests/oauth_passthrough_identity.rs` for the claims-derived key end to end (refresh keeps one identity, two SSO sessions of one user stay isolated).
 
+#### Transport session recovery (`src/transport/session_persistence.rs`)
+
+Three stores are keyed by the session id, and each owns exactly one kind of data — never duplicate one into another:
+
+| Store | Namespace | Holds | Written by |
+|---|---|---|---|
+| rmcp transport session (`TransportSessionStore`, adapts `rmcp::…::SessionStore`) | `mcp_transport_sessions` | the `initialize` parameters rmcp needs to rebuild a protocol session | rmcp, once at `initialize`; re-armed by the framework on `load` |
+| `SessionStore<T>` | `sessions` | consumer-defined application data | the consumer, through `update` |
+| `TokenStore` | `tokens` / `opaque*` / `grant_refresh` | credentials and grant material | the auth layer |
+
+The transport store is what turns a legacy-session request landing on an instance that did not create it into a restored session instead of a `404` → client re-`initialize`. It is mounted in `build_app` whenever a persistence backend is configured, with the same TTL as `SessionStore<T>`; without persistence rmcp keeps sessions in process memory as before. Sessionless revisions (2026-07-28) have no protocol session to restore and are unaffected.
+
+**TTL.** rmcp writes the entry once and never refreshes it while the creating instance serves traffic, so the entry's lifetime is counted from creation, not from last activity. The framework re-arms the TTL on every successful `load`, so a session that has failed over once stays recoverable on the next failover. A session served by a single instance for longer than the TTL is the remaining gap: it keeps working there, but a failover after that point re-initializes the client — exactly the pre-recovery behaviour, not worse.
+
+Covered by `http_legacy_session_is_restored_on_another_instance` (`tests/http_integration.rs`, two `build_app` instances sharing one `InMemoryBackend`) and the unit tests in `session_persistence.rs`.
+
 ### Audit logging (`src/audit/`)
 
 Pluggable tool call audit logging. Every `call_tool` invocation can be logged via a `ToolCallLogger` trait implementation. The framework ships two built-in loggers:

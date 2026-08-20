@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] — Unreleased
 
+### Changed — transport session recovery re-arms its TTL on failover
+
+`TransportSessionStore` (the adapter that lets rmcp rebuild a legacy protocol
+session on an instance that did not create it) is written by rmcp once, at
+`initialize`, and never again. Its entry therefore expired a fixed TTL after
+creation regardless of activity: the first failover past that point answered
+`404` and the client re-initialized.
+
+- A successful `load` now re-arms the entry's TTL, so a session that has been
+  recovered once stays recoverable on the next failover. A failed re-arm is
+  logged and does not fail the load.
+- `CLAUDE.md` gains a "Transport session recovery" section stating which of
+  the three session-keyed stores (`mcp_transport_sessions`, `sessions`,
+  `tokens`) owns which data — one mechanism per datum.
+
+
 ### Added — `TokenMode::ResourceServer`, the framework as a pure OAuth resource server
 
 In passthrough the client and the server co-own the same refresh token. Keycloak
@@ -402,8 +418,9 @@ a `<input_required>` / `<task>` content summary rather than being dropped.
   `legacy_session_mode`; the framework uses the default (`true`), so legacy
   sessions still work exactly as before.
 - rmcp 3.1 adds `StreamableHttpServerConfig::session_store` for cross-instance
-  session recovery. It is not wired up yet — it overlaps with this crate's own
-  Redis-backed read-through and is a candidate for a follow-up.
+  session recovery; it is adapted onto the persistence backend by
+  `TransportSessionStore` (see the `0.3.1` entry on transport session
+  recovery for how it is delimited from this crate's own stores).
 
 ### Added — multi-instance token and session resolution
 
