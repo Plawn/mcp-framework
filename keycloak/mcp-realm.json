@@ -2,7 +2,7 @@
   "realm": "mcp",
   "displayName": "MCP",
   "enabled": true,
-  "sslRequired": "none",
+  "sslRequired": "external",
   "registrationAllowed": false,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
@@ -530,15 +530,6 @@
       ]
     },
     {
-      "name": "offline_access",
-      "description": "OpenID Connect built-in scope: offline_access",
-      "protocol": "openid-connect",
-      "attributes": {
-        "consent.screen.text": "${offlineAccessScopeConsentText}",
-        "display.on.consent.screen": "true"
-      }
-    },
-    {
       "name": "mcp-audience",
       "description": "Injects the canonical MCP server URL into the access token audience (RFC 8707 workaround: Keycloak has no `resource` parameter).",
       "protocol": "openid-connect",
@@ -569,7 +560,21 @@
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
         "consent.screen.text": "Call MCP tools on your behalf"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "mcp-server-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "https://mcp.example.com/mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     },
     {
       "name": "mcp:resources",
@@ -579,7 +584,21 @@
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
         "consent.screen.text": "Read MCP resources on your behalf"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "mcp-server-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "https://mcp.example.com/mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "clients": [
@@ -637,44 +656,6 @@
         "phone",
         "mcp:tools",
         "mcp:resources"
-      ]
-    }
-  ],
-  "users": [
-    {
-      "username": "alice",
-      "enabled": true,
-      "emailVerified": true,
-      "email": "alice@example.com",
-      "firstName": "Alice",
-      "lastName": "Example",
-      "credentials": [
-        {
-          "type": "password",
-          "value": "alice",
-          "temporary": false
-        }
-      ],
-      "realmRoles": [
-        "default-roles-mcp"
-      ]
-    },
-    {
-      "username": "bob",
-      "enabled": true,
-      "emailVerified": true,
-      "email": "bob@example.com",
-      "firstName": "Bob",
-      "lastName": "Example",
-      "credentials": [
-        {
-          "type": "password",
-          "value": "bob",
-          "temporary": false
-        }
-      ],
-      "realmRoles": [
-        "default-roles-mcp"
       ]
     }
   ],
@@ -743,6 +724,9 @@
         "config": {
           "allow-default-scopes": [
             "true"
+          ],
+          "allowed-client-scopes": [
+            "openid"
           ]
         }
       },
@@ -769,6 +753,9 @@
         "config": {
           "allow-default-scopes": [
             "true"
+          ],
+          "allowed-client-scopes": [
+            "openid"
           ]
         }
       }
@@ -786,7 +773,6 @@
   "defaultOptionalClientScopes": [
     "address",
     "microprofile-jwt",
-    "offline_access",
     "phone",
     "mcp:tools",
     "mcp:resources"
