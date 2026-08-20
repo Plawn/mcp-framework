@@ -5,10 +5,16 @@ fn make_tool(name: &'static str, schema: serde_json::Map<String, Value>) -> Tool
     Tool::new(name, name, Arc::new(schema))
 }
 
+/// Sanitize with a throwaway audit, so no test can silence another through the
+/// audit's deduplication.
+fn sanitize(tools: &mut [Tool]) {
+    sanitize_tool_schemas(tools, &DescriptionAudit::new());
+}
+
 #[test]
 fn patches_missing_type_object() {
     let mut tools = vec![make_tool("bad", serde_json::Map::new())];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let schema = tools[0].input_schema.as_ref();
     assert_eq!(schema.get("type").unwrap(), "object");
@@ -28,7 +34,7 @@ fn leaves_valid_schema_untouched() {
         }),
     );
     let mut tools = vec![make_tool("good", schema.clone())];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     assert_eq!(tools[0].input_schema.as_ref(), &schema);
 }
@@ -48,7 +54,7 @@ fn strips_schema_and_title_from_valid_schema() {
     );
 
     let mut tools = vec![make_tool("with_meta", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let patched = tools[0].input_schema.as_ref();
     assert_eq!(patched.get("type").unwrap(), "object");
@@ -74,7 +80,7 @@ fn inlines_ref_enums() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let patched = tools[0].input_schema.as_ref();
     assert!(!patched.contains_key("$defs"), "$defs should be removed");
@@ -109,7 +115,7 @@ fn inlines_anyof_with_ref() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let patched = tools[0].input_schema.as_ref();
     assert!(!patched.contains_key("$defs"));
@@ -168,7 +174,7 @@ fn flattens_top_level_oneof_tagged_enum() {
     .unwrap();
 
     let mut tools = vec![make_tool("manage_notes", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let patched = tools[0].input_schema.as_ref();
 
     assert_eq!(patched.get("type").unwrap(), "object");
@@ -229,7 +235,7 @@ fn resolve_refs_deep_merges_properties_and_required() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let variant = tools[0].input_schema.as_ref()["properties"]["variant"]
         .as_object()
         .unwrap();
@@ -272,7 +278,7 @@ fn flattens_top_level_oneof_without_discriminator() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let patched = tools[0].input_schema.as_ref();
 
     assert_eq!(patched.get("type").unwrap(), "object");
@@ -293,7 +299,7 @@ fn patches_serde_json_value_style_schema() {
     schema.insert("title".to_string(), Value::String("AnyValue".to_string()));
 
     let mut tools = vec![make_tool("any_value", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let patched = tools[0].input_schema.as_ref();
     assert_eq!(patched.get("type").unwrap(), "object");
@@ -317,7 +323,7 @@ fn replaces_boolean_true_schemas_in_properties() {
     let mut tool = make_tool("t", serde_json::Map::new());
     tool.output_schema = Some(Arc::new(schema));
     let mut tools = vec![tool];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let os = tools[0].output_schema.as_ref().unwrap().as_ref();
     let props = os["properties"].as_object().unwrap();
@@ -351,7 +357,7 @@ fn strips_title_from_nested_schemas() {
     let mut tool = make_tool("t", serde_json::Map::new());
     tool.output_schema = Some(Arc::new(schema));
     let mut tools = vec![tool];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let os = tools[0].output_schema.as_ref().unwrap().as_ref();
     assert!(!os.contains_key("$schema"));
@@ -408,7 +414,7 @@ fn flatten_preserves_variant_docs_and_required() {
     .unwrap();
 
     let mut tools = vec![make_tool("manage_notes", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let props = tools[0].input_schema.as_ref()["properties"]
         .as_object()
         .unwrap()
@@ -472,7 +478,7 @@ fn flatten_collision_keeps_the_available_description() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let props = tools[0].input_schema.as_ref()["properties"]
         .as_object()
         .unwrap()
@@ -504,7 +510,7 @@ fn flatten_discriminant_description_falls_back_to_undocumented_variants() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let action = tools[0].input_schema.as_ref()["properties"]["action"]
         .as_object()
         .unwrap()
@@ -532,7 +538,7 @@ fn folds_title_into_description_when_absent() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let patched = tools[0].input_schema.as_ref();
 
     // `title` is still gone at every level — but its text survives.
@@ -566,7 +572,7 @@ fn strips_title_when_description_is_present() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let patched = tools[0].input_schema.as_ref();
 
     assert!(!patched.contains_key("title"));
@@ -591,7 +597,7 @@ fn blank_title_is_not_promoted() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     let a = tools[0].input_schema.as_ref()["properties"]["a"]
         .as_object()
@@ -653,7 +659,7 @@ fn audit_accepts_a_description_folded_from_a_title() {
         vec!["parameters without a description: query".to_string()],
     );
 
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     assert!(audit_descriptions(&tools[0]).is_empty());
 }
 
@@ -662,7 +668,7 @@ fn audit_reports_a_schema_with_no_properties_only_for_the_tool() {
     let mut tool = make_tool("t", serde_json::Map::new());
     tool.description = None;
     let mut tools = vec![tool];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     assert_eq!(
         audit_descriptions(&tools[0]),
@@ -697,7 +703,7 @@ fn flatten_collision_prefers_a_real_description_over_a_blank_one() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
     let props = tools[0].input_schema.as_ref()["properties"]
         .as_object()
         .unwrap()
@@ -729,7 +735,7 @@ fn flatten_discriminant_ignores_a_blank_variant_doc() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     assert_eq!(
         tools[0].input_schema.as_ref()["properties"]["action"]["description"],
@@ -760,7 +766,7 @@ fn flatten_discriminant_fallback_skips_a_blank_property_description() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     // No variant is documented, so the fallback is the discriminator property's
     // own description — the first *real* one, not the first one.
@@ -787,10 +793,91 @@ fn flatten_required_suffix_replaces_a_blank_description() {
     .unwrap();
 
     let mut tools = vec![make_tool("t", schema)];
-    sanitize_tool_schemas(&mut tools);
+    sanitize(&mut tools);
 
     assert_eq!(
         tools[0].input_schema.as_ref()["properties"]["body"]["description"],
         "Required when action=add.",
     );
+}
+
+// ── Audit deduplication (919 follow-up) ────────────────────────────
+
+#[test]
+fn audit_reports_a_tool_version_only_once() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "bare": { "type": "string" } }
+    }))
+    .unwrap();
+    let tool = make_tool("t", schema);
+    let audit = DescriptionAudit::new();
+
+    assert_eq!(
+        audit.audit(&tool),
+        Some(vec!["parameters without a description: bare".to_string()]),
+    );
+    // A polling client calling tools/list in a loop must not re-log this.
+    assert_eq!(audit.audit(&tool), None);
+}
+
+#[test]
+fn audit_reports_again_when_the_tool_changes() {
+    let bare: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "a": { "type": "string" } }
+    }))
+    .unwrap();
+    let audit = DescriptionAudit::new();
+
+    let mut tool = make_tool("t", bare);
+    assert!(audit.audit(&tool).is_some());
+    assert!(audit.audit(&tool).is_none());
+
+    // A new property with no description is a new deficit, on a new version.
+    let grown: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "a": { "type": "string" }, "b": { "type": "string" } }
+    }))
+    .unwrap();
+    tool.input_schema = Arc::new(grown);
+    assert_eq!(
+        audit.audit(&tool),
+        Some(vec!["parameters without a description: a, b".to_string()]),
+    );
+
+    // So is a change of the tool's own description.
+    tool.description = Some("Now documented.".into());
+    assert!(audit.audit(&tool).is_some());
+}
+
+#[test]
+fn audit_of_a_documented_tool_is_a_first_look_with_nothing_to_say() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "query": { "type": "string", "description": "What to look for." } }
+    }))
+    .unwrap();
+    let audit = DescriptionAudit::new();
+    let tool = make_tool("search", schema);
+
+    assert_eq!(audit.audit(&tool), Some(Vec::new()));
+    assert_eq!(audit.audit(&tool), None);
+}
+
+#[test]
+fn two_sanitize_passes_share_one_audit() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "bare": { "type": "string" } }
+    }))
+    .unwrap();
+    let audit = DescriptionAudit::new();
+
+    let mut first = vec![make_tool("t", schema.clone())];
+    sanitize_tool_schemas(&mut first, &audit);
+    // The listing path consumed the finding; a second tools/list says nothing.
+    let mut second = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut second, &audit);
+    assert!(audit.audit(&second[0]).is_none());
 }

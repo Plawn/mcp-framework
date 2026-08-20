@@ -60,9 +60,17 @@ wrong tool or the wrong argument.
 
 - `audit_descriptions(&Tool) -> Vec<String>` reports the deficits (the tool
   itself, then one aggregated finding listing the undocumented parameters);
-  `warn_missing_descriptions` logs them as a single `tracing::warn!` per tool,
-  alongside the existing "missing type" warning. The rule is pure, so it is
-  tested without capturing `tracing` output.
+  `DescriptionAudit` logs them as a single `tracing::warn!` per tool, alongside
+  the existing "missing type" warning. The rule is pure, so it is tested without
+  capturing `tracing` output.
+- **Dynamic tools are audited at registration**, not only when a client lists
+  them: `add_tool` / `add_tool_with_context` audit a throwaway sanitized copy,
+  so a tool that is registered but never listed is still checked. Inner-handler
+  tools, observable only at list time, keep being audited there.
+- Both paths share the registry's `DescriptionAudit`, which remembers the tool
+  versions it has already reported (hash of name + description + input schema).
+  A polling client no longer turns the audit into a log flood, and an edited
+  tool is audited again.
 - `title` is no longer dropped outright: it is folded into `description` when
   the node has none, at every nesting level, and still stripped when a
   description is already there. It was sometimes the only doc a type carried.

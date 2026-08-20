@@ -380,7 +380,8 @@ schema schemars emits is one an MCP client actually accepts. It runs, in order:
    merged into one flat object with a synthesized `string` `enum` discriminator.
 4. **`"type": "object"` patching** for schemas that have no `type` (e.g. a
    `serde_json::Value` parameter), with a `tracing::warn!`.
-5. **A documentation audit** (`audit_descriptions`), warned once per tool.
+5. **A documentation audit** (`audit_descriptions`), warned once per tool
+   *version*.
 
 **Flattening keeps the documentation.** Flattening is lossy by nature — runtime
 `serde` still enforces the real per-variant contract, but the schema can no
@@ -397,11 +398,26 @@ longer express it. What it must *not* lose is what `tools/list` exposes as prose
   description from a later variant fills in for a missing one.
 
 **The audit** is a pure `audit_descriptions(&Tool) -> Vec<String>`; the logging
-lives in its caller `warn_missing_descriptions`, so the rule is testable without
-capturing `tracing` output. It reports a tool with no `description`, and — in a
-single aggregated finding, to keep the log readable on a large server — the
-input-schema properties that have none. It runs **after** sanitization, so a
-description folded from a `title` counts as documentation.
+and the deduplication live in `DescriptionAudit`, so the rule is testable
+without capturing `tracing` output. It reports a tool with no `description`,
+and — in a single aggregated finding, to keep the log readable on a large
+server — the input-schema properties that have none. It runs **after**
+sanitization, so a description folded from a `title` counts as documentation,
+and a blank description counts as none.
+
+**Where it runs, and how often.** `tools/list` alone would be both too late and
+too often: a tool registered but never listed would never be checked, while a
+polling client would re-log the same finding on every call. So:
+
+- **dynamic tools are audited at registration** (`CapabilityRegistry::add_tool`
+  / `add_tool_with_context`), on a throwaway sanitized copy — the author sees
+  the warning even if no client ever connects;
+- **inner-handler tools** are only observable at list time, so they are audited
+  there;
+- both paths share **one** `DescriptionAudit`, owned by the registry and handed
+  to `DynamicHandler`. It keeps the set of tool versions already audited, keyed
+  by a hash of name + description + input schema — so a tool warns once, and
+  again only if it is edited.
 
 ### Persistence layer (`src/persistence.rs`)
 

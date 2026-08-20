@@ -162,7 +162,9 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
             a.name.as_ref() == b.name.as_ref()
         });
 
-        sanitize_tool_schemas(&mut inner_result.tools);
+        // The audit lives on the registry, so a dynamic tool already checked at
+        // registration is not re-reported here on every poll.
+        sanitize_tool_schemas(&mut inner_result.tools, self.registry.description_audit());
         let merged_count = inner_result.tools.len();
 
         if let Some(ref filter) = self.context.filter {

@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use rmcp::model::Tool;
 use serde_json::Value;
@@ -384,12 +386,13 @@ fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Optio
 /// LLM that picks the wrong tool or the wrong argument. The findings surface at
 /// registration, where the author can still act on them.
 ///
-/// Pure on purpose: [`warn_missing_descriptions`] does the logging, so the rule
-/// itself is testable without capturing `tracing` output.
+/// Pure on purpose: [`DescriptionAudit`] does the logging and the
+/// deduplication, so the rule itself is testable without capturing `tracing`
+/// output.
 ///
 /// Run **after** sanitization, so a `title` folded into `description` counts as
 /// documentation and does not produce a spurious finding.
-fn audit_descriptions(tool: &Tool) -> Vec<String> {
+pub(crate) fn audit_descriptions(tool: &Tool) -> Vec<String> {
     let mut findings = Vec::new();
 
     let documented = tool
@@ -417,19 +420,91 @@ fn audit_descriptions(tool: &Tool) -> Vec<String> {
     findings
 }
 
-/// Log [`audit_descriptions`] findings as a single aggregated warning per tool,
-/// so a server with many under-documented tools stays readable.
-fn warn_missing_descriptions(tool: &Tool) {
-    let findings = audit_descriptions(tool);
-    if findings.is_empty() {
-        return;
+/// Identity of one *version* of a tool, for the audit's deduplication.
+///
+/// Name alone would silence a tool whose schema later changed; the whole
+/// documented surface (name, description, input schema) is hashed so an edited
+/// tool is audited again, and only then.
+fn tool_version_key(tool: &Tool) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tool.name.hash(&mut hasher);
+    tool.description.hash(&mut hasher);
+    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order`), so this
+    // rendering is stable for a given schema.
+    Value::Object(tool.input_schema.as_ref().clone())
+        .to_string()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Remembers which tool versions have already been audited, so a documentation
+/// deficit is reported **once** rather than on every `tools/list`.
+///
+/// A polling client calls `tools/list` continuously; without this, the audit
+/// would be a log flood instead of a signal. The set is keyed by
+/// [`tool_version_key`], so editing a tool's schema or description makes it
+/// audible again.
+///
+/// It is shared, not global: [`CapabilityRegistry`](super::CapabilityRegistry)
+/// owns one and hands the same instance to `DynamicHandler`. Dynamic tools are
+/// therefore audited at registration — where the author is — and the listing
+/// path finds nothing left to say about them; an inner-handler tool, which only
+/// becomes observable at list time, is audited there, once.
+#[derive(Clone, Default)]
+pub(crate) struct DescriptionAudit {
+    seen: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl DescriptionAudit {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    tracing::warn!(
-        tool = %tool.name,
-        findings = %findings.join("; "),
-        "Tool documentation is incomplete — the LLM sees exactly what tools/list \
-         exposes. Add a /// doc comment on the tool and on each parameter field."
-    );
+
+    /// Audit `tool` unless this exact version was audited before.
+    ///
+    /// `None` means "already seen"; `Some(findings)` is a first look, possibly
+    /// with nothing to report.
+    pub(crate) fn audit(&self, tool: &Tool) -> Option<Vec<String>> {
+        let key = tool_version_key(tool);
+        let first_time = match self.seen.lock() {
+            Ok(mut seen) => seen.insert(key),
+            // A poisoned lock must not cost the caller its tool listing; the
+            // worst case is a duplicate warning.
+            Err(poisoned) => poisoned.into_inner().insert(key),
+        };
+        first_time.then(|| audit_descriptions(tool))
+    }
+
+    /// Audit and log: a single aggregated warning per tool, so a server with
+    /// many under-documented tools stays readable.
+    pub(crate) fn warn(&self, tool: &Tool) {
+        let Some(findings) = self.audit(tool) else {
+            return;
+        };
+        if findings.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            tool = %tool.name,
+            findings = %findings.join("; "),
+            "Tool documentation is incomplete — the LLM sees exactly what tools/list \
+             exposes. Add a /// doc comment on the tool and on each parameter field."
+        );
+    }
+}
+
+/// Audit a tool the moment it is registered, rather than waiting for a client
+/// to list it — a tool that is registered but never listed would otherwise
+/// never be checked at all.
+///
+/// The audit must see the schema `tools/list` will actually expose (a `title`
+/// folded into a `description` counts as documentation), so it runs on a
+/// throwaway sanitized copy. That copy is also what the listing path will hash,
+/// which is what makes the deduplication line up across the two entry points.
+pub(crate) fn audit_tool_at_registration(tool: &Tool, audit: &DescriptionAudit) {
+    let mut copy = tool.clone();
+    sanitize_one(&mut copy);
+    audit.warn(&copy);
 }
 
 /// Sanitize tool schemas for MCP client compatibility.
@@ -446,40 +521,54 @@ fn warn_missing_descriptions(tool: &Tool) {
 ///    types (e.g. `serde_json::Value`) produce schemas without a `"type"` key,
 ///    which causes clients to silently reject the tool.
 /// 5. Warns about every tool or parameter left without a description, once the
-///    schema is final (see [`audit_descriptions`]).
-pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool]) {
+///    schema is final and once per tool version (see [`DescriptionAudit`]).
+pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool], audit: &DescriptionAudit) {
     for tool in tools.iter_mut() {
-        // ── input_schema ───────────────────────────────────────────
-        let schema = Arc::make_mut(&mut tool.input_schema);
-        strip_meta_fields(schema);
-        inline_defs(schema);
-        flatten_top_level_combinator(schema);
-
-        if !schema.contains_key("type") {
+        if sanitize_one(tool) {
             tracing::warn!(
                 tool = %tool.name,
                 "Tool input_schema is missing \"type\": \"object\" — patching at runtime. \
                  Consider using mcp_framework::EmptyParams instead of serde_json::Value \
                  for tools with no parameters."
             );
-            schema.insert("type".to_string(), Value::String("object".to_string()));
-            if !schema.contains_key("properties") {
-                schema.insert("properties".to_string(), Value::Object(Default::default()));
-            }
-        }
-
-        // ── output_schema ──────────────────────────────────────────
-        if let Some(ref mut output_schema) = tool.output_schema {
-            let os = Arc::make_mut(output_schema);
-            strip_meta_fields(os);
-            inline_defs(os);
-            flatten_top_level_combinator(os);
         }
 
         // Last: the audit reads the sanitized schema, so a `title` folded into
         // a `description` counts as documentation.
-        warn_missing_descriptions(tool);
+        audit.warn(tool);
     }
+}
+
+/// Rewrite one tool's schemas in place, silently.
+///
+/// Returns whether `input_schema` had to be patched with `"type": "object"` —
+/// the caller decides whether that deserves a log line, so the registration
+/// audit can reuse this on a throwaway copy without duplicating the warning the
+/// listing path already emits.
+fn sanitize_one(tool: &mut Tool) -> bool {
+    // ── input_schema ───────────────────────────────────────────────
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    strip_meta_fields(schema);
+    inline_defs(schema);
+    flatten_top_level_combinator(schema);
+
+    let patched_type = !schema.contains_key("type");
+    if patched_type {
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+        if !schema.contains_key("properties") {
+            schema.insert("properties".to_string(), Value::Object(Default::default()));
+        }
+    }
+
+    // ── output_schema ──────────────────────────────────────────────
+    if let Some(ref mut output_schema) = tool.output_schema {
+        let os = Arc::make_mut(output_schema);
+        strip_meta_fields(os);
+        inline_defs(os);
+        flatten_top_level_combinator(os);
+    }
+
+    patched_type
 }
 
 #[cfg(test)]

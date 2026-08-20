@@ -523,3 +523,100 @@ async fn app_resource_version_changes() {
     reg.register_app_resource("ui://test/v", "<html/>").await;
     assert_ne!(reg.version(), v0);
 }
+
+// ── Documentation audit at registration (919) ────────────────────
+
+#[tokio::test]
+async fn registering_a_tool_audits_its_documentation() {
+    use crate::capability::sanitize::{DescriptionAudit, sanitize_tool_schemas};
+
+    let reg = CapabilityRegistry::new();
+    let mut tool = Tool::new("bare", "Does things.", serde_json::Map::new());
+    tool.input_schema = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "who": { "type": "string" } }
+        }))
+        .unwrap(),
+    );
+
+    reg.add_tool(tool.clone(), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+
+    // A tool that is registered but never listed is still audited — that is the
+    // whole point of doing it here. Proof: a *fresh* audit has findings, while
+    // the registry's own has already spent them.
+    let mut listed = vec![tool.clone()];
+    sanitize_tool_schemas(&mut listed, reg.description_audit());
+    assert_eq!(
+        DescriptionAudit::new().audit(&listed[0]),
+        Some(vec!["parameters without a description: who".to_string()]),
+    );
+    assert_eq!(reg.description_audit().audit(&listed[0]), None);
+}
+
+#[tokio::test]
+async fn listing_audits_an_inner_handler_tool_once() {
+    use crate::capability::sanitize::{DescriptionAudit, sanitize_tool_schemas};
+
+    // Never registered: only the listing path ever sees it.
+    let reg = CapabilityRegistry::new();
+    let mut inner = Tool::new("inner", "Does things.", serde_json::Map::new());
+    inner.input_schema = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "who": { "type": "string" } }
+        }))
+        .unwrap(),
+    );
+
+    // Nothing has looked at it yet.
+    assert_eq!(
+        DescriptionAudit::new().audit(&inner),
+        Some(vec!["parameters without a description: who".to_string()]),
+    );
+
+    let mut first = vec![inner.clone()];
+    sanitize_tool_schemas(&mut first, reg.description_audit());
+    // …and a second tools/list from a polling client says nothing more.
+    assert_eq!(reg.description_audit().audit(&first[0]), None);
+}
+
+#[tokio::test]
+async fn re_registering_a_changed_tool_audits_it_again() {
+    use crate::capability::sanitize::DescriptionAudit;
+
+    let reg = CapabilityRegistry::new();
+    let mut tool = Tool::new("t", "Does things.", serde_json::Map::new());
+    tool.input_schema = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" } }
+        }))
+        .unwrap(),
+    );
+    reg.add_tool(tool.clone(), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+
+    // Same tool, new property: a new version, so a new audit.
+    tool.input_schema = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" }, "b": { "type": "string" } }
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        DescriptionAudit::new().audit(&tool),
+        Some(vec!["parameters without a description: a, b".to_string()]),
+    );
+    reg.add_tool(tool.clone(), |_| async {
+        Ok(CallToolResult::success(vec![]))
+    })
+    .await;
+    assert_eq!(reg.description_audit().audit(&tool), None);
+}
