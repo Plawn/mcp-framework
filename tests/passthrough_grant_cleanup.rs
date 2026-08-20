@@ -15,9 +15,10 @@ use axum::{
     http::{Request, StatusCode},
     routing::post,
 };
-use common::app_with;
+use common::{app_with, app_with_persistence};
 use mcp_framework::TokenStore;
 use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode, UnknownTokenValidation};
+use mcp_framework::persistence::{InMemoryBackend, PersistenceBackend};
 use tower::ServiceExt as _;
 
 /// A Keycloak that mints a fresh (access, refresh) pair on every exchange, the
@@ -112,11 +113,13 @@ async fn refresh_grant_retires_the_previous_passthrough_entry() {
     assert_eq!(stored.refresh_token.as_deref(), Some("refresh-2"));
 }
 
-/// A stable grant key (task #920 derives it from JWT `sid`/`sub`) makes the old
-/// and new keys collide. The cleanup must then leave the freshly stored entry
-/// alone instead of deleting the grant it just wrote.
+/// Guard for a case this branch cannot yet produce. Here the key is derived from
+/// the access-token bytes, so a rotation always yields a *different* key; once
+/// identity becomes claims-derived (task #920, JWT `sid`/`sub`) both grants land
+/// on the same key and the removal must be skipped. The store calls below are a
+/// hand-rolled replay of the handler's sequence under that future derivation.
 #[tokio::test]
-async fn refresh_grant_keeps_the_entry_when_the_key_is_unchanged() {
+async fn stable_grant_key_survives_its_own_refresh_cleanup() {
     let store = TokenStore::new();
     let session_key = "grant-stable";
 
@@ -133,7 +136,8 @@ async fn refresh_grant_keeps_the_entry_when_the_key_is_unchanged() {
     store.index_grant_refresh("refresh-1", session_key).await;
 
     // What the handler does on a refresh whose new key equals the old one:
-    // the removal is skipped, only the spent refresh token is de-indexed.
+    // `old_key != session_key` is false, so `remove_token` is skipped and only
+    // the spent refresh token is de-indexed.
     assert_eq!(
         store.resolve_grant_refresh("refresh-1").await.as_deref(),
         Some(session_key)
@@ -160,5 +164,76 @@ async fn refresh_grant_keeps_the_entry_when_the_key_is_unchanged() {
         store.peek_token(session_key).await.map(|t| t.access_token),
         Some("access-2".to_string()),
         "the freshly stored grant must survive its own cleanup"
+    );
+}
+
+/// Two replicas sharing only a persistence backend: the exchange happens on A,
+/// the refresh on B — which has never seen the grant in memory and must reach it
+/// through `NS_GRANT_REFRESH` read-through. A third, freshly built store then
+/// checks what actually survived in persistence.
+#[tokio::test]
+async fn refresh_on_a_peer_retires_the_persisted_grant() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let issuer = mock_keycloak().await;
+
+    let (app_a, store_a) = app_with_persistence(passthrough_oauth(issuer.clone()), backend.clone());
+    let (app_b, _store_b) = app_with_persistence(passthrough_oauth(issuer), backend.clone());
+
+    // Replica A serves the initial exchange.
+    assert_eq!(
+        post_token(&app_a, "grant_type=authorization_code&code=abc").await,
+        StatusCode::OK
+    );
+    let key1 = store_a
+        .resolve_grant_refresh("refresh-1")
+        .await
+        .expect("initial grant indexed");
+
+    // The index landed in NS_GRANT_REFRESH, keyed by a hash (never the raw
+    // refresh token) and holding the grant key as its value.
+    let index_keys = backend.keys("grant_refresh").await.unwrap();
+    assert_eq!(index_keys.len(), 1, "one index entry: {index_keys:?}");
+    assert!(
+        !index_keys[0].contains("refresh-1"),
+        "the raw refresh token must never be a persistence key: {index_keys:?}"
+    );
+    assert_eq!(
+        backend
+            .get("grant_refresh", &index_keys[0])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(key1.as_bytes())
+    );
+
+    // Replica B serves the refresh. Nothing about this grant is in its memory.
+    assert_eq!(
+        post_token(&app_b, "grant_type=refresh_token&refresh_token=refresh-1").await,
+        StatusCode::OK
+    );
+
+    // A third store, built fresh over the same backend: everything it sees comes
+    // from persistence, so this is what a restarted or newly scaled-up replica
+    // would find.
+    let fresh = TokenStore::new().with_persistence(backend.clone());
+    assert!(
+        fresh.peek_token(&key1).await.is_none(),
+        "the superseded grant must be gone from persistence too"
+    );
+    assert_eq!(fresh.resolve_grant_refresh("refresh-1").await, None);
+
+    let key2 = fresh
+        .resolve_grant_refresh("refresh-2")
+        .await
+        .expect("refreshed grant resolvable from persistence alone");
+    assert_ne!(key1, key2);
+    let stored = fresh.peek_token(&key2).await.expect("new grant adoptable");
+    assert_eq!(stored.access_token, "access-2");
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-2"));
+
+    assert_eq!(
+        backend.keys("grant_refresh").await.unwrap().len(),
+        1,
+        "the spent index entry must not linger alongside the new one"
     );
 }

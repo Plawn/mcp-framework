@@ -279,11 +279,12 @@ async fn passthrough_token_handler(
             // entry stayed adoptable by `bearer_auth_middleware`, which would
             // then drive a refresh into `invalid_grant` → a spurious 401.
             //
-            // The old key may equal the new one (it is derived from the token,
-            // and a stable derivation would map both to the same grant), so the
-            // removal is skipped in that case rather than deleting the entry we
-            // are about to write. Only the *spent* refresh token's index entry
-            // is dropped; the new one is written below.
+            // The key hashes the access token, so a rotation currently always
+            // yields a different one; a claims-derived identity (`sid`/`sub`)
+            // would map both grants onto the same key. The removal is skipped in
+            // that case rather than deleting the grant this exchange is about to
+            // write. Only the *spent* refresh token's index entry is dropped;
+            // the new one is written below.
             if let Some(ref spent) = spent_refresh_token {
                 if let Some(old_key) = state.token_store.resolve_grant_refresh(spent).await
                     && old_key != session_key

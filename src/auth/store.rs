@@ -1139,7 +1139,7 @@ impl TokenStore {
     /// `grant_type=refresh_token` exchange can find the entry it supersedes.
     ///
     /// The raw refresh token is never used as a key: it is hashed the same way
-    /// [`credential_session_key`] hashes a bearer.
+    /// `credential_session_key` hashes a bearer.
     pub async fn index_grant_refresh(&self, refresh_token: &str, session_key: &str) {
         let _mutation = self.mutation_lock.lock().await;
         let key = credential_session_key(refresh_token);
