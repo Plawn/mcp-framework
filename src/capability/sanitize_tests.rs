@@ -360,3 +360,156 @@ fn strips_title_from_nested_schemas() {
     let nested = &os["properties"]["items"]["items"];
     assert!(!nested.as_object().unwrap().contains_key("title"));
 }
+
+#[test]
+fn flatten_preserves_variant_docs_and_required() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ManageNotesInput",
+        "oneOf": [
+            {
+                "type": "object",
+                "description": "Add a note to a task.",
+                "properties": {
+                    "action": { "type": "string", "const": "add" }
+                },
+                "$ref": "#/$defs/AddNoteInput",
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "description": "Remove a note from a task.",
+                "properties": {
+                    "action": { "type": "string", "const": "remove" }
+                },
+                "$ref": "#/$defs/RemoveNoteInput",
+                "required": ["action"]
+            }
+        ],
+        "$defs": {
+            "AddNoteInput": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task." },
+                    "body": { "type": "string", "description": "The note body." }
+                },
+                "required": ["task_id", "body"]
+            },
+            "RemoveNoteInput": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "note_id": { "type": "string", "description": "The note to drop." }
+                },
+                "required": ["task_id", "note_id"]
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("manage_notes", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let props = tools[0].input_schema.as_ref()["properties"]
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // The synthesized discriminant carries every variant's doc.
+    assert_eq!(
+        props["action"]["description"],
+        "`add`: Add a note to a task. · `remove`: Remove a note from a task."
+    );
+
+    // Per-variant `required` survives as prose, appended to the existing doc.
+    assert_eq!(
+        props["body"]["description"],
+        "The note body. Required when action=add."
+    );
+    assert_eq!(
+        props["note_id"]["description"],
+        "The note to drop. Required when action=remove."
+    );
+    // Required by both variants, and the retained (first) entry had no
+    // description — the homonym from the second variant is irrelevant here,
+    // only the constraint suffix applies.
+    assert_eq!(
+        props["task_id"]["description"],
+        "The task. Required when action=add, remove."
+    );
+
+    // Flattening itself is unchanged.
+    let required: Vec<&str> = tools[0].input_schema.as_ref()["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["action"]);
+}
+
+#[test]
+fn flatten_collision_keeps_the_available_description() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "add" },
+                    "target": { "type": "string" }
+                },
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "remove" },
+                    "target": { "type": "string", "description": "What to act on." }
+                },
+                "required": ["action"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let props = tools[0].input_schema.as_ref()["properties"]
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // First variant wins the slot but had no description; the later one's is copied.
+    assert_eq!(props["target"]["description"], "What to act on.");
+    // No variant is documented → no invented description on the discriminant.
+    assert!(!props["action"].as_object().unwrap().contains_key("description"));
+}
+
+#[test]
+fn flatten_discriminant_description_falls_back_to_undocumented_variants() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "description": "Add something.",
+                "properties": { "action": { "type": "string", "const": "add" } },
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "properties": { "action": { "type": "string", "const": "remove" } },
+                "required": ["action"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let action = tools[0].input_schema.as_ref()["properties"]["action"]
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // A variant with no doc contributes just its value.
+    assert_eq!(action["description"], "`add`: Add something. · `remove`");
+}

@@ -148,6 +148,18 @@ fn inline_defs(schema: &mut serde_json::Map<String, Value>) {
 /// enforces the full per-variant contract, so no actual validation is lost —
 /// only the LLM loses a visibility aid.
 ///
+/// Documentation is **not** lost in the process:
+/// - each variant's `description` (its `///` doc comment) is composed into the
+///   synthesized discriminator's description, as
+///   ``` `add`: <doc> · `remove`: <doc> ``` (a variant with no doc contributes
+///   just its value);
+/// - every non-discriminator property gets the variants that require it appended
+///   to its description (`Required when action=add, remove.`) — the only place
+///   the per-variant `required` can survive the flattening;
+/// - when the same property name appears in several variants, the first
+///   occurrence is kept, but a description from a later variant fills in for a
+///   missing one.
+///
 /// For combinators without a discriminator, we fall back to a plain property
 /// union with no `required` fields.
 fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
@@ -165,7 +177,14 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
 
     let mut merged_props = serde_json::Map::new();
     let mut tag_key: Option<String> = None;
-    let mut tag_values: Vec<Value> = Vec::new();
+    // `(discriminant value, variant description)`, in variant order.
+    let mut tag_entries: Vec<(Value, Option<Value>)> = Vec::new();
+    // A description carried by the discriminator property itself (rather than by
+    // the variant); used as a fallback when no variant is documented.
+    let mut tag_prop_description: Option<String> = None;
+    // Non-discriminator property → discriminant values of the variants that
+    // list it in `required`, in variant order.
+    let mut required_by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
 
     for variant in &variants {
         let Some(v_obj) = variant.as_object() else {
@@ -175,34 +194,107 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
             continue;
         };
 
+        // First pass: identify this variant's discriminant value, so the second
+        // pass can attribute per-variant `required` to it regardless of the
+        // order properties happen to be iterated in.
+        let mut variant_tag: Option<Value> = None;
         for (prop_name, prop_schema) in v_props {
             // A property with a `const` value is the tagged-enum discriminator.
-            if let Some(const_val) = prop_schema.get("const") {
-                if tag_key.is_none() {
-                    tag_key = Some(prop_name.clone());
+            let Some(const_val) = prop_schema.get("const") else {
+                continue;
+            };
+            if tag_key.is_none() {
+                tag_key = Some(prop_name.clone());
+            }
+            if tag_key.as_deref() != Some(prop_name.as_str()) {
+                continue;
+            }
+            variant_tag = Some(const_val.clone());
+            if tag_prop_description.is_none()
+                && let Some(Value::String(d)) = prop_schema.get("description")
+            {
+                tag_prop_description = Some(d.clone());
+            }
+            if !tag_entries.iter().any(|(v, _)| v == const_val) {
+                tag_entries.push((const_val.clone(), v_obj.get("description").cloned()));
+            }
+        }
+
+        let variant_required: Vec<&str> = v_obj
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        // Second pass: merge the non-discriminator properties.
+        for (prop_name, prop_schema) in v_props {
+            if prop_schema.get("const").is_some() {
+                continue;
+            }
+
+            match merged_props.entry(prop_name.clone()) {
+                serde_json::map::Entry::Vacant(slot) => {
+                    slot.insert(prop_schema.clone());
                 }
-                if tag_key.as_deref() == Some(prop_name.as_str()) && !tag_values.contains(const_val)
-                {
-                    tag_values.push(const_val.clone());
+                // Homonymous property across variants: first wins, but never at
+                // the cost of a description the retained entry does not have.
+                serde_json::map::Entry::Occupied(mut slot) => {
+                    let kept_has_description = slot
+                        .get()
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .is_some_and(|d| !d.is_empty());
+                    if !kept_has_description
+                        && let Some(new_description) = prop_schema.get("description")
+                        && let Some(kept) = slot.get_mut().as_object_mut()
+                    {
+                        kept.insert("description".to_string(), new_description.clone());
+                    }
                 }
-            } else {
-                merged_props
-                    .entry(prop_name.clone())
-                    .or_insert_with(|| prop_schema.clone());
+            }
+
+            if let Some(tag) = variant_tag.as_ref()
+                && variant_required.contains(&prop_name.as_str())
+            {
+                let label = value_label(tag);
+                let entry = required_by.entry(prop_name.clone()).or_default();
+                if !entry.contains(&label) {
+                    entry.push(label);
+                }
             }
         }
     }
 
     let mut required: Vec<Value> = Vec::new();
     if let Some(ref tk) = tag_key {
-        merged_props.insert(
-            tk.clone(),
-            serde_json::json!({
-                "type": "string",
-                "enum": tag_values,
-            }),
-        );
+        let mut discriminant = serde_json::json!({
+            "type": "string",
+            "enum": tag_entries.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
+        });
+        if let Some(description) = compose_discriminant_description(&tag_entries)
+            .or(tag_prop_description)
+            && let Some(obj) = discriminant.as_object_mut()
+        {
+            obj.insert("description".to_string(), Value::String(description));
+        }
+        merged_props.insert(tk.clone(), discriminant);
         required.push(Value::String(tk.clone()));
+
+        // Re-attach the per-variant `required` as prose on each property, since
+        // the flattened schema can only advertise the discriminator as required.
+        for (prop_name, tags) in &required_by {
+            let Some(Value::Object(prop)) = merged_props.get_mut(prop_name) else {
+                continue;
+            };
+            let suffix = format!("Required when {tk}={}.", tags.join(", "));
+            let merged = match prop.get("description").and_then(Value::as_str) {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{} {suffix}", existing.trim_end())
+                }
+                _ => suffix,
+            };
+            prop.insert("description".to_string(), Value::String(merged));
+        }
     }
 
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -212,6 +304,43 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
     } else {
         schema.insert("required".to_string(), Value::Array(required));
     }
+}
+
+/// Render a discriminant value for prose: strings unquoted, anything else as JSON.
+fn value_label(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Compose the variant docs into a single description for the synthesized
+/// discriminator: ``` `add`: Add a note · `remove`: Remove a note ```.
+///
+/// Returns `None` when no variant is documented — the enum values alone would
+/// only restate the `enum` keyword.
+fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Option<String> {
+    let documented = entries.iter().any(|(_, d)| {
+        d.as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if !documented {
+        return None;
+    }
+
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(value, description)| {
+            let label = format!("`{}`", value_label(value));
+            match description.as_ref().and_then(Value::as_str) {
+                Some(d) if !d.trim().is_empty() => format!("{label}: {}", d.trim()),
+                _ => label,
+            }
+        })
+        .collect();
+
+    Some(parts.join(" · "))
 }
 
 /// Sanitize tool schemas for MCP client compatibility.

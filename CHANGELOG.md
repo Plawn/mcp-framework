@@ -51,6 +51,25 @@ A tool handler now knows which session its call came from. Without it, every
 tool needing that fact becomes one more special case in the application's
 wiring.
 
+### Fixed — descriptions survive the tagged-enum flattening
+
+`sanitize_tool_schemas` flattens the root-level `oneOf` schemars emits for
+`#[serde(tag = "...")]` enums, because the Anthropic API rejects a combinator
+at the root of `input_schema`. The flattening used to throw away everything
+`tools/list` exposes as documentation: each variant's doc comment, the
+per-variant `required`, and — on a property name shared by several variants —
+any description the first variant did not happen to carry.
+
+- The synthesized discriminator now carries the composed variant docs:
+  ``` `add`: Add a note · `remove`: Remove a note ``` (an undocumented variant
+  contributes just its value; if no variant is documented, no description is
+  invented).
+- Every other property states the variants that require it:
+  `Required when action=add, remove.`, appended to its own description. This is
+  the only place the per-variant `required` can survive a flat object schema.
+- A homonymous property across variants still resolves first-wins, but a
+  description from a later variant now fills in for a missing one.
+
 ### Dependencies
 
 - added `futures` `0.3` — the `Sink`/`Stream` halves of the loopback transport
