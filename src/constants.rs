@@ -47,6 +47,12 @@ pub const NS_OPAQUE: &str = "opaque";
 pub const NS_OPAQUE_ACCESS: &str = "opaque_access";
 /// Inverse index: `opaque_refresh` → `session_id` (for cross-instance read-through).
 pub const NS_OPAQUE_REFRESH: &str = "opaque_refresh";
+/// Passthrough-mode index: `sha256(refresh_token)` → grant session key.
+///
+/// Lets `/oauth/token` locate the entry a `refresh_token` grant supersedes, so
+/// the previous grant — whose refresh token Keycloak has just rotated away —
+/// stops being adoptable by the auth middleware.
+pub const NS_GRANT_REFRESH: &str = "grant_refresh";
 /// Distributed refresh locks (SETNX) to serialize token refresh across instances.
 pub const NS_REFRESH_LOCK: &str = "refresh_lock";
 /// Distributed session mutation locks used to serialize replicas.

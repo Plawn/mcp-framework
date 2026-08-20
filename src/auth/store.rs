@@ -13,10 +13,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::config::UnknownTokenValidation;
 use super::jwks::{JwksRejection, JwksValidator};
+use super::middleware::credential_session_key;
 use crate::constants::{
-    NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH, NS_REFRESH_LOCK, NS_TOKENS, OPAQUE_ACCESS_TTL,
-    OPAQUE_REFRESH_TTL, PENDING_AUTH_TIMEOUT, REFRESH_LOCK_POLL, REFRESH_LOCK_TTL,
-    REFRESH_LOCK_WAIT, TOKEN_EXPIRY_BUFFER,
+    NS_GRANT_REFRESH, NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH, NS_REFRESH_LOCK, NS_TOKENS,
+    OPAQUE_ACCESS_TTL, OPAQUE_REFRESH_TTL, PENDING_AUTH_TIMEOUT, REFRESH_LOCK_POLL,
+    REFRESH_LOCK_TTL, REFRESH_LOCK_WAIT, TOKEN_EXPIRY_BUFFER,
 };
 use crate::persistence::{
     PersistenceBackend, PersistenceError, instant_to_unix_millis, persist, persist_raw,
@@ -339,6 +340,9 @@ pub struct TokenStore {
 
     /// Opaque token index (only populated in Opaque token mode).
     opaque_index: Arc<RwLock<OpaqueIndex>>,
+    /// `sha256(refresh_token)` → grant session key (only populated in
+    /// Passthrough token mode, by the `/oauth/token` proxy).
+    grant_refresh_index: Arc<RwLock<HashMap<String, String>>>,
     /// Orders in-memory mutations with persistence writes and deletions.
     mutation_lock: Arc<Mutex<()>>,
 
@@ -362,6 +366,7 @@ impl TokenStore {
             claims_decoder: None,
             persistence: None,
             opaque_index: Arc::new(RwLock::new(OpaqueIndex::default())),
+            grant_refresh_index: Arc::new(RwLock::new(HashMap::new())),
             mutation_lock: Arc::new(Mutex::new(())),
             bearer_validation: None,
             introspection_not_permitted: Arc::new(AtomicBool::new(false)),
@@ -1128,6 +1133,61 @@ impl TokenStore {
         }
         self.hydrate_opaque(&session_id, mapping).await;
         Some(session_id)
+    }
+
+    /// Index a passthrough grant by its refresh token, so a later
+    /// `grant_type=refresh_token` exchange can find the entry it supersedes.
+    ///
+    /// The raw refresh token is never used as a key: it is hashed the same way
+    /// `credential_session_key` hashes a bearer.
+    pub async fn index_grant_refresh(&self, refresh_token: &str, session_key: &str) {
+        let _mutation = self.mutation_lock.lock().await;
+        let key = credential_session_key(refresh_token);
+
+        self.grant_refresh_index
+            .write()
+            .await
+            .insert(key.clone(), session_key.to_string());
+
+        if let Some(ref backend) = self.persistence {
+            persist_raw(
+                backend,
+                NS_GRANT_REFRESH,
+                &key,
+                session_key.as_bytes(),
+                Some(OPAQUE_REFRESH_TTL),
+            )
+            .await;
+        }
+    }
+
+    /// Resolve a refresh token to the grant session key it was issued with.
+    ///
+    /// On a memory miss, falls back to persistence (read-through) so an instance
+    /// that did not serve the original exchange can still clean up after it.
+    pub async fn resolve_grant_refresh(&self, refresh_token: &str) -> Option<String> {
+        let key = credential_session_key(refresh_token);
+        if let Some(session_key) = self.grant_refresh_index.read().await.get(&key).cloned() {
+            return Some(session_key);
+        }
+        let session_key = self.load_inverse(NS_GRANT_REFRESH, &key).await?;
+        self.grant_refresh_index
+            .write()
+            .await
+            .insert(key, session_key.clone());
+        Some(session_key)
+    }
+
+    /// Drop the index entry for a refresh token (in memory and persisted).
+    pub async fn remove_grant_refresh(&self, refresh_token: &str) {
+        let _mutation = self.mutation_lock.lock().await;
+        let key = credential_session_key(refresh_token);
+        self.grant_refresh_index.write().await.remove(&key);
+        if let Some(ref backend) = self.persistence
+            && let Err(e) = backend.delete(NS_GRANT_REFRESH, &key).await
+        {
+            tracing::warn!("Failed to delete persisted grant refresh index: {e}");
+        }
     }
 
     /// Read an inverse-index entry (`opaque token → session_id`) from persistence.

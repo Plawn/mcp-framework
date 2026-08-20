@@ -236,7 +236,20 @@ async fn passthrough_token_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Result<axum::response::Response, HttpError> {
-    let (mut params, _grant_type) = read_token_request(body, &headers).await?;
+    let (mut params, grant_type) = read_token_request(body, &headers).await?;
+
+    // On a refresh grant, remember which refresh token is being spent: Keycloak
+    // rotates it away, so the entry it belongs to must not outlive this
+    // exchange (see the cleanup below).
+    let spent_refresh_token = (grant_type == "refresh_token")
+        .then(|| {
+            params
+                .iter()
+                .find(|(k, _)| k == "refresh_token")
+                .map(|(_, v)| v.clone())
+        })
+        .flatten();
+
     inject_keycloak_credentials(&mut params, &state);
 
     let (status, response_headers, response_body) = forward_to_keycloak(&state, &params).await?;
@@ -260,9 +273,32 @@ async fn passthrough_token_handler(
             // recomputes from the bearer it receives, so it can adopt the
             // `refresh_token` captured here.
             let session_key = credential_session_key(access_token);
+
+            // Retire the superseded grant *before* storing the new one. Its
+            // refresh token has just been rotated away by Keycloak, but the
+            // entry stayed adoptable by `bearer_auth_middleware`, which would
+            // then drive a refresh into `invalid_grant` → a spurious 401.
+            //
+            // The key hashes the access token, so a rotation currently always
+            // yields a different one; a claims-derived identity (`sid`/`sub`)
+            // would map both grants onto the same key. The removal is skipped in
+            // that case rather than deleting the grant this exchange is about to
+            // write. Only the *spent* refresh token's index entry is dropped;
+            // the new one is written below.
+            if let Some(ref spent) = spent_refresh_token {
+                if let Some(old_key) = state.token_store.resolve_grant_refresh(spent).await
+                    && old_key != session_key
+                {
+                    tracing::debug!("Removing superseded passthrough grant '{}'", old_key);
+                    state.token_store.remove_token(&old_key).await;
+                }
+                state.token_store.remove_grant_refresh(spent).await;
+            }
+
+            let refresh_token = json["refresh_token"].as_str().map(|s| s.to_string());
             let stored = StoredToken {
                 access_token: access_token.to_string(),
-                refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+                refresh_token: refresh_token.clone(),
                 expires_at: json["expires_in"]
                     .as_u64()
                     .map(|secs| Instant::now() + Duration::from_secs(secs)),
@@ -272,6 +308,12 @@ async fn passthrough_token_handler(
                 .token_store
                 .store_token(session_key.clone(), stored)
                 .await;
+            if let Some(ref refresh_token) = refresh_token {
+                state
+                    .token_store
+                    .index_grant_refresh(refresh_token, &session_key)
+                    .await;
+            }
             tracing::debug!("Stored token for session '{}'", session_key);
         }
     } else {
