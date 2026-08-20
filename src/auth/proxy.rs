@@ -272,6 +272,14 @@ async fn passthrough_token_handler(
             // one. The credential-derived key is what `bearer_auth_middleware`
             // recomputes from the bearer it receives, so it can adopt the
             // `refresh_token` captured here.
+            //
+            // The key comes from the token's `sid`/`sub` claims, not its bytes,
+            // so a `refresh_token` grant for the same SSO session **replaces**
+            // this entry rather than adding a sibling: the store keeps exactly
+            // one live entry per grant, and its `refresh_token` is always the
+            // most recently issued one (which is what Keycloak's refresh-token
+            // rotation requires). Only a genuinely opaque, non-JWT access token
+            // still falls back to a per-bytes key.
             let session_key = credential_session_key(access_token);
 
             // Retire the superseded grant *before* storing the new one. Its
