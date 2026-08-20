@@ -5,22 +5,53 @@ use serde_json::Value;
 
 /// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object,
 /// and recursively sanitize the entire schema tree:
-/// - Removes `$schema` and `title` at every nesting level.
+/// - Removes `$schema` and `title` at every nesting level. `title` is folded
+///   into `description` first when there is no description — it is sometimes
+///   the only documentation a type carries, and dropping it outright loses it
+///   for good (see [`fold_title_into_description`]).
 /// - Replaces boolean `true` schemas with `{}` — schemars emits `true` for
 ///   `serde_json::Value` (the "accept anything" schema), but strict MCP clients
 ///   like dust.tt reject boolean schemas and expect objects.
 fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
     schema.remove("$schema");
-    schema.remove("title");
+    fold_title_into_description(schema);
 
     for value in schema.values_mut() {
         sanitize_value_recursive(value);
     }
 }
 
+/// Remove `title` from a schema node, promoting it to `description` when the
+/// node has none.
+///
+/// `title` is stripped because MCP clients do not expect schemars' meta-fields,
+/// but a `title` with no `description` next to it is the only doc the client
+/// would ever see for that node — a `#[schemars(title = "...")]`, or a type name
+/// that at least says what the value is. Once a `description` is present, the
+/// title adds nothing and goes away as before.
+fn fold_title_into_description(map: &mut serde_json::Map<String, Value>) {
+    let Some(title) = map.remove("title") else {
+        return;
+    };
+    let Value::String(ref title_str) = title else {
+        return;
+    };
+    if title_str.trim().is_empty() {
+        return;
+    }
+    let has_description = map
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(|d| !d.trim().is_empty());
+    if !has_description {
+        map.insert("description".to_string(), title);
+    }
+}
+
 /// Walk a JSON value and clean up schema nodes:
 /// - `true` → `{}` (boolean schema → empty object schema)
-/// - Objects get `$schema`/`title` removed, then recurse into their values
+/// - Objects get `$schema` removed and `title` folded into `description`
+///   (then removed), before recursing into their values
 /// - Arrays recurse into each element
 fn sanitize_value_recursive(value: &mut Value) {
     match value {
@@ -29,7 +60,7 @@ fn sanitize_value_recursive(value: &mut Value) {
         }
         Value::Object(map) => {
             map.remove("$schema");
-            map.remove("title");
+            fold_title_into_description(map);
             for v in map.values_mut() {
                 sanitize_value_recursive(v);
             }
@@ -343,6 +374,66 @@ fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Optio
     Some(parts.join(" · "))
 }
 
+/// Report every documentation deficit of a tool, as human-readable findings.
+///
+/// A tool or a parameter with no description is not an error — the MCP call
+/// still works — which is exactly why it goes unnoticed: the only symptom is an
+/// LLM that picks the wrong tool or the wrong argument. The findings surface at
+/// registration, where the author can still act on them.
+///
+/// Pure on purpose: [`warn_missing_descriptions`] does the logging, so the rule
+/// itself is testable without capturing `tracing` output.
+///
+/// Run **after** sanitization, so a `title` folded into `description` counts as
+/// documentation and does not produce a spurious finding.
+fn audit_descriptions(tool: &Tool) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    let documented = tool
+        .description
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty());
+    if !documented {
+        findings.push("the tool itself has no description".to_string());
+    }
+
+    if let Some(Value::Object(props)) = tool.input_schema.get("properties") {
+        let undocumented: Vec<&str> = props
+            .iter()
+            .filter(|(_, schema)| {
+                !schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| !d.trim().is_empty())
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !undocumented.is_empty() {
+            findings.push(format!(
+                "parameters without a description: {}",
+                undocumented.join(", ")
+            ));
+        }
+    }
+
+    findings
+}
+
+/// Log [`audit_descriptions`] findings as a single aggregated warning per tool,
+/// so a server with many under-documented tools stays readable.
+fn warn_missing_descriptions(tool: &Tool) {
+    let findings = audit_descriptions(tool);
+    if findings.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        tool = %tool.name,
+        findings = %findings.join("; "),
+        "Tool documentation is incomplete — the LLM sees exactly what tools/list \
+         exposes. Add a /// doc comment on the tool and on each parameter field."
+    );
+}
+
 /// Sanitize tool schemas for MCP client compatibility.
 ///
 /// 1. Strips `$schema` and `title` keys that schemars 1.x injects — many MCP
@@ -356,6 +447,8 @@ fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Optio
 /// 4. Ensures every input schema contains `"type": "object"` — some parameter
 ///    types (e.g. `serde_json::Value`) produce schemas without a `"type"` key,
 ///    which causes clients to silently reject the tool.
+/// 5. Warns about every tool or parameter left without a description, once the
+///    schema is final (see [`audit_descriptions`]).
 pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool]) {
     for tool in tools.iter_mut() {
         // ── input_schema ───────────────────────────────────────────
@@ -384,6 +477,10 @@ pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool]) {
             inline_defs(os);
             flatten_top_level_combinator(os);
         }
+
+        // Last: the audit reads the sanitized schema, so a `title` folded into
+        // a `description` counts as documentation.
+        warn_missing_descriptions(tool);
     }
 }
 

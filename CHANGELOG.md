@@ -51,6 +51,23 @@ A tool handler now knows which session its call came from. Without it, every
 tool needing that fact becomes one more special case in the application's
 wiring.
 
+### Added — a documentation audit at tool registration, and a `title` fallback
+
+Tool and parameter descriptions come from `///` doc comments (via schemars) or
+from the manual `Tool::new` argument. Nothing flagged a tool or a property left
+without one — the call still works, and the only symptom is an LLM picking the
+wrong tool or the wrong argument.
+
+- `audit_descriptions(&Tool) -> Vec<String>` reports the deficits (the tool
+  itself, then one aggregated finding listing the undocumented parameters);
+  `warn_missing_descriptions` logs them as a single `tracing::warn!` per tool,
+  alongside the existing "missing type" warning. The rule is pure, so it is
+  tested without capturing `tracing` output.
+- `title` is no longer dropped outright: it is folded into `description` when
+  the node has none, at every nesting level, and still stripped when a
+  description is already there. It was sometimes the only doc a type carried.
+  The audit runs after sanitization, so a folded title counts as documentation.
+
 ### Fixed — descriptions survive the tagged-enum flattening
 
 `sanitize_tool_schemas` flattens the root-level `oneOf` schemars emits for

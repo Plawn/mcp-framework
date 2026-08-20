@@ -513,3 +513,159 @@ fn flatten_discriminant_description_falls_back_to_undocumented_variants() {
     // A variant with no doc contributes just its value.
     assert_eq!(action["description"], "`add`: Add something. · `remove`");
 }
+
+// ── 919: title fallback + documentation audit ──────────────────────
+
+#[test]
+fn folds_title_into_description_when_absent() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "title": "SearchParams",
+        "properties": {
+            "query": { "type": "string", "title": "Full-text query" },
+            "items": {
+                "type": "array",
+                "items": { "type": "object", "title": "A single hit" }
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let patched = tools[0].input_schema.as_ref();
+
+    // `title` is still gone at every level — but its text survives.
+    assert!(!patched.contains_key("title"));
+    assert_eq!(patched["description"], "SearchParams");
+
+    let query = patched["properties"]["query"].as_object().unwrap();
+    assert!(!query.contains_key("title"));
+    assert_eq!(query["description"], "Full-text query");
+
+    let item = patched["properties"]["items"]["items"].as_object().unwrap();
+    assert!(!item.contains_key("title"));
+    assert_eq!(item["description"], "A single hit");
+}
+
+#[test]
+fn strips_title_when_description_is_present() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "title": "SearchParams",
+        "description": "Search the corpus.",
+        "properties": {
+            "query": {
+                "type": "string",
+                "title": "Full-text query",
+                "description": "What to look for."
+            },
+            "blank": { "type": "string", "title": "   ", "description": "Kept." }
+        }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let patched = tools[0].input_schema.as_ref();
+
+    assert!(!patched.contains_key("title"));
+    assert_eq!(patched["description"], "Search the corpus.");
+
+    let query = patched["properties"]["query"].as_object().unwrap();
+    assert!(!query.contains_key("title"));
+    assert_eq!(query["description"], "What to look for.");
+
+    // A blank title is dropped, never promoted over nothing.
+    let blank = patched["properties"]["blank"].as_object().unwrap();
+    assert!(!blank.contains_key("title"));
+    assert_eq!(blank["description"], "Kept.");
+}
+
+#[test]
+fn blank_title_is_not_promoted() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "a": { "type": "string", "title": "  " } }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+
+    let a = tools[0].input_schema.as_ref()["properties"]["a"]
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(!a.contains_key("title"));
+    assert!(!a.contains_key("description"));
+}
+
+#[test]
+fn audit_reports_missing_tool_and_property_descriptions() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "documented": { "type": "string", "description": "Fine." },
+            "bare": { "type": "string" },
+            "blank": { "type": "string", "description": "   " }
+        }
+    }))
+    .unwrap();
+
+    let mut tool = make_tool("t", schema);
+    tool.description = None;
+
+    assert_eq!(
+        audit_descriptions(&tool),
+        vec![
+            "the tool itself has no description".to_string(),
+            "parameters without a description: bare, blank".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn audit_is_silent_on_a_fully_documented_tool() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "query": { "type": "string", "description": "What to look for." } }
+    }))
+    .unwrap();
+
+    let tool = make_tool("search", schema);
+    assert!(tool.description.is_some());
+    assert!(audit_descriptions(&tool).is_empty());
+}
+
+#[test]
+fn audit_accepts_a_description_folded_from_a_title() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": { "query": { "type": "string", "title": "Full-text query" } }
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("search", schema)];
+    // Before sanitization the title is not yet documentation.
+    assert_eq!(
+        audit_descriptions(&tools[0]),
+        vec!["parameters without a description: query".to_string()],
+    );
+
+    sanitize_tool_schemas(&mut tools);
+    assert!(audit_descriptions(&tools[0]).is_empty());
+}
+
+#[test]
+fn audit_reports_a_schema_with_no_properties_only_for_the_tool() {
+    let mut tool = make_tool("t", serde_json::Map::new());
+    tool.description = None;
+    let mut tools = vec![tool];
+    sanitize_tool_schemas(&mut tools);
+
+    assert_eq!(
+        audit_descriptions(&tools[0]),
+        vec!["the tool itself has no description".to_string()],
+    );
+}

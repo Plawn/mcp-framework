@@ -361,6 +361,48 @@ registry.add_tool(tool, |args| async {
 
 The HTML bundle runs in an isolated iframe — it does not receive the tool call arguments or result automatically. To pass data, embed it in the HTML at build time (e.g. template variables in the Vite build), or use a convention like a `<script id="data">` tag populated by the resource handler. The current implementation serves the HTML as a static string; dynamic per-call rendering would require creating a unique resource per invocation.
 
+### Tool schema sanitization (`src/capability/sanitize.rs`)
+
+`sanitize_tool_schemas` rewrites every `Tool` on its way to `tools/list`, so the
+schema schemars emits is one an MCP client actually accepts. It runs, in order:
+
+1. **`$schema` / `title` stripping** at every nesting level. `title` is *folded
+   into `description`* first when the node has none — a `#[schemars(title =
+   "...")]` or a type name is sometimes the only documentation there is, and it
+   is what the LLM would otherwise never see. Once a `description` is present,
+   the title is dropped as before.
+2. **`$defs` inlining** — `$ref` pointers are resolved recursively, sibling keys
+   merged per JSON Schema semantics (`properties` deep-merged, `required`
+   unioned, everything else overriding).
+3. **Root-level `oneOf` / `anyOf` / `allOf` flattening** — the Anthropic API
+   rejects a combinator at the root of `input_schema`, and schemars emits one
+   for every `#[serde(tag = "...")]` tagged enum. The variants' properties are
+   merged into one flat object with a synthesized `string` `enum` discriminator.
+4. **`"type": "object"` patching** for schemas that have no `type` (e.g. a
+   `serde_json::Value` parameter), with a `tracing::warn!`.
+5. **A documentation audit** (`audit_descriptions`), warned once per tool.
+
+**Flattening keeps the documentation.** Flattening is lossy by nature — runtime
+`serde` still enforces the real per-variant contract, but the schema can no
+longer express it. What it must *not* lose is what `tools/list` exposes as prose:
+
+- the synthesized discriminator carries the composed variant docs,
+  ``` `add`: Add a note · `remove`: Remove a note ``` (an undocumented variant
+  contributes just its value; if none is documented, no description is invented
+  — the `enum` already lists the values);
+- every other property states the variants that require it, appended to its own
+  description: `Required when action=add, remove.` This is the only place the
+  per-variant `required` survives;
+- a property name shared by several variants still resolves first-wins, but a
+  description from a later variant fills in for a missing one.
+
+**The audit** is a pure `audit_descriptions(&Tool) -> Vec<String>`; the logging
+lives in its caller `warn_missing_descriptions`, so the rule is testable without
+capturing `tracing` output. It reports a tool with no `description`, and — in a
+single aggregated finding, to keep the log readable on a large server — the
+input-schema properties that have none. It runs **after** sanitization, so a
+description folded from a `title` counts as documentation.
+
 ### Persistence layer (`src/persistence.rs`)
 
 `PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:
