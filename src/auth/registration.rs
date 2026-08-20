@@ -87,8 +87,8 @@ pub async fn register_handler(
     );
 
     // See `build_fallback_registration`.
-    let fallback_client_id = (!state.token_mode.is_stateful())
-        .then(|| state.keycloak_client_id.clone());
+    let fallback_client_id =
+        (!state.token_mode.is_stateful()).then(|| state.keycloak_client_id.clone());
 
     tracing::info!(
         "DCR request for client: {:?}, redirects: {:?}",

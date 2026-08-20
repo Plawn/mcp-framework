@@ -10,14 +10,15 @@ use crate::audit::ToolCallLogger;
 use crate::auth::{
     AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig,
     OAuthState, RefreshConfig, TokenStore, WellKnownState, authorization_server_metadata_handler,
-    basic_auth_middleware, bearer_auth_middleware, mcp_oauth_router, oauth_router,
-    protected_resource_metadata_handler, strip_framework_session_header,
+    basic_auth_middleware, bearer_auth_middleware, mcp_oauth_router, not_proxied_handler,
+    oauth_router, protected_resource_metadata_handler, strip_framework_session_header,
 };
 use crate::capability::{
     AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
 };
 use crate::constants::{
-    CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, HTTP_REQUEST_TIMEOUT, OAUTH_MOUNT,
+    CLEANUP_INTERVAL, GRACEFUL_SHUTDOWN_TIMEOUT, HTTP_REQUEST_TIMEOUT, OAUTH_CALLBACK_PATH,
+    OAUTH_LOGIN_PATH, OAUTH_MOUNT, OAUTH_STATUS_PATH,
 };
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
@@ -158,7 +159,12 @@ fn setup_oauth_routes(
         };
         mcp_oauth_router(mcp_oauth_state.clone()).merge(oauth_router(oauth_state))
     } else {
-        mcp_oauth_router(mcp_oauth_state.clone())
+        mcp_oauth_router(mcp_oauth_state.clone()).merge(
+            Router::new()
+                .route(OAUTH_LOGIN_PATH, get(not_proxied_handler))
+                .route(OAUTH_CALLBACK_PATH, get(not_proxied_handler))
+                .route(OAUTH_STATUS_PATH, get(not_proxied_handler)),
+        )
     };
 
     Router::new()
@@ -416,9 +422,7 @@ where
                 public_url
             );
             if oauth_config.token_mode.is_stateful() {
-                tracing::info!(
-                    "OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token"
-                );
+                tracing::info!("OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token");
                 tracing::info!("Legacy OAuth:    /oauth/login, /oauth/callback, /oauth/status");
             } else {
                 tracing::info!("OAuth endpoints: /oauth/register (DCR translation only)");

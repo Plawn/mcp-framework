@@ -20,6 +20,7 @@ pub use jwks::{JwksRejection, JwksValidator, ValidatedJwt};
 pub use metadata::{
     WellKnownState, authorization_server_metadata_handler, protected_resource_metadata_handler,
 };
+pub use proxy::not_proxied_handler;
 pub use routes::{OAuthState, oauth_router};
 pub use store::{ClaimsDecoderFn, RefreshConfig, StoredToken, TokenStore};
 
@@ -78,15 +79,22 @@ impl McpOAuthState {
 /// - `/oauth/register` stays: Keycloak's `clients-registrations` endpoint sends
 ///   no CORS headers, so a browser-based MCP client cannot perform dynamic
 ///   client registration against it directly.
+///
+/// The two retired paths answer `404` with a reason rather than being left out
+/// of the router — see [`proxy::not_proxied_handler`].
 pub fn mcp_oauth_router(state: McpOAuthState) -> Router {
     let stateful = state.token_mode.is_stateful();
-    let mut router = Router::new().route(OAUTH_REGISTER_PATH, post(registration::register_handler));
+    let router = Router::new().route(OAUTH_REGISTER_PATH, post(registration::register_handler));
 
-    if stateful {
-        router = router
+    let router = if stateful {
+        router
             .route(OAUTH_AUTHORIZE_PATH, get(proxy::authorize_handler))
-            .route(OAUTH_TOKEN_PATH, post(proxy::token_handler));
-    }
+            .route(OAUTH_TOKEN_PATH, post(proxy::token_handler))
+    } else {
+        router
+            .route(OAUTH_AUTHORIZE_PATH, get(proxy::not_proxied_handler))
+            .route(OAUTH_TOKEN_PATH, post(proxy::not_proxied_handler))
+    };
 
     router.with_state(Arc::new(state))
 }

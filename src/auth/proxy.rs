@@ -213,6 +213,23 @@ fn build_passthrough_response(
     builder.body(axum::body::Body::from(body.to_vec())).unwrap()
 }
 
+/// Answer for the OAuth endpoints a pure resource server does not proxy.
+///
+/// They are mounted rather than simply left out: an unmounted path falls
+/// through to the auth-wrapped MCP fallback and answers `401`, which tells a
+/// client that its credentials were wrong when the truth is that the endpoint
+/// does not exist here. `404` plus a reason is what a misconfigured client
+/// needs to read in a log.
+pub async fn not_proxied_handler() -> HttpError {
+    HttpError::oauth_error(
+        axum::http::StatusCode::NOT_FOUND,
+        "invalid_request",
+        "This server is a pure OAuth resource server (MCP_TOKEN_MODE=resource_server) and \
+         proxies no part of the authorization flow. Use the endpoints advertised by the \
+         authorization server named in this server's protected-resource metadata.",
+    )
+}
+
 /// Handler for `/oauth/token` — proxies to Keycloak.
 ///
 /// Dispatches to [`passthrough_token_handler`] or [`opaque_token_handler`]

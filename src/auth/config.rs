@@ -114,13 +114,11 @@ impl OAuthConfig {
         }
 
         if self.unknown_token_validation == UnknownTokenValidation::Reject {
-            return Err(
-                "MCP_TOKEN_MODE=resource_server is incompatible with \
+            return Err("MCP_TOKEN_MODE=resource_server is incompatible with \
                  OAUTH_UNKNOWN_TOKEN_VALIDATION=reject: every bearer is an 'unknown' bearer in \
                  resource-server mode (the framework issues none), so nothing would ever be \
                  accepted. Use jwks (recommended), or jwks_then_introspection."
-                    .to_string(),
-            );
+                .to_string());
         }
 
         Ok(())
