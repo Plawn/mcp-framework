@@ -14,6 +14,7 @@ use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use super::sanitize::{DescriptionAudit, audit_tool_at_registration};
 use crate::constants::NS_CAP_VERSIONS;
 use crate::persistence::{PersistenceBackend, PersistenceError, persist};
 
@@ -104,6 +105,9 @@ pub struct CapabilityRegistry {
     version: Arc<AtomicU64>,
     session_versions: Arc<RwLock<HashMap<String, u64>>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
+    /// Shared with `DynamicHandler`, so a tool audited here at registration is
+    /// not audited again on every `tools/list`.
+    description_audit: DescriptionAudit,
 }
 
 impl CapabilityRegistry {
@@ -117,7 +121,13 @@ impl CapabilityRegistry {
             version: Arc::new(AtomicU64::new(empty_capability_hash())),
             session_versions: Arc::new(RwLock::new(HashMap::new())),
             persistence: None,
+            description_audit: DescriptionAudit::new(),
         }
+    }
+
+    /// The documentation audit shared between registration and `tools/list`.
+    pub(crate) fn description_audit(&self) -> &DescriptionAudit {
+        &self.description_audit
     }
 
     // ── Versioning ──────────────────────────────────────────────────
@@ -222,6 +232,7 @@ impl CapabilityRegistry {
     {
         let name = tool.name.to_string();
         let handler: StoredHandler = Arc::new(move |args, _ctx| Box::pin(handler(args)));
+        audit_tool_at_registration(&tool, &self.description_audit);
         self.tools.write().await.insert(name, (tool, handler));
         self.recompute_version().await;
         self.notify_peers(NotifyKind::Tools).await;
@@ -242,6 +253,7 @@ impl CapabilityRegistry {
                 ))
             }),
         });
+        audit_tool_at_registration(&tool, &self.description_audit);
         self.tools.write().await.insert(name, (tool, handler));
         self.recompute_version().await;
         self.notify_peers(NotifyKind::Tools).await;

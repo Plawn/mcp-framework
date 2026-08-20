@@ -1,26 +1,70 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use rmcp::model::Tool;
 use serde_json::Value;
 
+/// A string value that is present *and* not blank.
+///
+/// Blank means missing, everywhere: a `description` of `"   "` documents
+/// nothing, so it must not win over a real one on a collision, nor satisfy
+/// [`audit_descriptions`], nor block a `title` from being folded in. One helper
+/// keeps every one of those decisions on the same rule.
+fn nonblank(value: Option<&Value>) -> Option<&str> {
+    value?.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// The `description` of a schema node, when it is a non-blank string.
+fn nonblank_description(node: &Value) -> Option<&str> {
+    nonblank(node.get("description"))
+}
+
 /// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object,
 /// and recursively sanitize the entire schema tree:
-/// - Removes `$schema` and `title` at every nesting level.
+/// - Removes `$schema` and `title` at every nesting level. `title` is folded
+///   into `description` first when there is no description — it is sometimes
+///   the only documentation a type carries, and dropping it outright loses it
+///   for good (see [`fold_title_into_description`]).
 /// - Replaces boolean `true` schemas with `{}` — schemars emits `true` for
 ///   `serde_json::Value` (the "accept anything" schema), but strict MCP clients
 ///   like dust.tt reject boolean schemas and expect objects.
 fn strip_meta_fields(schema: &mut serde_json::Map<String, Value>) {
     schema.remove("$schema");
-    schema.remove("title");
+    fold_title_into_description(schema);
 
     for value in schema.values_mut() {
         sanitize_value_recursive(value);
     }
 }
 
+/// Remove `title` from a schema node, promoting it to `description` when the
+/// node has none.
+///
+/// `title` is stripped because MCP clients do not expect schemars' meta-fields,
+/// but a `title` with no `description` next to it is the only doc the client
+/// would ever see for that node — a `#[schemars(title = "...")]`, or a type name
+/// that at least says what the value is. Once a `description` is present, the
+/// title adds nothing and goes away as before.
+fn fold_title_into_description(map: &mut serde_json::Map<String, Value>) {
+    let Some(title) = map.remove("title") else {
+        return;
+    };
+    let Value::String(ref title_str) = title else {
+        return;
+    };
+    if title_str.trim().is_empty() {
+        return;
+    }
+    if nonblank(map.get("description")).is_none() {
+        map.insert("description".to_string(), title);
+    }
+}
+
 /// Walk a JSON value and clean up schema nodes:
 /// - `true` → `{}` (boolean schema → empty object schema)
-/// - Objects get `$schema`/`title` removed, then recurse into their values
+/// - Objects get `$schema` removed and `title` folded into `description`
+///   (then removed), before recursing into their values
 /// - Arrays recurse into each element
 fn sanitize_value_recursive(value: &mut Value) {
     match value {
@@ -29,7 +73,7 @@ fn sanitize_value_recursive(value: &mut Value) {
         }
         Value::Object(map) => {
             map.remove("$schema");
-            map.remove("title");
+            fold_title_into_description(map);
             for v in map.values_mut() {
                 sanitize_value_recursive(v);
             }
@@ -148,6 +192,18 @@ fn inline_defs(schema: &mut serde_json::Map<String, Value>) {
 /// enforces the full per-variant contract, so no actual validation is lost —
 /// only the LLM loses a visibility aid.
 ///
+/// Documentation is **not** lost in the process:
+/// - each variant's `description` (its `///` doc comment) is composed into the
+///   synthesized discriminator's description, as
+///   ``` `add`: <doc> · `remove`: <doc> ``` (a variant with no doc contributes
+///   just its value);
+/// - every non-discriminator property gets the variants that require it appended
+///   to its description (`Required when action=add, remove.`) — the only place
+///   the per-variant `required` can survive the flattening;
+/// - when the same property name appears in several variants, the first
+///   occurrence is kept, but a description from a later variant fills in for a
+///   missing one.
+///
 /// For combinators without a discriminator, we fall back to a plain property
 /// union with no `required` fields.
 fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
@@ -165,7 +221,14 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
 
     let mut merged_props = serde_json::Map::new();
     let mut tag_key: Option<String> = None;
-    let mut tag_values: Vec<Value> = Vec::new();
+    // `(discriminant value, variant description)`, in variant order.
+    let mut tag_entries: Vec<(Value, Option<Value>)> = Vec::new();
+    // A description carried by the discriminator property itself (rather than by
+    // the variant); used as a fallback when no variant is documented.
+    let mut tag_prop_description: Option<String> = None;
+    // Non-discriminator property → discriminant values of the variants that
+    // list it in `required`, in variant order.
+    let mut required_by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
 
     for variant in &variants {
         let Some(v_obj) = variant.as_object() else {
@@ -175,34 +238,101 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
             continue;
         };
 
+        // First pass: identify this variant's discriminant value, so the second
+        // pass can attribute per-variant `required` to it regardless of the
+        // order properties happen to be iterated in.
+        let mut variant_tag: Option<Value> = None;
         for (prop_name, prop_schema) in v_props {
             // A property with a `const` value is the tagged-enum discriminator.
-            if let Some(const_val) = prop_schema.get("const") {
-                if tag_key.is_none() {
-                    tag_key = Some(prop_name.clone());
+            let Some(const_val) = prop_schema.get("const") else {
+                continue;
+            };
+            if tag_key.is_none() {
+                tag_key = Some(prop_name.clone());
+            }
+            if tag_key.as_deref() != Some(prop_name.as_str()) {
+                continue;
+            }
+            variant_tag = Some(const_val.clone());
+            if tag_prop_description.is_none()
+                && let Some(d) = nonblank_description(prop_schema)
+            {
+                tag_prop_description = Some(d.to_string());
+            }
+            if !tag_entries.iter().any(|(v, _)| v == const_val) {
+                tag_entries.push((const_val.clone(), v_obj.get("description").cloned()));
+            }
+        }
+
+        let variant_required: Vec<&str> = v_obj
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        // Second pass: merge the non-discriminator properties.
+        for (prop_name, prop_schema) in v_props {
+            if prop_schema.get("const").is_some() {
+                continue;
+            }
+
+            match merged_props.entry(prop_name.clone()) {
+                serde_json::map::Entry::Vacant(slot) => {
+                    slot.insert(prop_schema.clone());
                 }
-                if tag_key.as_deref() == Some(prop_name.as_str()) && !tag_values.contains(const_val)
-                {
-                    tag_values.push(const_val.clone());
+                // Homonymous property across variants: first wins, but never at
+                // the cost of a description the retained entry does not have.
+                serde_json::map::Entry::Occupied(mut slot) => {
+                    if nonblank_description(slot.get()).is_none()
+                        && let Some(new_description) =
+                            nonblank_description(prop_schema).map(str::to_string)
+                        && let Some(kept) = slot.get_mut().as_object_mut()
+                    {
+                        kept.insert("description".to_string(), Value::String(new_description));
+                    }
                 }
-            } else {
-                merged_props
-                    .entry(prop_name.clone())
-                    .or_insert_with(|| prop_schema.clone());
+            }
+
+            if let Some(tag) = variant_tag.as_ref()
+                && variant_required.contains(&prop_name.as_str())
+            {
+                let label = value_label(tag);
+                let entry = required_by.entry(prop_name.clone()).or_default();
+                if !entry.contains(&label) {
+                    entry.push(label);
+                }
             }
         }
     }
 
     let mut required: Vec<Value> = Vec::new();
     if let Some(ref tk) = tag_key {
-        merged_props.insert(
-            tk.clone(),
-            serde_json::json!({
-                "type": "string",
-                "enum": tag_values,
-            }),
-        );
+        let mut discriminant = serde_json::json!({
+            "type": "string",
+            "enum": tag_entries.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
+        });
+        if let Some(description) = compose_discriminant_description(&tag_entries)
+            .or(tag_prop_description)
+            && let Some(obj) = discriminant.as_object_mut()
+        {
+            obj.insert("description".to_string(), Value::String(description));
+        }
+        merged_props.insert(tk.clone(), discriminant);
         required.push(Value::String(tk.clone()));
+
+        // Re-attach the per-variant `required` as prose on each property, since
+        // the flattened schema can only advertise the discriminator as required.
+        for (prop_name, tags) in &required_by {
+            let Some(Value::Object(prop)) = merged_props.get_mut(prop_name) else {
+                continue;
+            };
+            let suffix = format!("Required when {tk}={}.", tags.join(", "));
+            let merged = match nonblank(prop.get("description")) {
+                Some(existing) => format!("{} {suffix}", existing.trim_end()),
+                None => suffix,
+            };
+            prop.insert("description".to_string(), Value::String(merged));
+        }
     }
 
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -212,6 +342,169 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
     } else {
         schema.insert("required".to_string(), Value::Array(required));
     }
+}
+
+/// Render a discriminant value for prose: strings unquoted, anything else as JSON.
+fn value_label(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Compose the variant docs into a single description for the synthesized
+/// discriminator: ``` `add`: Add a note · `remove`: Remove a note ```.
+///
+/// Returns `None` when no variant is documented — the enum values alone would
+/// only restate the `enum` keyword.
+fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Option<String> {
+    if !entries
+        .iter()
+        .any(|(_, d)| nonblank(d.as_ref()).is_some())
+    {
+        return None;
+    }
+
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(value, description)| {
+            let label = format!("`{}`", value_label(value));
+            match nonblank(description.as_ref()) {
+                Some(d) => format!("{label}: {}", d.trim()),
+                None => label,
+            }
+        })
+        .collect();
+
+    Some(parts.join(" · "))
+}
+
+/// Report every documentation deficit of a tool, as human-readable findings.
+///
+/// A tool or a parameter with no description is not an error — the MCP call
+/// still works — which is exactly why it goes unnoticed: the only symptom is an
+/// LLM that picks the wrong tool or the wrong argument. The findings surface at
+/// registration, where the author can still act on them.
+///
+/// Pure on purpose: [`DescriptionAudit`] does the logging and the
+/// deduplication, so the rule itself is testable without capturing `tracing`
+/// output.
+///
+/// Run **after** sanitization, so a `title` folded into `description` counts as
+/// documentation and does not produce a spurious finding.
+pub(crate) fn audit_descriptions(tool: &Tool) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    let documented = tool
+        .description
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty());
+    if !documented {
+        findings.push("the tool itself has no description".to_string());
+    }
+
+    if let Some(Value::Object(props)) = tool.input_schema.get("properties") {
+        let undocumented: Vec<&str> = props
+            .iter()
+            .filter(|(_, schema)| nonblank_description(schema).is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !undocumented.is_empty() {
+            findings.push(format!(
+                "parameters without a description: {}",
+                undocumented.join(", ")
+            ));
+        }
+    }
+
+    findings
+}
+
+/// Identity of one *version* of a tool, for the audit's deduplication.
+///
+/// Name alone would silence a tool whose schema later changed; the whole
+/// documented surface (name, description, input schema) is hashed so an edited
+/// tool is audited again, and only then.
+fn tool_version_key(tool: &Tool) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tool.name.hash(&mut hasher);
+    tool.description.hash(&mut hasher);
+    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order`), so this
+    // rendering is stable for a given schema.
+    Value::Object(tool.input_schema.as_ref().clone())
+        .to_string()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Remembers which tool versions have already been audited, so a documentation
+/// deficit is reported **once** rather than on every `tools/list`.
+///
+/// A polling client calls `tools/list` continuously; without this, the audit
+/// would be a log flood instead of a signal. The set is keyed by
+/// [`tool_version_key`], so editing a tool's schema or description makes it
+/// audible again.
+///
+/// It is shared, not global: [`CapabilityRegistry`](super::CapabilityRegistry)
+/// owns one and hands the same instance to `DynamicHandler`. Dynamic tools are
+/// therefore audited at registration — where the author is — and the listing
+/// path finds nothing left to say about them; an inner-handler tool, which only
+/// becomes observable at list time, is audited there, once.
+#[derive(Clone, Default)]
+pub(crate) struct DescriptionAudit {
+    seen: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl DescriptionAudit {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Audit `tool` unless this exact version was audited before.
+    ///
+    /// `None` means "already seen"; `Some(findings)` is a first look, possibly
+    /// with nothing to report.
+    pub(crate) fn audit(&self, tool: &Tool) -> Option<Vec<String>> {
+        let key = tool_version_key(tool);
+        let first_time = match self.seen.lock() {
+            Ok(mut seen) => seen.insert(key),
+            // A poisoned lock must not cost the caller its tool listing; the
+            // worst case is a duplicate warning.
+            Err(poisoned) => poisoned.into_inner().insert(key),
+        };
+        first_time.then(|| audit_descriptions(tool))
+    }
+
+    /// Audit and log: a single aggregated warning per tool, so a server with
+    /// many under-documented tools stays readable.
+    pub(crate) fn warn(&self, tool: &Tool) {
+        let Some(findings) = self.audit(tool) else {
+            return;
+        };
+        if findings.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            tool = %tool.name,
+            findings = %findings.join("; "),
+            "Tool documentation is incomplete — the LLM sees exactly what tools/list \
+             exposes. Add a /// doc comment on the tool and on each parameter field."
+        );
+    }
+}
+
+/// Audit a tool the moment it is registered, rather than waiting for a client
+/// to list it — a tool that is registered but never listed would otherwise
+/// never be checked at all.
+///
+/// The audit must see the schema `tools/list` will actually expose (a `title`
+/// folded into a `description` counts as documentation), so it runs on a
+/// throwaway sanitized copy. That copy is also what the listing path will hash,
+/// which is what makes the deduplication line up across the two entry points.
+pub(crate) fn audit_tool_at_registration(tool: &Tool, audit: &DescriptionAudit) {
+    let mut copy = tool.clone();
+    sanitize_one(&mut copy);
+    audit.warn(&copy);
 }
 
 /// Sanitize tool schemas for MCP client compatibility.
@@ -227,35 +520,55 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
 /// 4. Ensures every input schema contains `"type": "object"` — some parameter
 ///    types (e.g. `serde_json::Value`) produce schemas without a `"type"` key,
 ///    which causes clients to silently reject the tool.
-pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool]) {
+/// 5. Warns about every tool or parameter left without a description, once the
+///    schema is final and once per tool version (see [`DescriptionAudit`]).
+pub(crate) fn sanitize_tool_schemas(tools: &mut [Tool], audit: &DescriptionAudit) {
     for tool in tools.iter_mut() {
-        // ── input_schema ───────────────────────────────────────────
-        let schema = Arc::make_mut(&mut tool.input_schema);
-        strip_meta_fields(schema);
-        inline_defs(schema);
-        flatten_top_level_combinator(schema);
-
-        if !schema.contains_key("type") {
+        if sanitize_one(tool) {
             tracing::warn!(
                 tool = %tool.name,
                 "Tool input_schema is missing \"type\": \"object\" — patching at runtime. \
                  Consider using mcp_framework::EmptyParams instead of serde_json::Value \
                  for tools with no parameters."
             );
-            schema.insert("type".to_string(), Value::String("object".to_string()));
-            if !schema.contains_key("properties") {
-                schema.insert("properties".to_string(), Value::Object(Default::default()));
-            }
         }
 
-        // ── output_schema ──────────────────────────────────────────
-        if let Some(ref mut output_schema) = tool.output_schema {
-            let os = Arc::make_mut(output_schema);
-            strip_meta_fields(os);
-            inline_defs(os);
-            flatten_top_level_combinator(os);
+        // Last: the audit reads the sanitized schema, so a `title` folded into
+        // a `description` counts as documentation.
+        audit.warn(tool);
+    }
+}
+
+/// Rewrite one tool's schemas in place, silently.
+///
+/// Returns whether `input_schema` had to be patched with `"type": "object"` —
+/// the caller decides whether that deserves a log line, so the registration
+/// audit can reuse this on a throwaway copy without duplicating the warning the
+/// listing path already emits.
+fn sanitize_one(tool: &mut Tool) -> bool {
+    // ── input_schema ───────────────────────────────────────────────
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    strip_meta_fields(schema);
+    inline_defs(schema);
+    flatten_top_level_combinator(schema);
+
+    let patched_type = !schema.contains_key("type");
+    if patched_type {
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+        if !schema.contains_key("properties") {
+            schema.insert("properties".to_string(), Value::Object(Default::default()));
         }
     }
+
+    // ── output_schema ──────────────────────────────────────────────
+    if let Some(ref mut output_schema) = tool.output_schema {
+        let os = Arc::make_mut(output_schema);
+        strip_meta_fields(os);
+        inline_defs(os);
+        flatten_top_level_combinator(os);
+    }
+
+    patched_type
 }
 
 #[cfg(test)]

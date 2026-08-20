@@ -51,6 +51,54 @@ A tool handler now knows which session its call came from. Without it, every
 tool needing that fact becomes one more special case in the application's
 wiring.
 
+### Added — a documentation audit at tool registration, and a `title` fallback
+
+Tool and parameter descriptions come from `///` doc comments (via schemars) or
+from the manual `Tool::new` argument. Nothing flagged a tool or a property left
+without one — the call still works, and the only symptom is an LLM picking the
+wrong tool or the wrong argument.
+
+- `audit_descriptions(&Tool) -> Vec<String>` reports the deficits (the tool
+  itself, then one aggregated finding listing the undocumented parameters);
+  `DescriptionAudit` logs them as a single `tracing::warn!` per tool, alongside
+  the existing "missing type" warning. The rule is pure, so it is tested without
+  capturing `tracing` output.
+- **Dynamic tools are audited at registration**, not only when a client lists
+  them: `add_tool` / `add_tool_with_context` audit a throwaway sanitized copy,
+  so a tool that is registered but never listed is still checked. Inner-handler
+  tools, observable only at list time, keep being audited there.
+- Both paths share the registry's `DescriptionAudit`, which remembers the tool
+  versions it has already reported (hash of name + description + input schema).
+  A polling client no longer turns the audit into a log flood, and an edited
+  tool is audited again.
+- `title` is no longer dropped outright: it is folded into `description` when
+  the node has none, at every nesting level, and still stripped when a
+  description is already there. It was sometimes the only doc a type carried.
+  The audit runs after sanitization, so a folded title counts as documentation.
+
+### Fixed — descriptions survive the tagged-enum flattening
+
+`sanitize_tool_schemas` flattens the root-level `oneOf` schemars emits for
+`#[serde(tag = "...")]` enums, because the Anthropic API rejects a combinator
+at the root of `input_schema`. The flattening used to throw away everything
+`tools/list` exposes as documentation: each variant's doc comment, the
+per-variant `required`, and — on a property name shared by several variants —
+any description the first variant did not happen to carry.
+
+- The synthesized discriminator now carries the composed variant docs:
+  ``` `add`: Add a note · `remove`: Remove a note ``` (an undocumented variant
+  contributes just its value; if no variant is documented, no description is
+  invented).
+- Every other property states the variants that require it:
+  `Required when action=add, remove.`, appended to its own description. This is
+  the only place the per-variant `required` can survive a flat object schema.
+- A homonymous property across variants still resolves first-wins, but a
+  description from a later variant now fills in for a missing one.
+- A blank description counts as no description throughout (one `nonblank`
+  helper): a whitespace-only string on an earlier variant no longer shuts out a
+  real description from a later one, and it is never used as the discriminator's
+  fallback. This is the rule the documentation audit already applied.
+
 ### Dependencies
 
 - added `futures` `0.3` — the `Sink`/`Stream` halves of the loopback transport
