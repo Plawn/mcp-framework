@@ -20,14 +20,16 @@ creation regardless of activity: the first failover past that point answered
 
 - A successful `load` now re-arms the entry's TTL, so a session that has been
   recovered once stays recoverable on the next failover.
-- `PersistenceBackend::touch(ns, key, ttl) -> bool` is the primitive behind
-  it: atomic, and honest about a key that is already gone. A `get` followed by
-  a `set` would have recreated a session a peer had just `DELETE`d.
-  `RedisBackend` maps it to `EXPIRE`, `InMemoryBackend` to a presence check.
-  The default reports `false` without doing anything, so a custom backend that
-  has not implemented it gets **no** transport session recovery rather than
-  an unsafe one — implement `touch` to opt in. A `touch` that errors fails the
-  `load` for the same reason: fail closed, the client re-initializes.
+- `PersistenceBackend::touch(ns, key, ttl) -> Touch` is the primitive behind
+  it: atomic, and honest about a key that is already gone (`Armed` /
+  `Missing`). A `get` followed by a `set` would have recreated a session a
+  peer had just `DELETE`d. `RedisBackend` maps it to `EXPIRE`,
+  `InMemoryBackend` to a presence check. The default answers `Unsupported`
+  without doing anything: a backend written before the method existed keeps
+  restoring sessions exactly as before — it just does not extend their TTL.
+  A `touch` that errors makes `load` answer "unknown session" (a `404` the
+  client answers by re-initializing) rather than an error (a `500` it would
+  retry).
 - `CLAUDE.md` gains a "Transport session recovery" section stating which of
   the three session-keyed stores (`mcp_transport_sessions`, `sessions`,
   `tokens`) owns which data — one mechanism per datum.

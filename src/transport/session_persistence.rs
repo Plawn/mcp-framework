@@ -5,7 +5,7 @@ use rmcp::transport::streamable_http_server::session::store::{
     SessionState, SessionStore, SessionStoreError,
 };
 
-use crate::persistence::PersistenceBackend;
+use crate::persistence::{PersistenceBackend, Touch};
 
 const NS_TRANSPORT_SESSIONS: &str = "mcp_transport_sessions";
 
@@ -43,19 +43,29 @@ impl SessionStore for TransportSessionStore {
         // Re-arm the TTL: this instance is about to own the session, and the
         // next failover must be able to find it too. `touch` is atomic, so a
         // session a peer deleted between the read and this point is reported
-        // gone rather than resurrected with a fresh lifetime. A re-arm that
-        // cannot answer is a failed load: without its verdict the state read
-        // above may belong to a session that no longer exists, and the only
-        // safe outcome is the one rmcp gives an unknown session — the client
-        // re-initializes.
-        if self
+        // gone rather than resurrected with a fresh lifetime.
+        match self
             .backend
             .touch(NS_TRANSPORT_SESSIONS, session_id, self.ttl)
-            .await?
+            .await
         {
-            Ok(Some(state))
-        } else {
-            Ok(None)
+            Ok(Touch::Armed) => Ok(Some(state)),
+            // No write happened, so nothing was resurrected; the state is
+            // simply not re-armed — what a backend did before `touch` existed.
+            Ok(Touch::Unsupported) => Ok(Some(state)),
+            Ok(Touch::Missing) => Ok(None),
+            // Without a verdict the state read above may be a session that no
+            // longer exists. "Unknown session" is the answer rmcp turns into a
+            // 404, which makes the client re-initialize — a `SessionStoreError`
+            // would become a 500 and a retry loop on the same session.
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "transport session TTL could not be re-armed; treating the session as unknown"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -79,7 +89,7 @@ mod tests {
     use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
 
     use super::*;
-    use crate::persistence::{BoxFuture, InMemoryBackend, PersistenceError};
+    use crate::persistence::{BoxFuture, InMemoryBackend, PersistenceError, Touch};
 
     /// Wraps `InMemoryBackend` to observe `touch`, and to script what happens
     /// to the key between the read and the re-arm.
@@ -131,7 +141,7 @@ mod tests {
         fn keys(&self, ns: &str) -> BoxFuture<'_, Vec<String>> {
             self.inner.keys(ns)
         }
-        fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, bool> {
+        fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, Touch> {
             self.touches.lock().unwrap().push((key.to_owned(), ttl));
             if self.fail_touch.load(Ordering::SeqCst) {
                 return Box::pin(async { Err(PersistenceError::from("touch unavailable")) });
@@ -195,22 +205,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_re_arm_that_cannot_answer_fails_the_load() {
+    async fn a_re_arm_that_cannot_answer_reports_the_session_unknown() {
         let spy = Spy::new();
         let store = TransportSessionStore::new(spy.clone(), Duration::from_secs(1));
         store.store("s1", &state()).await.unwrap();
 
         // The peer's delete lands in the window *and* the re-arm errors: the
-        // state read must not be handed out on the strength of a stale read.
+        // state read must not be handed out on the strength of a stale read —
+        // and the answer is "unknown" (404, re-initialize), not an error (500).
         spy.delete_after_get.store(true, Ordering::SeqCst);
         spy.fail_touch.store(true, Ordering::SeqCst);
-        assert!(store.load("s1").await.is_err());
+        assert!(store.load("s1").await.unwrap().is_none());
     }
 
-    /// A backend that keeps the trait's default `touch` cannot vouch for the
-    /// key, so recovery is off for it — the stored state is never handed out.
+    /// A backend that keeps the trait's default `touch` still restores — it
+    /// simply gets no TTL extension, since nothing was written.
     #[tokio::test]
-    async fn a_backend_without_touch_never_restores() {
+    async fn a_backend_without_touch_restores_without_re_arming() {
         struct NoTouch(InMemoryBackend);
         impl PersistenceBackend for NoTouch {
             fn get(&self, ns: &str, key: &str) -> BoxFuture<'_, Option<Vec<u8>>> {
@@ -237,6 +248,7 @@ mod tests {
             Duration::from_secs(1),
         );
         store.store("s1", &state()).await.unwrap();
-        assert!(store.load("s1").await.unwrap().is_none());
+        let loaded = store.load("s1").await.unwrap().expect("restored");
+        assert_eq!(loaded.initialize_params.client_info.name, "spy-client");
     }
 }

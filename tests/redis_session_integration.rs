@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_framework::auth::AuthProvider;
+use mcp_framework::persistence::Touch;
 use mcp_framework::prelude::*;
 use mcp_framework::session::{RequestContextExt, SessionStore};
 use mcp_framework::transport::{HttpAppConfig, build_app};
@@ -449,7 +450,7 @@ async fn touch_re_arms_a_live_key_and_reports_a_deleted_one() -> anyhow::Result<
         .touch(ns, "k", Duration::from_secs(3000))
         .await
         .map_err(anyhow::Error::from_boxed)?;
-    assert!(armed, "a live key is re-armed");
+    assert_eq!(armed, Touch::Armed, "a live key is re-armed");
 
     let client = redis::Client::open(redis_url().as_str())?;
     let mut conn = redis::aio::ConnectionManager::new(client).await?;
@@ -467,7 +468,11 @@ async fn touch_re_arms_a_live_key_and_reports_a_deleted_one() -> anyhow::Result<
         .touch(ns, "k", Duration::from_secs(3000))
         .await
         .map_err(anyhow::Error::from_boxed)?;
-    assert!(!armed, "a deleted key is reported gone, not recreated");
+    assert_eq!(
+        armed,
+        Touch::Missing,
+        "a deleted key is reported gone, not recreated"
+    );
     assert!(
         backend
             .get(ns, "k")

@@ -3,7 +3,7 @@ use std::time::Duration;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
-use super::{BoxFuture, PersistenceBackend, PersistenceError};
+use super::{BoxFuture, PersistenceBackend, PersistenceError, Touch};
 
 /// Redis-backed persistence backend.
 ///
@@ -90,7 +90,7 @@ impl PersistenceBackend for RedisBackend {
         })
     }
 
-    fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, bool> {
+    fn touch(&self, ns: &str, key: &str, ttl: Duration) -> BoxFuture<'_, Touch> {
         let rkey = self.redis_key(ns, key);
         let secs = ttl.as_secs().max(1);
         let mut conn = self.conn.clone();
@@ -102,7 +102,11 @@ impl PersistenceBackend for RedisBackend {
                 .arg(secs)
                 .query_async(&mut conn)
                 .await?;
-            Ok(armed == 1)
+            Ok(if armed == 1 {
+                Touch::Armed
+            } else {
+                Touch::Missing
+            })
         })
     }
 

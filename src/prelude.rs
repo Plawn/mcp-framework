@@ -20,7 +20,7 @@ pub use crate::metrics::{
 };
 #[cfg(feature = "redis")]
 pub use crate::persistence::RedisBackend;
-pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
+pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceError, Touch};
 pub use crate::runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
 pub use crate::session::{RequestContextExt, Session, SessionData, SessionStore};
 pub use crate::transport::ProtocolLifecyclePolicy;
