@@ -33,7 +33,7 @@ use mcp_framework::auth::{
 use mcp_framework::capability::{CapabilityFilter, ToolFilter};
 use mcp_framework::constants::MCP_SESSION_ID_HEADER;
 use mcp_framework::session::SessionStore;
-use mcp_framework::transport::{HttpAppConfig, build_app};
+use mcp_framework::transport::{HttpAppConfig, build_app, run_http};
 use rmcp::ServerHandler;
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
 use tower::ServiceExt as _;
@@ -421,7 +421,7 @@ fn app_with_filter(
         extra_routes: None,
         public_routes: None,
     };
-    let (app, _token_store, _registry) = build_app(config);
+    let (app, _token_store, _registry) = build_app(config).expect("valid test configuration");
     app
 }
 
@@ -832,5 +832,62 @@ async fn introspection_never_gets_a_say_even_when_the_policy_asks_for_it() {
         introspect_hits.load(Ordering::Relaxed),
         0,
         "and the authorization server is never even asked"
+    );
+}
+
+/// The boot check must hold on the public entry points too, not only on
+/// `McpAppBuilder` — `HttpAppConfig` is a plain struct anyone can fill in.
+fn config_with(auth: AuthProvider) -> HttpAppConfig<fn() -> NoopServer, ()> {
+    HttpAppConfig {
+        public_url: "http://localhost".to_string(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        auth,
+        server_factory: (|| NoopServer) as fn() -> NoopServer,
+        app_name: "resource-server-test".to_string(),
+        capability_registry: None,
+        capability_filter: None,
+        access_validator: None,
+        claims_decoder: None,
+        session_store: SessionStore::default(),
+        tool_call_logger: None,
+        persistence: None,
+        protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
+        extra_routes: None,
+        public_routes: None,
+    }
+}
+
+#[tokio::test]
+async fn build_app_refuses_a_configuration_that_cannot_work() {
+    let mut config = resource_server_config("http://issuer/realms/test".to_string());
+    config.expected_audiences.clear();
+
+    let error = build_app(config_with(AuthProvider::OAuth(config)))
+        .err()
+        .expect("a router that accepts every token the issuer signs must not be built");
+    assert!(
+        error.to_string().contains("OAUTH_EXPECTED_AUDIENCE"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn run_http_fails_before_it_binds_anything() {
+    let mut config = resource_server_config("http://issuer/realms/test".to_string());
+    config.expected_audiences.clear();
+
+    // A valid configuration would serve until shutdown, so the timeout is the
+    // assertion that the check happens *before* the listener is created.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_http(config_with(AuthProvider::OAuth(config))),
+    )
+    .await
+    .expect("run_http must return, not start serving");
+
+    let error = outcome.err().expect("a misconfigured server must not run");
+    assert!(
+        error.to_string().contains("OAUTH_EXPECTED_AUDIENCE"),
+        "{error}"
     );
 }

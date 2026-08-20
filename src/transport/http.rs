@@ -8,10 +8,11 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::audit::ToolCallLogger;
 use crate::auth::{
-    AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, McpOAuthState, OAuthConfig,
-    OAuthState, RefreshConfig, TokenStore, WellKnownState, authorization_server_metadata_handler,
-    basic_auth_middleware, bearer_auth_middleware, mcp_oauth_router, not_proxied_handler,
-    oauth_router, protected_resource_metadata_handler, strip_framework_session_header,
+    AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, ConfigError, McpOAuthState,
+    OAuthConfig, OAuthState, RefreshConfig, TokenStore, WellKnownState,
+    authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
+    mcp_oauth_router, not_proxied_handler, oauth_router, protected_resource_metadata_handler,
+    strip_framework_session_header,
 };
 use crate::capability::{
     AccessValidator, CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext,
@@ -186,14 +187,29 @@ fn setup_oauth_routes(
 
 /// Build the axum router with all routes configured.
 ///
-/// Returns `(Router, TokenStore)` so the caller can start a cleanup task on
-/// the token store and abort it on shutdown.
-pub fn build_app<F, S, T>(config: HttpAppConfig<F, T>) -> (Router, TokenStore, CapabilityRegistry)
+/// Returns `(Router, TokenStore, CapabilityRegistry)` so the caller can start a
+/// cleanup task on the token store and abort it on shutdown.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] for an [`AuthProvider::OAuth`] configuration that
+/// cannot work — see [`OAuthConfig::validate`]. The check lives here rather than
+/// only in [`McpAppBuilder`](crate::McpAppBuilder) because `HttpAppConfig` is a
+/// plain public struct: a caller assembling one by hand (as the integration
+/// tests do) would otherwise get a router that answers `401` to everything
+/// instead of a startup failure.
+pub fn build_app<F, S, T>(
+    config: HttpAppConfig<F, T>,
+) -> Result<(Router, TokenStore, CapabilityRegistry), ConfigError>
 where
     F: Fn() -> S + Clone + Send + Sync + 'static,
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    if let AuthProvider::OAuth(oauth_config) = &config.auth {
+        oauth_config.validate()?;
+    }
+
     let transport_session_ttl = config.session_store.ttl();
     let transport_persistence = config.persistence.clone();
 
@@ -382,11 +398,11 @@ where
             },
         );
 
-    (
+    Ok((
         app.layer(cors).layer(trace_layer),
         token_store,
         registry_ref,
-    )
+    ))
 }
 
 /// Run the MCP server with HTTP transport (for remote connections)
@@ -396,6 +412,12 @@ where
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    // Before anything is bound or spawned: a configuration that cannot work is
+    // a startup failure, not a server that answers 401 to every request.
+    if let AuthProvider::OAuth(oauth_config) = &config.auth {
+        oauth_config.validate()?;
+    }
+
     let bind_addr: std::net::SocketAddr = config.bind_addr.parse()?;
 
     let public_url = config.public_url.clone();
@@ -445,7 +467,7 @@ where
     // Start session cleanup task
     let session_cleanup = config.session_store.start_cleanup_task();
 
-    let (app, token_store, registry) = build_app(config);
+    let (app, token_store, registry) = build_app(config)?;
 
     token_store
         .load_persisted()
