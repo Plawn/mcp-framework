@@ -772,6 +772,33 @@ impl TokenStore {
         pending.remove(state)
     }
 
+    /// Build a [`StoredToken`] for a bearer that must **not** enter the store.
+    ///
+    /// [`TokenMode::ResourceServer`](super::TokenMode::ResourceServer) keeps no
+    /// token state, but consumers (capability filters, access validators, tool
+    /// handlers) still expect a `StoredToken` carrying the decoded claims. This
+    /// applies the configured claims decoder and hands the value back instead of
+    /// inserting it — the middleware attaches it to the request extensions, so it
+    /// lives exactly as long as the request does.
+    pub(crate) fn transient_token(
+        &self,
+        access_token: String,
+        expires_at: Option<Instant>,
+    ) -> StoredToken {
+        let decoded_claims = self
+            .claims_decoder
+            .as_ref()
+            .and_then(|decoder| (decoder)(&access_token));
+        StoredToken {
+            access_token,
+            // No refresh material by construction: in resource-server mode the
+            // refresh token belongs to the client and never reaches this process.
+            refresh_token: None,
+            expires_at,
+            decoded_claims,
+        }
+    }
+
     /// Store a token for a session.
     ///
     /// If a [claims decoder](Self::with_claims_decoder) is configured, it is

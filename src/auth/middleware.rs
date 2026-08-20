@@ -139,6 +139,23 @@ pub struct AuthMiddlewareState {
 #[derive(Clone, Debug)]
 pub struct BearerToken(pub String);
 
+/// A validated credential attached to the request instead of to the
+/// [`TokenStore`].
+///
+/// [`TokenMode::ResourceServer`] keeps no server-side token state, so there is
+/// nothing for `resolve_token` to look up by session id. The middleware builds a
+/// transient [`StoredToken`] (bearer + decoded claims, no refresh material) and
+/// attaches it here; it is read back through `http::request::Parts::extensions`,
+/// which rmcp injects into the MCP request context. Everything a capability
+/// filter, an access validator or a tool handler sees is therefore identical to
+/// the stateful modes — minus `refresh_token`, which by design never reaches
+/// this process.
+///
+/// The extension is *only* ever written by the auth middleware, after the
+/// credential has been validated.
+#[derive(Clone, Debug)]
+pub struct RequestToken(pub StoredToken);
+
 /// Middleware that extracts Bearer token from Authorization header
 /// and stores it in request extensions for handlers to use.
 ///
@@ -151,6 +168,11 @@ pub struct BearerToken(pub String);
 /// In **Opaque** mode: the Bearer token is an opaque UUID issued by this
 /// framework. The middleware resolves it to the real Keycloak token
 /// (auto-refreshing if needed) and injects that for downstream handlers.
+///
+/// In **ResourceServer** mode: the bearer is validated locally against the
+/// issuer's keys and attached to the request. Nothing is read from or written to
+/// the `TokenStore`, and nothing is refreshed — see
+/// [`authorize_as_resource_server`].
 ///
 /// If no token is present, returns 401 with WWW-Authenticate header
 /// pointing to the OAuth protected resource metadata.
@@ -205,6 +227,14 @@ pub async fn bearer_auth_middleware(
     if token.is_empty() {
         tracing::warn!("Auth middleware: empty Bearer token, returning 401");
         return unauthorized_response(&state.resource_metadata_url);
+    }
+
+    if state.token_mode == TokenMode::ResourceServer {
+        // Pure resource server: validate locally, store nothing, refresh nothing.
+        return match authorize_as_resource_server(&state, &mut request, &token).await {
+            Ok(()) => next.run(request).await,
+            Err(response) => response,
+        };
     }
 
     if state.token_mode == TokenMode::Opaque {
@@ -464,6 +494,68 @@ pub async fn bearer_auth_middleware(
 
     // Continue to next handler
     next.run(request).await
+}
+
+/// Authorize a request in [`TokenMode::ResourceServer`].
+///
+/// The whole mode is this function: **validate, derive an identity, attach —
+/// and touch no shared state**.
+///
+/// 1. **Validate** the bearer with the configured
+///    [`UnknownTokenValidation`](super::UnknownTokenValidation) policy. Every
+///    bearer is "unknown" here, because this mode issues none: the
+///    [`TokenStore`] is never consulted (no `peek_token`, no adoption) and never
+///    written. `jwks` is the intended policy — signature, `iss`, `exp`, `nbf`
+///    and `aud` are all checked locally against the issuer's published keys,
+///    with the same asymmetric-algorithm restriction and fetch cooldown as
+///    everywhere else. `introspection` remains available for deployments that
+///    explicitly ask for it.
+/// 2. **Derive** the session identity from the credential's stable claims
+///    (`sid`, then `sub`) when the protocol supplies none, exactly as the other
+///    modes do — see [`credential_session_key`]. This is what lets a
+///    `SessionStore` entry survive the client rotating its bearer, which it now
+///    does entirely on its own.
+/// 3. **Attach** the credential to the request: [`BearerToken`] for handlers
+///    that want the raw string, and [`RequestToken`] carrying a transient
+///    [`StoredToken`] (with decoded claims) for everything that reads tokens
+///    through `resolve_token`.
+///
+/// There is deliberately no refresh path. An expired bearer is a `401` with the
+/// protected-resource challenge; refreshing it is the client's business, and
+/// only the client still holds a refresh token that Keycloak has not rotated
+/// out from under it.
+async fn authorize_as_resource_server(
+    state: &AuthMiddlewareState,
+    request: &mut Request<Body>,
+    token: &str,
+) -> Result<(), Response> {
+    let validated = match state.token_store.validate_unknown_bearer(token).await {
+        Ok(validated) => validated,
+        Err(rejection) => {
+            // As everywhere else, the client only ever sees an opaque 401; the
+            // cause is for the operator's logs.
+            tracing::warn!("Rejecting bearer in resource-server mode: {rejection}");
+            return Err(unauthorized_response(&state.resource_metadata_url));
+        }
+    };
+
+    let session_id = resolve_or_derive_session_id(request, token);
+    tracing::debug!(
+        session = %session_id,
+        source = ?validated.source,
+        subject = validated.subject.as_deref().unwrap_or("<none>"),
+        "Accepted a bearer as a pure resource server (no token state kept)"
+    );
+
+    let transient = state
+        .token_store
+        .transient_token(token.to_string(), validated.expires_at);
+    request.extensions_mut().insert(RequestToken(transient));
+    request
+        .extensions_mut()
+        .insert(BearerToken(token.to_string()));
+
+    Ok(())
 }
 
 /// Decode one base64url JWT segment into a JSON **object**.
