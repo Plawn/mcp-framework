@@ -14,20 +14,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `TokenMode::ResourceServer` had unit coverage for its decisions and none for the
 cycle those decisions live in: discovery from a `401`, PKCE, expiry, client-side
-refresh, session loss, revocation. Those are exactly the parts that cannot be
-faked convincingly — a stub AS proves nothing about Keycloak, and a hand-rolled
-client proves nothing about the client rmcp actually ships.
+refresh, session loss, revocation, dynamic client registration. Those are
+exactly the parts that cannot be faked convincingly — a stub AS proves nothing
+about Keycloak, and a hand-rolled client proves nothing about the client rmcp
+actually ships.
 
 - `tests/oauth_lifecycle_rmcp.rs` drives the framework with rmcp's own
   `OAuthState` / `AuthClient` / `StreamableHttpClientTransport` against an
   ephemeral Keycloak 26.3 (testcontainers), covering: reactive discovery and
   full authorization, transparent refresh past expiry with session state intact,
-  reconnection after protocol-session loss, and revocation →
-  `AuthError::AuthorizationRequired` → re-authorization. Every scenario also
-  asserts the `tokens` namespace stays empty — the mode's central claim.
+  reconnection after a protocol session the server really did drop (a raw
+  `DELETE /mcp` mid-flight, then the same client), revocation →
+  re-authorization under a new `cred-sid-*` identity, an expired bearer refused
+  once the JWKS skew leeway has passed, and an authorization flow with **no**
+  preregistered client — real RFC 7591 registration against Keycloak's own
+  endpoint, verified through the admin API.
+- The scenarios that make a claim about token state assert it on both sides:
+  the `tokens` persistence namespace stays empty *and*
+  `TokenStore::peek_token` answers `None` for every identity the request
+  actually used — the mode's central claim, checked where a regression would
+  land.
 - The two protocol revisions are covered separately because they *differ*:
   sessionless (2026-07-28) identity is claims-derived and survives a reconnect;
-  on 2025-11-25 the identity is the `mcp-session-id`, so it does not.
+  on 2025-11-25 the identity is the `mcp-session-id`, so it does not. Session
+  loss is exercised on both, and the test states rmcp 3.1's real contract:
+  `reinit_on_expired_session` absorbs the `404`, so the caller sees a working
+  call, not `SessionExpired`.
 - `#[ignore]`d by default (they need Docker and take ~2 min); CI runs them in a
   dedicated `integration-keycloak` job, and `release` now waits on it. The
   shared container is labelled and reaped by the following run — testcontainers
@@ -42,11 +54,40 @@ answer is a hardcoded audience mapper, which is not guessable.
 - A public PKCE (S256) `mcp-client` with the loopback and hosted-client redirect
   URI families, an `mcp-audience` default client scope carrying the mapper,
   `mcp:tools` / `mcp:resources` aligned with the framework's PRM, Client
-  Registration Policies for DCR, MCP-length lifetimes, and two test users.
+  Registration Policies for DCR, and MCP-length lifetimes.
+- **The versioned realm is safe by default**: `sslRequired: "external"` and no
+  users. The harness patches a *copy* before importing it into its throwaway
+  container — `sslRequired: "none"`, two test users, a shortened access-token
+  lifespan, a rewritten audience, relaxed trusted-hosts — so the fixture's
+  conveniences cannot be imported into a deployment by accident.
+- Three Keycloak behaviours the realm now accommodates, each found the hard way
+  against a live container: the `Allowed Client Scopes` policy validates every
+  name in a DCR `scope` against realm client scopes, so `openid` must be listed
+  explicitly; a DCR request carrying `scope` **replaces** the client's default
+  scopes, so `mcp:tools` / `mcp:resources` carry the audience mapper too or a
+  dynamically registered client gets no `aud`; and declaring the
+  `offline_access` client scope in an export suppresses Keycloak's own
+  offline-token setup, so the export leaves it to Keycloak (rmcp requests that
+  scope per SEP-2207).
 - `keycloak/README.md` states what must be substituted per deployment, which
   values are proposals rather than settled, and the one ordering constraint that
   bites: refresh-token rotation must not be enabled before the switch to
   `ResourceServer`, because it breaks passthrough.
+
+### Changed — OAuth metadata advertises the configured scopes
+
+`scopes_supported` was hardcoded to `openid profile email` in both the RFC 8414
+authorization-server document and the RFC 9728 protected-resource document, so a
+deployment that configured `OAUTH_SCOPES` advertised something it did not use —
+and a client reading the PRM to decide what to ask for could not discover the
+MCP-specific scopes at all.
+
+- Both documents now advertise `OAuthConfig::scopes`, in every token mode. The
+  default (`openid,profile,email`) is unchanged, so nothing moves unless
+  `OAUTH_SCOPES` is set.
+- `keycloak/README.md` documents
+  `OAUTH_SCOPES=openid,profile,email,mcp:tools,mcp:resources` as the value that
+  matches the shipped realm.
 
 
 ### Changed — transport session recovery re-arms its TTL on failover

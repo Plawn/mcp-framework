@@ -36,7 +36,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mcp_framework::auth::{AuthProvider, OAuthConfig, TokenMode, UnknownTokenValidation};
+use mcp_framework::auth::{
+    AuthProvider, OAuthConfig, TokenMode, TokenStore, UnknownTokenValidation,
+};
 use mcp_framework::constants::{JWKS_CLOCK_SKEW_LEEWAY, NS_TOKENS};
 use mcp_framework::prelude::*;
 use mcp_framework::session::SessionStore;
@@ -97,6 +99,13 @@ const HARNESS_LABEL: &str = "app.mcp-framework.harness=oauth-lifecycle";
 /// middleware has had its say, which would make "not 401" indistinguishable
 /// from "accepted".
 const RAW_INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw-probe","version":"0"}}}"#;
+
+/// What this deployment declares as `OAUTH_SCOPES`, and therefore what
+/// discovery advertises and clients request. The two MCP-specific ones are
+/// optional client scopes in the realm, so they only end up in a token if the
+/// client actually asks — which is the point: a scope nobody is told about is a
+/// scope nobody requests.
+const SCOPES: [&str; 5] = ["openid", "profile", "email", "mcp:tools", "mcp:resources"];
 
 const DOCKER_HINT: &str = "Docker unavailable — skipping (this test needs a Keycloak container)";
 
@@ -171,25 +180,26 @@ fn docker_is_available() -> bool {
 ///
 /// A directory, not the file itself: bind-mounting a single file is the one
 /// case Docker Desktop's file sharing handles inconsistently across platforms.
+///
+/// The shipped realm is deliberately *not* a test fixture — it is what a
+/// deployment imports, so it demands TLS and ships no users. Everything a test
+/// needs that a production realm must not have is injected here instead, which
+/// keeps the harness testing the shipped artefact rather than a parallel copy:
+///
+/// 1. `accessTokenLifespan` — 600 s shipped, seconds here.
+/// 2. every audience mapper — rewritten to the audience this binary uses.
+/// 3. `sslRequired` — `external` shipped; the container speaks plain HTTP.
+/// 4. `users` — alice and bob, with permanent passwords equal to their names.
+/// 5. the trusted-hosts DCR policy — see [`relax_trusted_hosts`].
 fn write_patched_realm() -> anyhow::Result<PathBuf> {
     let mut realm: Value = serde_json::from_str(include_str!("../keycloak/mcp-realm.json"))?;
 
     realm["accessTokenLifespan"] = json!(ACCESS_TOKEN_LIFESPAN_SECS);
+    realm["sslRequired"] = json!("none");
+    realm["users"] = json!([test_user("alice"), test_user("bob")]);
 
-    let scopes = realm["clientScopes"]
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("realm has no clientScopes array"))?;
-    let audience_scope = scopes
-        .iter_mut()
-        .find(|scope| scope["name"] == "mcp-audience")
-        .ok_or_else(|| anyhow::anyhow!("realm has no `mcp-audience` client scope"))?;
-    let mappers = audience_scope["protocolMappers"]
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("`mcp-audience` has no protocolMappers"))?;
-    anyhow::ensure!(!mappers.is_empty(), "`mcp-audience` has no audience mapper");
-    for mapper in mappers {
-        mapper["config"]["included.custom.audience"] = json!(AUDIENCE);
-    }
+    rewrite_audience(&mut realm)?;
+    relax_trusted_hosts(&mut realm)?;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -201,6 +211,74 @@ fn write_patched_realm() -> anyhow::Result<PathBuf> {
         serde_json::to_vec_pretty(&realm)?,
     )?;
     Ok(dir)
+}
+
+/// A test user whose password is their username. Never shipped in the realm:
+/// an importable file carrying enabled accounts with permanent, guessable
+/// passwords is a footgun aimed at whoever imports it into a real Keycloak.
+fn test_user(name: &str) -> Value {
+    json!({
+        "username": name,
+        "enabled": true,
+        "emailVerified": true,
+        "email": format!("{name}@example.com"),
+        "firstName": name,
+        "lastName": "Example",
+        "credentials": [{ "type": "password", "value": name, "temporary": false }],
+        "realmRoles": ["default-roles-mcp"],
+    })
+}
+
+/// Point every `oidc-audience-mapper` in the realm at [`AUDIENCE`].
+///
+/// Three scopes carry one: `mcp-audience`, which preregistered clients get as a
+/// default scope, and `mcp:tools` / `mcp:resources`, which is how a
+/// *dynamically registered* client gets the audience at all — see
+/// [`lifecycle_dynamic_client_registration`]. Rewriting them one by one would
+/// silently miss a fourth, so this walks the whole array and insists on finding
+/// at least one.
+fn rewrite_audience(realm: &mut Value) -> anyhow::Result<()> {
+    let scopes = realm["clientScopes"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("realm has no clientScopes array"))?;
+    let mut rewritten = 0;
+    for scope in scopes {
+        let Some(mappers) = scope["protocolMappers"].as_array_mut() else {
+            continue;
+        };
+        for mapper in mappers {
+            if mapper["protocolMapper"] == "oidc-audience-mapper" {
+                mapper["config"]["included.custom.audience"] = json!(AUDIENCE);
+                rewritten += 1;
+            }
+        }
+    }
+    anyhow::ensure!(rewritten > 0, "realm carries no audience mapper");
+    Ok(())
+}
+
+/// Turn off the *sender* half of the trusted-hosts DCR policy for the fixture.
+///
+/// The policy has two independent checks. `client-uris-must-match` is left on
+/// and is the one worth exercising: the redirect URI a client registers has to
+/// resolve to a trusted host, and [`REDIRECT_URI`] is `127.0.0.1`, which the
+/// shipped realm trusts. `host-sending-registration-request-must-match` is the
+/// one that cannot hold here: the framework proxies `/oauth/register` from the
+/// *host*, so Keycloak sees the Docker bridge gateway as the source address —
+/// an address that exists only because the AS runs in a container, and whose
+/// value differs across Docker runtimes. In a real deployment the framework and
+/// Keycloak see each other by their real addresses and the check stays on.
+fn relax_trusted_hosts(realm: &mut Value) -> anyhow::Result<()> {
+    let policies = realm["components"]
+        ["org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("realm has no client registration policies"))?;
+    let trusted = policies
+        .iter_mut()
+        .find(|policy| policy["providerId"] == "trusted-hosts")
+        .ok_or_else(|| anyhow::anyhow!("realm has no `trusted-hosts` policy"))?;
+    trusted["config"]["host-sending-registration-request-must-match"] = json!(["false"]);
+    Ok(())
 }
 
 async fn start_keycloak() -> anyhow::Result<Keycloak> {
@@ -286,6 +364,7 @@ struct Framework {
     addr: SocketAddr,
     sessions: SessionStore<TestData>,
     backend: Arc<InMemoryBackend>,
+    tokens: TokenStore,
 }
 
 impl Framework {
@@ -293,13 +372,44 @@ impl Framework {
         format!("http://{}/mcp", self.addr)
     }
 
-    /// Keys the framework wrote into the token namespace. Resource-server mode
-    /// keeps no grant, so this must stay empty for the whole run.
-    async fn stored_token_keys(&self) -> Vec<String> {
-        self.backend
+    fn prm_url(&self) -> String {
+        format!("http://{}/.well-known/oauth-protected-resource", self.addr)
+    }
+
+    fn as_metadata_url(&self) -> String {
+        format!(
+            "http://{}/.well-known/oauth-authorization-server",
+            self.addr
+        )
+    }
+
+    fn register_url(&self) -> String {
+        format!("http://{}/oauth/register", self.addr)
+    }
+
+    /// Resource-server mode keeps no grant, and this is the assertion that says
+    /// so. It has to look in *both* places: the persistence backend catches a
+    /// write-through, but in this mode the `TokenStore` is built without a
+    /// backend at all, so an in-memory `store_token` would leave the namespace
+    /// empty and slip past a backend-only check. `identities` are the session
+    /// keys the test actually observed — the only keys a regression could
+    /// plausibly write under.
+    async fn assert_no_token_state(&self, identities: &[&str]) {
+        let keys = self
+            .backend
             .keys(NS_TOKENS)
             .await
-            .expect("the in-memory backend cannot fail")
+            .expect("the in-memory backend cannot fail");
+        assert!(
+            keys.is_empty(),
+            "resource-server mode persisted a token: {keys:?}",
+        );
+        for identity in identities {
+            assert!(
+                self.tokens.peek_token(identity).await.is_none(),
+                "resource-server mode kept a token in memory for {identity:?}",
+            );
+        }
     }
 }
 
@@ -309,7 +419,7 @@ fn resource_server_auth(issuer_url: String) -> AuthProvider {
         client_secret: None,
         issuer_url,
         redirect_url: REDIRECT_URI.to_string(),
-        scopes: vec!["openid".to_string()],
+        scopes: SCOPES.iter().map(|scope| scope.to_string()).collect(),
         token_mode: TokenMode::ResourceServer,
         unknown_token_validation: UnknownTokenValidation::Jwks,
         expected_audiences: vec![AUDIENCE.to_string()],
@@ -369,7 +479,7 @@ async fn start_framework(issuer_url: String) -> anyhow::Result<Framework> {
         public_routes: None,
     };
 
-    let (app, _token_store, _registry) = build_app(config)?;
+    let (app, tokens, _registry) = build_app(config)?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -378,6 +488,7 @@ async fn start_framework(issuer_url: String) -> anyhow::Result<Framework> {
         addr,
         sessions,
         backend,
+        tokens,
     })
 }
 
@@ -412,7 +523,15 @@ async fn discovery_challenge(mcp_url: &str) -> anyhow::Result<String> {
     Ok(challenge)
 }
 
-/// Post Keycloak's login form and return the `Location` of the resulting 302.
+/// Drive Keycloak's browser flow to the redirect back to [`REDIRECT_URI`] and
+/// return that `Location`.
+///
+/// Written as a small browser loop — follow redirects, fill in whatever form
+/// the page turns out to be — because the number of steps is not fixed. A
+/// preregistered `mcp-client` needs one form. A client the realm's `Consent
+/// Required` registration policy marked `consentRequired` needs three steps:
+/// the login form, the 302 to the `OAUTH_GRANT` required action, and the
+/// consent form it renders.
 ///
 /// Cookies are handled by hand rather than with reqwest's cookie store: under
 /// `sslRequired: none` Keycloak still marks `AUTH_SESSION_ID` and friends
@@ -423,68 +542,177 @@ async fn keycloak_login(auth_url: &str, username: &str, password: &str) -> anyho
         .redirect(reqwest13::redirect::Policy::none())
         .build()?;
 
-    let response = http.get(auth_url).send().await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "authorization endpoint answered {}",
-        response.status()
-    );
-    let cookies = response
+    let mut cookies = Cookies::default();
+    let mut response = http.get(auth_url).send().await?;
+
+    for _ in 0..8 {
+        cookies.absorb(&response);
+
+        if response.status().is_redirection() {
+            let location = redirect_location(&response)
+                .ok_or_else(|| anyhow::anyhow!("Keycloak redirected without a Location"))?;
+            if location.starts_with(REDIRECT_URI) {
+                return Ok(location);
+            }
+            response = http
+                .get(&location)
+                .header(reqwest13::header::COOKIE, cookies.header())
+                .send()
+                .await?;
+            continue;
+        }
+
+        let status = response.status();
+        anyhow::ensure!(status.is_success(), "Keycloak answered {status}");
+        // A form action may be a path rather than a URL — resolve it against
+        // the page it came from.
+        let page = response.url().clone();
+        let body = response.text().await?;
+
+        response =
+            if let Some(action) = capture(r#"id="kc-form-login"[^>]*action="([^"]+)""#, &body) {
+                http.post(page.join(&action)?)
+                    .header(reqwest13::header::COOKIE, cookies.header())
+                    .form(&[
+                        ("username", username),
+                        ("password", password),
+                        ("credentialId", ""),
+                    ])
+                    .send()
+                    .await?
+            } else if let Some(action) = consent_action(&body) {
+                let code = capture(r#"name="code"[^>]*value="([^"]+)""#, &body)
+                    .or_else(|| capture(r#"value="([^"]+)"[^>]*name="code""#, &body))
+                    .ok_or_else(|| anyhow::anyhow!("consent form carries no `code`"))?;
+                http.post(page.join(&action)?)
+                    .header(reqwest13::header::COOKIE, cookies.header())
+                    .form(&[("code", code.as_str()), ("accept", "Yes")])
+                    .send()
+                    .await?
+            } else {
+                anyhow::bail!(
+                    "Keycloak rendered a page that is neither login nor consent: {}",
+                    excerpt(&body)
+                );
+            };
+    }
+
+    anyhow::bail!("the browser flow did not reach {REDIRECT_URI} within 8 steps")
+}
+
+/// The consent form is recognised by where it posts — `login-actions/consent`
+/// — not by an id: Keycloak 26's `login-oauth-grant.ftl` gives the form neither
+/// an id nor a class of its own.
+fn consent_action(body: &str) -> Option<String> {
+    capture(
+        r#"<form[^>]*action="([^"]*login-actions/consent[^"]*)""#,
+        body,
+    )
+}
+
+fn excerpt(body: &str) -> String {
+    body.replace('\n', " ").chars().take(400).collect()
+}
+
+/// The cookies Keycloak set so far, latest value per name. A map rather than a
+/// concatenation: `AUTH_SESSION_ID` and `KEYCLOAK_IDENTITY` are re-set as the
+/// flow advances, and sending both the old and the new value makes Keycloak
+/// pick the wrong one.
+#[derive(Default)]
+struct Cookies(std::collections::BTreeMap<String, String>);
+
+impl Cookies {
+    fn absorb(&mut self, response: &reqwest13::Response) {
+        for cookie in collect_cookies(response) {
+            if let Some((name, value)) = cookie.split_once('=') {
+                self.0.insert(name.trim().to_string(), value.to_string());
+            }
+        }
+    }
+
+    fn header(&self) -> String {
+        self.0
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn collect_cookies(response: &reqwest13::Response) -> Vec<String> {
+    response
         .headers()
         .get_all(reqwest13::header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .filter_map(|cookie| cookie.split(';').next())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let body = response.text().await?;
+        .map(str::to_string)
+        .collect()
+}
 
-    let form_action = regex::Regex::new(r#"id="kc-form-login"[^>]*action="([^"]+)""#)
-        .expect("static regex")
-        .captures(&body)
-        .ok_or_else(|| anyhow::anyhow!("no Keycloak login form in the response"))?[1]
-        .replace("&amp;", "&");
-
-    let response = http
-        .post(&form_action)
-        .header(reqwest13::header::COOKIE, cookies)
-        .form(&[
-            ("username", username),
-            ("password", password),
-            ("credentialId", ""),
-        ])
-        .send()
-        .await?;
-
-    let status = response.status();
-    let location = response
+fn redirect_location(response: &reqwest13::Response) -> Option<String> {
+    response
         .headers()
         .get(reqwest13::header::LOCATION)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    match location {
-        Some(location) if status.is_redirection() => Ok(location),
-        _ => anyhow::bail!(
-            "login did not redirect (HTTP {status}); Keycloak said: {}",
-            response.text().await.unwrap_or_default().replace('\n', " ")
-        ),
-    }
+        .map(str::to_string)
+}
+
+/// First capture group of `pattern` in `haystack`, with HTML entities undone.
+/// A regex rather than an HTML parser: the two forms this has to read are
+/// Keycloak's own templates, and the alternative is a parser dependency for
+/// four `action` attributes.
+fn capture(pattern: &str, haystack: &str) -> Option<String> {
+    regex::Regex::new(pattern)
+        .expect("static regex")
+        .captures(haystack)
+        .map(|found| found[1].replace("&amp;", "&"))
 }
 
 /// The whole client-side authorization code + PKCE flow, driven by rmcp's own
 /// state machine — discovery from the challenge, authorization URL, callback,
 /// token exchange — with only the human at the login form replaced.
+///
+/// Uses the preregistered `mcp-client`, which is what a configured deployment
+/// looks like. The registration path is [`authorize_dynamically`].
 async fn authorize(mcp_url: &str, username: &str, password: &str) -> anyhow::Result<AuthClient> {
+    run_authorization(
+        mcp_url,
+        username,
+        password,
+        AuthorizationRequest::new(REDIRECT_URI).with_preregistered_client(CLIENT_ID),
+    )
+    .await
+}
+
+/// The same flow with no client identity at all, which sends rmcp down the RFC
+/// 7591 branch: it reads `registration_endpoint` out of the authorization
+/// server metadata — the framework's `/oauth/register` — and registers itself.
+async fn authorize_dynamically(
+    mcp_url: &str,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<AuthClient> {
+    run_authorization(
+        mcp_url,
+        username,
+        password,
+        AuthorizationRequest::new(REDIRECT_URI).with_client_name("mcp-framework harness"),
+    )
+    .await
+}
+
+async fn run_authorization(
+    mcp_url: &str,
+    username: &str,
+    password: &str,
+    request: AuthorizationRequest,
+) -> anyhow::Result<AuthClient> {
     let challenge = discovery_challenge(mcp_url).await?;
 
     let mut state = OAuthState::new(mcp_url, None).await?;
     state
-        .start_authorization(
-            AuthorizationRequest::new(REDIRECT_URI)
-                .with_preregistered_client(CLIENT_ID)
-                .with_scopes(["openid"])
-                .with_challenge(challenge),
-        )
+        .start_authorization(request.with_scopes(SCOPES).with_challenge(challenge))
         .await?;
 
     let auth_url = state.get_authorization_url().await?;
@@ -517,15 +745,6 @@ enum Lifecycle {
     /// credential's claims (`cred-sid-…`). It survives both a token refresh and
     /// a reconnection, because neither changes the SSO session.
     Sessionless,
-}
-
-impl Lifecycle {
-    /// Whether re-`initialize`-ing with the same grant lands on the same
-    /// framework identity. This is the substantive difference between the two
-    /// revisions, and the reason scenario 2 is parameterised over them.
-    fn identity_survives_reconnect(self) -> bool {
-        matches!(self, Lifecycle::Sessionless)
-    }
 }
 
 async fn connect(auth: &AuthClient, mcp_url: &str, lifecycle: Lifecycle) -> anyhow::Result<Client> {
@@ -579,6 +798,45 @@ async fn raw_mcp_status(mcp_url: &str, bearer: &str) -> anyhow::Result<reqwest13
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(RAW_INITIALIZE)
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+/// Terminate a transport session from outside the client that owns it — the
+/// server-side half of "your session is gone", which is what a client hitting
+/// an instance that never saw the session runs into.
+async fn raw_delete_session(
+    mcp_url: &str,
+    bearer: &str,
+    session_id: &str,
+) -> anyhow::Result<reqwest13::StatusCode> {
+    let response = reqwest13::Client::new()
+        .delete(mcp_url)
+        .bearer_auth(bearer)
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", "2025-11-25")
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+/// Send a request *as* an existing session, to see whether the server still
+/// knows it. A live session answers `200`; a terminated one answers `404`,
+/// which is the signal rmcp turns into a re-`initialize`.
+async fn raw_session_probe(
+    mcp_url: &str,
+    bearer: &str,
+    session_id: &str,
+) -> anyhow::Result<reqwest13::StatusCode> {
+    let response = reqwest13::Client::new()
+        .post(mcp_url)
+        .bearer_auth(bearer)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", "2025-11-25")
+        .body(r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#)
         .send()
         .await?;
     Ok(response.status())
@@ -662,7 +920,41 @@ async fn revoke_user_sessions(keycloak: &Keycloak, username: &str) -> anyhow::Re
     Ok(())
 }
 
+/// The Keycloak client record for `client_id`, straight from the admin API.
+/// Used to check that a *dynamically registered* client really exists there —
+/// the framework's own response would be just as happy with a fabricated id.
+async fn admin_client_record(keycloak: &Keycloak, client_id: &str) -> anyhow::Result<Value> {
+    let token = admin_token(keycloak).await?;
+    let clients: Value = reqwest13::Client::new()
+        .get(format!(
+            "{}/admin/realms/{REALM}/clients?clientId={client_id}",
+            keycloak.base_url
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    clients
+        .get(0)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("realm `{REALM}` has no client `{client_id}`"))
+}
+
 // ── Test plumbing ───────────────────────────────────────────────────
+
+/// The claims of a JWT, decoded without verifying anything — these tests only
+/// read what the authorization server put in the token they already hold.
+fn jwt_claims(token: &str) -> anyhow::Result<Value> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)?;
+    Ok(serde_json::from_slice(&decoded)?)
+}
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -747,11 +1039,7 @@ async fn scenario_discovery_and_refresh(lifecycle: Lifecycle) -> anyhow::Result<
             "the access token never rotated — no refresh took place",
         );
 
-        assert!(
-            framework.stored_token_keys().await.is_empty(),
-            "resource-server mode stored a token: {:?}",
-            framework.stored_token_keys().await,
-        );
+        framework.assert_no_token_state(&[&session]).await;
         assert_eq!(framework.sessions.len().await, 1, "one caller, one session");
 
         let _ = keycloak;
@@ -777,25 +1065,60 @@ async fn lifecycle_discovery_auth_and_refresh_sessionless() -> anyhow::Result<()
 
 // ── Scenario 2 — session loss and repeated refresh ──────────────────
 
-/// The transport session dies — the client `DELETE`s it, which is what an
-/// expired or evicted server-side session presents as — and the client
-/// reconnects with the same grant. Then two consecutive refresh cycles, the
+/// Two consecutive refresh cycles on a client that is already connected — the
 /// pair that catches a client reusing a refresh token the AS has rotated away
-/// (`revokeRefreshToken: true`, `refreshTokenMaxReuse: 0`).
+/// (`revokeRefreshToken: true`, `refreshTokenMaxReuse: 0`). Returns the call
+/// count reached.
+async fn two_refresh_cycles(
+    client: &Client,
+    identity: &str,
+    mut calls: u32,
+    lifecycle: Lifecycle,
+) -> anyhow::Result<u32> {
+    for cycle in 1..=2 {
+        sleep_past_expiry().await;
+        let (session_now, calls_now) = whoami(client).await?;
+        calls += 1;
+        assert_eq!(
+            session_now, identity,
+            "{lifecycle:?}: identity drifted on refresh cycle {cycle}",
+        );
+        assert_eq!(
+            calls_now, calls,
+            "{lifecycle:?}: session data lost on refresh cycle {cycle}",
+        );
+    }
+    Ok(calls)
+}
+
+/// The server-side transport session disappears under a *running* client.
 ///
-/// What the reconnection means depends on the negotiated revision, and the
-/// difference is the point of parameterising this:
+/// This is the failure a horizontally scaled deployment produces constantly: an
+/// instance that never saw the session answers `404`, and the question is what
+/// the client does next. The harness reproduces it exactly — a side-channel
+/// `DELETE /mcp` carrying the live `mcp-session-id`, which is what rmcp's server
+/// treats as "this session is gone" — rather than closing the client politely
+/// and building a new one, which tests the harness rather than the transport.
 ///
-/// - **2026-07-28** — identity is derived from the credential's `sid`, so the
-///   reconnection lands on the *same* `SessionStore` entry and its counter
-///   keeps going up. This is what makes a long-lived MCP client survive its own
-///   reconnections without losing per-user state.
-/// - **2025-11-25** — identity *is* the `mcp-session-id`, so a new `initialize`
-///   is a new identity by construction and the counter restarts. Not a defect:
-///   the protocol session is the unit of identity when the protocol has one.
-///   Asserted rather than glossed over, because it is the thing a consumer
-///   keying state off `ctx.session_id` has to know.
-async fn scenario_session_loss(lifecycle: Lifecycle) -> anyhow::Result<()> {
+/// **rmcp 3.1.0 recovers transparently.** `StreamableHttpClientTransportConfig`
+/// defaults `reinit_on_expired_session` to `true`, so on `SessionExpired` the
+/// transport replays the saved `initialize`, adopts the new session id and
+/// re-sends the request that failed. The caller never sees an error — asserted
+/// here, because the alternative contract (surfacing `SessionExpired` and
+/// making the caller reconnect) is what the code would look like if that flag
+/// ever flipped.
+///
+/// What the framework then does is the part that matters to a consumer: the
+/// re-`initialize` mints a *new* `mcp-session-id`, and on 2025-11-25 the
+/// framework identity **is** that id — so the recovered call lands on a fresh
+/// `SessionStore` entry and the counter restarts. Not a defect (the protocol
+/// session is the unit of identity when the protocol has one), but it is
+/// precisely what a consumer keying state off `ctx.session_id` has to know, and
+/// it is the reason the sessionless variant below exists.
+#[tokio::test]
+#[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
+async fn lifecycle_session_loss_then_reinitialize_legacy_session() -> anyhow::Result<()> {
+    let lifecycle = Lifecycle::LegacySession;
     scenario!(|keycloak, framework| {
         let mcp_url = framework.mcp_url();
         let auth = authorize(&mcp_url, "alice", "alice").await?;
@@ -804,50 +1127,38 @@ async fn scenario_session_loss(lifecycle: Lifecycle) -> anyhow::Result<()> {
         let (session, calls) = whoami(&client).await?;
         assert_eq!(calls, 1);
 
-        // Ends the rmcp session server-side.
-        client.cancel().await?;
-
-        // Fresh transport, fresh `initialize`, same credential.
-        let client = connect(&auth, &mcp_url, lifecycle).await?;
-        let (session_again, mut calls_expected) = whoami(&client).await?;
-
-        if lifecycle.identity_survives_reconnect() {
-            assert_eq!(
-                session_again, session,
-                "{lifecycle:?}: re-initializing with the same bearer produced a different identity",
-            );
-            assert_eq!(
-                calls_expected, 2,
-                "session data was lost on re-initialization"
-            );
-        } else {
-            assert_ne!(
-                session_again, session,
-                "{lifecycle:?}: a new protocol session must be a new identity",
-            );
-            assert_eq!(calls_expected, 1, "the new protocol session started fresh");
-        }
-
-        // Two consecutive refresh cycles, on whichever identity we now hold.
-        for cycle in 1..=2 {
-            sleep_past_expiry().await;
-            let (session_now, calls_now) = whoami(&client).await?;
-            calls_expected += 1;
-            assert_eq!(
-                session_now, session_again,
-                "{lifecycle:?}: identity drifted on refresh cycle {cycle}",
-            );
-            assert_eq!(
-                calls_now, calls_expected,
-                "{lifecycle:?}: session data lost on refresh cycle {cycle}",
-            );
-        }
-
+        // In this revision the framework identity *is* the transport session
+        // id, which is what makes it usable as the DELETE target.
+        let bearer = auth.get_access_token().await?;
+        let status = raw_delete_session(&mcp_url, &bearer, &session).await?;
         assert!(
-            framework.stored_token_keys().await.is_empty(),
-            "resource-server mode stored a token: {:?}",
-            framework.stored_token_keys().await,
+            status.is_success() || status == reqwest13::StatusCode::NO_CONTENT,
+            "the server refused to terminate session {session}: HTTP {status}",
         );
+        // And it really is gone: a replay of the same session id now 404s.
+        assert_eq!(
+            raw_session_probe(&mcp_url, &bearer, &session).await?,
+            reqwest13::StatusCode::NOT_FOUND,
+            "the terminated session is still being served",
+        );
+
+        // Same client object, no reconnection by us: rmcp re-initializes.
+        let (session_again, calls_again) = whoami(&client).await?;
+        assert_ne!(
+            session_again, session,
+            "rmcp reused a session the server had terminated",
+        );
+        assert_eq!(
+            calls_again, 1,
+            "a new protocol session must start from fresh state",
+        );
+
+        let calls = two_refresh_cycles(&client, &session_again, calls_again, lifecycle).await?;
+        assert_eq!(calls, 3);
+
+        framework
+            .assert_no_token_state(&[&session, &session_again])
+            .await;
 
         let _ = keycloak;
         client.cancel().await?;
@@ -855,19 +1166,49 @@ async fn scenario_session_loss(lifecycle: Lifecycle) -> anyhow::Result<()> {
     })
 }
 
-/// The case the ticket is really about: a sessionless client keeps its identity
-/// across a reconnection, because the identity is the credential's.
+/// The case the ticket is really about: with MCP 2026-07-28 there is no
+/// protocol session to lose, so there is nothing to `DELETE` — every request is
+/// served statelessly. Identity comes from the credential's `sid`, which means
+/// a client that throws away its transport and builds a new one lands back on
+/// the same `SessionStore` entry and its counter keeps going up. That is what
+/// makes a long-lived MCP client survive its own reconnections without losing
+/// per-user state.
 #[tokio::test]
 #[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
 async fn lifecycle_session_loss_then_reinitialize_sessionless() -> anyhow::Result<()> {
-    scenario_session_loss(Lifecycle::Sessionless).await
-}
+    let lifecycle = Lifecycle::Sessionless;
+    scenario!(|keycloak, framework| {
+        let mcp_url = framework.mcp_url();
+        let auth = authorize(&mcp_url, "alice", "alice").await?;
 
-/// The contrasting case, pinned down so the difference cannot regress silently.
-#[tokio::test]
-#[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
-async fn lifecycle_session_loss_then_reinitialize_legacy_session() -> anyhow::Result<()> {
-    scenario_session_loss(Lifecycle::LegacySession).await
+        let client = connect(&auth, &mcp_url, lifecycle).await?;
+        let (session, calls) = whoami(&client).await?;
+        assert_eq!(calls, 1);
+        assert!(
+            session.starts_with("cred-"),
+            "a sessionless client must be identified from its credential: {session:?}",
+        );
+
+        // Drop the whole connection and build a new one from the same grant.
+        client.cancel().await?;
+        let client = connect(&auth, &mcp_url, lifecycle).await?;
+        let (session_again, calls_again) = whoami(&client).await?;
+
+        assert_eq!(
+            session_again, session,
+            "re-initializing with the same bearer produced a different identity",
+        );
+        assert_eq!(calls_again, 2, "session data was lost on reconnection");
+
+        let calls = two_refresh_cycles(&client, &session_again, calls_again, lifecycle).await?;
+        assert_eq!(calls, 4);
+
+        framework.assert_no_token_state(&[&session]).await;
+
+        let _ = keycloak;
+        client.cancel().await?;
+        Ok(())
+    })
 }
 
 // ── Scenario 3 — revocation ─────────────────────────────────────────
@@ -877,20 +1218,27 @@ async fn lifecycle_session_loss_then_reinitialize_legacy_session() -> anyhow::Re
 /// so what has to work is the *client* side: refresh fails, rmcp surfaces
 /// [`AuthError::AuthorizationRequired`], and a fresh authorization recovers.
 ///
-/// The recovered identity is deliberately **different**: revocation ends the
-/// SSO session, a new login mints a new `sid`, and `credential_session_key`
-/// derives identity from `sid`. Same human, new session — that is the design of
-/// task 920, not a bug, and asserting it pins the behaviour down.
+/// Run **sessionless** on purpose. The interesting claim is that the recovered
+/// identity is a *different* one, and that claim is only causal here: identity
+/// is `cred-sid-{sha256(sid)}`, revocation ends the SSO session, and a new login
+/// mints a new `sid`. Under 2025-11-25 the identity is the `mcp-session-id`, so
+/// reconnecting would change it whether or not anything was revoked — the same
+/// assertion would pass for the wrong reason. Same human, new session: that is
+/// the design of task 920, and this is where it is pinned down.
 #[tokio::test]
 #[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
 async fn lifecycle_revoked_grant_requires_reauthorization() -> anyhow::Result<()> {
     scenario!(|keycloak, framework| {
         let mcp_url = framework.mcp_url();
         let auth = authorize(&mcp_url, "alice", "alice").await?;
-        let client = connect(&auth, &mcp_url, Lifecycle::LegacySession).await?;
+        let client = connect(&auth, &mcp_url, Lifecycle::Sessionless).await?;
 
         let (session, calls) = whoami(&client).await?;
         assert_eq!(calls, 1);
+        assert!(
+            session.starts_with("cred-sid-"),
+            "identity should be derived from the SSO session id, got {session:?}",
+        );
 
         revoke_user_sessions(keycloak, "alice").await?;
         sleep_past_expiry().await;
@@ -910,24 +1258,195 @@ async fn lifecycle_revoked_grant_requires_reauthorization() -> anyhow::Result<()
 
         // Full re-authorization, from a brand new state machine.
         let auth = authorize(&mcp_url, "alice", "alice").await?;
-        let client = connect(&auth, &mcp_url, Lifecycle::LegacySession).await?;
+        let client = connect(&auth, &mcp_url, Lifecycle::Sessionless).await?;
         let (new_session, new_calls) = whoami(&client).await?;
 
+        assert!(
+            new_session.starts_with("cred-sid-"),
+            "identity should be derived from the SSO session id, got {new_session:?}",
+        );
         assert_ne!(
             new_session, session,
             "a new SSO session must yield a new framework identity",
         );
         assert_eq!(new_calls, 1, "the new identity started from fresh state");
 
-        assert!(
-            framework.stored_token_keys().await.is_empty(),
-            "resource-server mode stored a token: {:?}",
-            framework.stored_token_keys().await,
-        );
+        framework
+            .assert_no_token_state(&[&session, &new_session])
+            .await;
 
         client.cancel().await?;
         Ok(())
     })
+}
+
+// ── Scenario 4 — dynamic client registration ────────────────────────
+
+/// The same flow with **no client id configured anywhere on the client side**.
+///
+/// Every other scenario calls `with_preregistered_client`, which is the happy
+/// path a deployment sets up by hand — and which walks straight past dynamic
+/// registration and the realm's client registration policies. A browser-based
+/// MCP client has no preregistered id, so RFC 7591 is the path it actually
+/// takes.
+///
+/// **Where the registration lands, and why the framework still proxies one.**
+/// rmcp follows RFC 9728: it reads the framework's protected-resource metadata,
+/// takes the `authorization_servers` entry — which in resource-server mode is
+/// *Keycloak's* issuer, not the framework — and fetches that server's metadata.
+/// The `registration_endpoint` it finds there is Keycloak's own
+/// `clients-registrations/openid-connect`, so a spec-current client registers
+/// **directly with Keycloak** and never touches `/oauth/register`. That route
+/// is nonetheless still advertised by the framework's own
+/// `/.well-known/oauth-authorization-server` — the document MCP 2025-03-26
+/// clients probe on the resource server — and still needed there for the reason
+/// it has always existed: Keycloak's registration endpoint sends no CORS
+/// headers, so a browser cannot post to it. Both halves are asserted below and
+/// both paths are then exercised: rmcp's direct registration end to end, and
+/// the framework's proxy by hand.
+///
+/// Either way it is the realm's **anonymous** registration policies that decide,
+/// and this is the only test that puts them under load: `Trusted Hosts` (the
+/// redirect URI has to resolve to one — [`REDIRECT_URI`] is `127.0.0.1`, which
+/// the shipped realm trusts), `Allowed Client Scopes`, `Max Clients Limit`, and
+/// `Consent Required` — which is why the dynamic client, unlike `mcp-client`,
+/// shows a consent form that [`keycloak_login`] has to answer.
+///
+/// What it pins down: Keycloak really minted a client, verified through the
+/// admin API by looking up the `azp` of the token that came out and checking
+/// the redirect URI recorded for it, and the resulting credential then works
+/// against the MCP endpoint like any other.
+#[tokio::test]
+#[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
+async fn lifecycle_dynamic_client_registration() -> anyhow::Result<()> {
+    scenario!(|keycloak, framework| {
+        let mcp_url = framework.mcp_url();
+
+        // Which registration endpoint each kind of client is sent to.
+        let prm = fetch_json(&framework.prm_url()).await?;
+        let authorization_server = prm["authorization_servers"][0]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("protected-resource metadata names no AS: {prm}"))?
+            .to_string();
+        assert_eq!(
+            authorization_server,
+            keycloak.issuer(),
+            "resource-server mode must point clients at Keycloak, not at itself",
+        );
+        let as_metadata = fetch_json(&format!(
+            "{authorization_server}/.well-known/oauth-authorization-server"
+        ))
+        .await?;
+        let keycloak_registration = as_metadata["registration_endpoint"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Keycloak advertises no registration_endpoint"))?;
+        assert!(
+            keycloak_registration.starts_with(&keycloak.base_url),
+            "an RFC 9728 client registers with the AS itself, but the endpoint it \
+             would use is {keycloak_registration:?}",
+        );
+        let ours = fetch_json(&framework.as_metadata_url()).await?;
+        assert_eq!(
+            ours["registration_endpoint"],
+            json!(framework.register_url()),
+            "the framework's own AS document must keep advertising its CORS-capable \
+             registration proxy for MCP 2025-03-26 clients",
+        );
+
+        // 1. rmcp, all the way through: register, authorize, call a tool.
+        let auth = authorize_dynamically(&mcp_url, "bob", "bob").await?;
+        let bearer = auth.get_access_token().await?;
+        let claims = jwt_claims(&bearer)?;
+
+        let azp = claims["azp"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("token carries no `azp`"))?;
+        assert_ne!(
+            azp, CLIENT_ID,
+            "the flow fell back to the preregistered client — DCR did not happen",
+        );
+        assert_dynamic_client(keycloak, azp).await?;
+
+        // And the credential it produced is an ordinary working credential.
+        let client = connect(&auth, &mcp_url, Lifecycle::Sessionless).await?;
+        let (session, calls) = whoami(&client).await?;
+        assert_eq!(calls, 1);
+        framework.assert_no_token_state(&[&session]).await;
+        client.cancel().await?;
+
+        // 2. The framework's proxy, which is what a browser-based 2025-03-26
+        //    client posts to. It must reach Keycloak — the handler answers 201
+        //    with the *configured* client id when Keycloak refuses, so a
+        //    successful-looking response proves nothing on its own.
+        let proxied =
+            register_through_framework(&framework, "mcp-framework harness (proxy)").await?;
+        assert_ne!(
+            proxied, CLIENT_ID,
+            "/oauth/register returned the configured client id — that is the offline \
+             fallback, so the proxy to Keycloak did not go through",
+        );
+        assert_dynamic_client(keycloak, &proxied).await?;
+
+        Ok(())
+    })
+}
+
+/// Keycloak holds a real, public client under `client_id`, carrying the
+/// redirect URI it was registered with. The framework's own response would be
+/// just as happy with a fabricated id, so this reads the admin API instead.
+async fn assert_dynamic_client(keycloak: &Keycloak, client_id: &str) -> anyhow::Result<()> {
+    let record = admin_client_record(keycloak, client_id).await?;
+    let redirects = record["redirectUris"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("registered client has no redirectUris"))?;
+    assert!(
+        redirects.iter().any(|uri| uri == REDIRECT_URI),
+        "the dynamically registered client does not carry {REDIRECT_URI:?}: {redirects:?}",
+    );
+    assert_eq!(
+        record["publicClient"],
+        json!(true),
+        "a client registered with token_endpoint_auth_method=none must be public",
+    );
+    Ok(())
+}
+
+/// An RFC 7591 registration posted at the framework's proxy, returning the
+/// `client_id` it hands back.
+async fn register_through_framework(
+    framework: &Framework,
+    client_name: &str,
+) -> anyhow::Result<String> {
+    let response: Value = reqwest13::Client::new()
+        .post(framework.register_url())
+        .json(&json!({
+            "client_name": client_name,
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "scope": SCOPES.join(" "),
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    response["client_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("/oauth/register answered without a client_id: {response}"))
+}
+
+/// A discovery document, fetched and parsed. These are all public endpoints.
+async fn fetch_json(url: &str) -> anyhow::Result<Value> {
+    Ok(reqwest13::Client::new()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 // ── Guard: expiry actually bites ────────────────────────────────────
@@ -973,25 +1492,51 @@ async fn expired_bearer_is_refused_once_the_skew_leeway_passes() -> anyhow::Resu
 
 // ── Guard: the mode's own preconditions ─────────────────────────────
 
-/// The realm must actually inject the audience the framework demands. A
-/// `protocolMapper` Keycloak does not recognise is accepted at import and then
-/// injects nothing, which would show up as an unexplained 401 in every scenario
-/// above — so it is worth one direct assertion.
+/// Two preconditions every scenario above silently depends on, asserted here so
+/// a failure of either shows up as itself rather than as an unexplained 401.
+///
+/// **The audience.** A `protocolMapper` Keycloak does not recognise is accepted
+/// at import and then injects nothing, and `OAUTH_EXPECTED_AUDIENCE` is
+/// mandatory in this mode — so a typo in the realm turns every request into a
+/// confused-deputy rejection with no clue attached.
+///
+/// **The scopes.** `mcp:tools` and `mcp:resources` are *optional* client scopes:
+/// they reach a token only if the client requests them, and a client only
+/// requests what discovery advertises. That makes the chain here three links
+/// long — `OAUTH_SCOPES` → the RFC 8414 / RFC 9728 documents → the `scope` claim
+/// — and a break anywhere in it is invisible until someone wonders why an
+/// authorization rule keyed on `mcp:tools` never fires.
 #[tokio::test]
 #[ignore = "needs Docker (Keycloak testcontainer); run with --ignored"]
-async fn realm_injects_the_expected_audience() -> anyhow::Result<()> {
+async fn realm_injects_the_expected_audience_and_scopes() -> anyhow::Result<()> {
     scenario!(|keycloak, framework| {
         let mcp_url = framework.mcp_url();
-        let auth = authorize(&mcp_url, "bob", "bob").await?;
-        let token = auth.get_access_token().await?;
 
-        let payload = token
-            .split('.')
-            .nth(1)
-            .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
-        let decoded =
-            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)?;
-        let claims: Value = serde_json::from_slice(&decoded)?;
+        // Link 1: the protected-resource document advertises what this
+        // deployment configured, not a hard-coded list.
+        let prm: Value = reqwest13::Client::new()
+            .get(framework.prm_url())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let advertised = prm["scopes_supported"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("protected-resource metadata has no scopes_supported"))?
+            .iter()
+            .filter_map(|scope| scope.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        for scope in SCOPES {
+            assert!(
+                advertised.iter().any(|found| found == scope),
+                "discovery does not advertise {scope:?}: {advertised:?}",
+            );
+        }
+
+        // Links 2 and 3: the client asks for them, Keycloak grants them.
+        let auth = authorize(&mcp_url, "bob", "bob").await?;
+        let claims = jwt_claims(&auth.get_access_token().await?)?;
 
         let audiences = match &claims["aud"] {
             Value::String(one) => vec![one.clone()],
@@ -1005,6 +1550,15 @@ async fn realm_injects_the_expected_audience() -> anyhow::Result<()> {
             audiences.iter().any(|aud| aud == AUDIENCE),
             "the `mcp-audience` mapper injected {audiences:?}, expected {AUDIENCE:?}",
         );
+
+        let granted = claims["scope"].as_str().unwrap_or_default();
+        for scope in ["mcp:tools", "mcp:resources"] {
+            assert!(
+                granted.split_whitespace().any(|found| found == scope),
+                "the access token does not carry {scope:?}: {granted:?}",
+            );
+        }
+
         assert_eq!(
             claims["iss"],
             json!(keycloak.issuer()),
