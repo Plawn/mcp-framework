@@ -615,7 +615,7 @@
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
       "frontchannelLogout": true,
-      "fullScopeAllowed": true,
+      "fullScopeAllowed": false,
       "consentRequired": false,
       "redirectUris": [
         "http://127.0.0.1/*",
@@ -667,7 +667,7 @@
         "subType": "anonymous",
         "config": {
           "host-sending-registration-request-must-match": [
-            "true"
+            "false"
           ],
           "client-uris-must-match": [
             "true"

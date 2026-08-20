@@ -13,8 +13,8 @@ Le realm livré n'est **pas** une fixture de test : il exige TLS et ne contient
 aucun utilisateur. Tout ce dont un test a besoin et qu'un realm réel ne doit pas
 porter est injecté par le harness (`write_patched_realm`), pas par ce fichier :
 durée de vie de l'access token, audience, `sslRequired: none`, les utilisateurs
-`alice` / `bob`, et la moitié « hôte émetteur » de la politique
-`trusted-hosts`.
+`alice` / `bob`. Les politiques d'enregistrement dynamique, elles, sont
+exercées **telles que livrées**.
 
 ## Import
 
@@ -42,6 +42,17 @@ bas).
 `publicClient: true`, flux standard uniquement (`directAccessGrantsEnabled:
 false`, pas d'implicite, pas de device flow), `pkce.code.challenge.method =
 S256` — donc PKCE obligatoire, ce que la spec MCP exige d'un client public.
+
+`fullScopeAllowed: false`. Avec `true`, le client hérite de *tous* les rôles du
+royaume : les tokens portent le `realm_access` complet de l'utilisateur, y
+compris des rôles qui ne concernent en rien le serveur MCP, et un token volé
+devient beaucoup plus intéressant. Ce que le client doit réellement obtenir
+passe par les *scope mappings* de ses client scopes — c'est le cas de
+`offline_access`, dont le rôle royaume homonyme est porté par le client scope
+que Keycloak crée lui-même (voir plus bas), donc la demande `offline_access`
+que rmcp ajoute continue de passer. Un déploiement dont un `AccessValidator`
+lit un rôle métier doit l'attacher explicitement au client ou à un client
+scope, pas rouvrir le scope complet.
 
 `redirectUris` couvre deux familles :
 
@@ -140,7 +151,7 @@ deux sous-types (`anonymous` et `authenticated`) :
 
 | Politique | Rôle |
 |---|---|
-| `trusted-hosts` | restreint les hôtes autorisés à s'enregistrer et les `redirect_uri` acceptés |
+| `trusted-hosts` | valide les `redirect_uri` demandés contre la liste d'hôtes (la vérification de l'IP émettrice, elle, est désactivée — voir plus bas) |
 | `allowed-client-templates` | limite les client scopes qu'un client enregistré peut réclamer |
 | `allowed-protocol-mappers` | liste blanche de mappers — empêche un client enregistré de se fabriquer des claims |
 | `max-clients` | plafond de clients (200) |
@@ -173,11 +184,27 @@ renvoie aucun en-tête CORS.
 > raison pour laquelle le mapper d'audience est *aussi* posé sur `mcp:tools` et
 > `mcp:resources` : ces scopes-là, le client les a demandés, donc il les garde.
 
+**Les deux moitiés de `trusted-hosts` ne se valent pas.**
+`client-uris-must-match: true` valide les `redirect_uri` (et autres URI) que la
+demande d'enregistrement réclame : c'est la moitié qui protège réellement,
+puisqu'un client enregistré avec un `redirect_uri` arbitraire est un vol de code
+d'autorisation en attente. `host-sending-registration-request-must-match`, en
+revanche, compare l'**adresse IP source** de la requête d'enregistrement à la
+liste d'hôtes — et en mode resource server c'est le client MCP lui-même qui
+s'enregistre, depuis n'importe où sur Internet, puisque c'est là que la
+métadonnée de ressource protégée l'envoie. Cette moitié refuse donc
+systématiquement, y compris le client parfaitement légitime. Le realm livre
+`host-sending-registration-request-must-match: false` et
+`client-uris-must-match: true`.
+
+Un déploiement qui n'accepte l'enregistrement dynamique que depuis son propre
+réseau peut la réactiver : elle redevient sensée quand l'émetteur de la demande
+est une machine connue. Ce n'est pas le cas d'un client MCP.
+
 > **À confirmer.** `trusted-hosts` liste `mcp.example.com`, `localhost` et
-> `127.0.0.1`. À aligner sur le nom d'hôte public réel avant mise en production.
-> Le harness désactive `host-sending-registration-request-must-match` (le
-> framework et le conteneur ne se voient que par la passerelle Docker) et laisse
-> `client-uris-must-match` actif.
+> `127.0.0.1`. À aligner sur le nom d'hôte public réel avant mise en production
+> — c'est cette liste qui décide des `redirect_uri` acceptables, donc la laisser
+> sur les valeurs d'exemple revient à n'autoriser que des clients loopback.
 
 ### Durées de vie
 

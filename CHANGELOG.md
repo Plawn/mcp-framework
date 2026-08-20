@@ -58,17 +58,31 @@ answer is a hardcoded audience mapper, which is not guessable.
 - **The versioned realm is safe by default**: `sslRequired: "external"` and no
   users. The harness patches a *copy* before importing it into its throwaway
   container — `sslRequired: "none"`, two test users, a shortened access-token
-  lifespan, a rewritten audience, relaxed trusted-hosts — so the fixture's
-  conveniences cannot be imported into a deployment by accident.
-- Three Keycloak behaviours the realm now accommodates, each found the hard way
+  lifespan, a rewritten audience — so the fixture's conveniences cannot be
+  imported into a deployment by accident. The client registration policies are
+  patched *not at all*, and are exercised exactly as shipped.
+- `mcp-client` carries `fullScopeAllowed: false`. With the full scope, every
+  realm role the user holds lands in every token the MCP client is issued —
+  claims the resource server has no use for and a stolen token every reason to
+  want. What the client legitimately needs comes through its client scopes'
+  role mappings, `offline_access` included.
+- Four Keycloak behaviours the realm now accommodates, each found the hard way
   against a live container: the `Allowed Client Scopes` policy validates every
   name in a DCR `scope` against realm client scopes, so `openid` must be listed
   explicitly; a DCR request carrying `scope` **replaces** the client's default
-  scopes, so `mcp:tools` / `mcp:resources` carry the audience mapper too or a
-  dynamically registered client gets no `aud`; and declaring the
-  `offline_access` client scope in an export suppresses Keycloak's own
-  offline-token setup, so the export leaves it to Keycloak (rmcp requests that
-  scope per SEP-2207).
+  scopes (leaving `basic` and pushing everything requested to optional), so
+  `mcp:tools` / `mcp:resources` carry the audience mapper too or a dynamically
+  registered client gets no `aud`; declaring the `offline_access` client scope
+  in an export suppresses Keycloak's own offline-token setup, so the export
+  leaves it to Keycloak (rmcp requests that scope per SEP-2207); and the
+  `trusted-hosts` policy's `host-sending-registration-request-must-match`
+  compares the **source IP** of the registration request against the host list
+  — which in resource-server mode is the MCP client's own address, from
+  anywhere on the internet, so the check rejects every legitimate client. The
+  realm ships it `false` and keeps `client-uris-must-match: true`, the half
+  that actually protects (a client registered with an arbitrary
+  `redirect_uri` is an authorization-code theft waiting to happen); the harness
+  asserts an untrusted redirect host still gets a `403`.
 - `keycloak/README.md` states what must be substituted per deployment, which
   values are proposals rather than settled, and the one ordering constraint that
   bites: refresh-token rotation must not be enabled before the switch to
