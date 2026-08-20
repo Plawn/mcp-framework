@@ -40,6 +40,7 @@ pub fn app_with(auth: AuthProvider) -> (Router, TokenStore) {
     (app, token_store)
 }
 
+#[allow(dead_code)] // not every test binary using this harness needs it
 pub async fn whoami_request(app: &Router, headers: &[(&str, &str)]) -> (StatusCode, String) {
     let mut builder = Request::builder()
         .uri("/whoami")
