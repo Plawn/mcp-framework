@@ -8,7 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > History before `0.2.0` was not retro-documented; see `git log` for earlier releases.
 
-## [0.3.1] — Unreleased
+## [0.4.0] — 2026-08-20
+
+> Released as `0.4.0` rather than `0.3.1`: the `v0.3.1` tag was cut by CI on
+> the version bump itself, before any of the work below landed, and the
+> release job skips an existing tag. The minor bump also reflects that
+> `build_app` now returns a `Result` and the advertised `scopes_supported`
+> follow `OAUTH_SCOPES` — not strictly additive changes.
 
 ### Added — an OAuth lifecycle harness against a real Keycloak
 
