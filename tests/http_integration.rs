@@ -354,6 +354,51 @@ async fn http_modern_discover_remains_stateless_and_lists_tools() -> anyhow::Res
         discover_response.headers().get("mcp-session-id").is_none(),
         "modern discover must not create a session"
     );
+    assert_eq!(
+        discover_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "terminal sessionless discovery should use plain JSON"
+    );
+
+    let list_response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/list")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "stateless-test",
+                        "version": "1"
+                    }
+                }
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(list_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        list_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "terminal sessionless tools/list should use plain JSON"
+    );
+    let list_body: serde_json::Value = list_response.json().await?;
+    let listed_tools = list_body["result"]["tools"]
+        .as_array()
+        .expect("tools/list result must contain a tools array");
+    assert!(!listed_tools.is_empty(), "tools/list must not be empty");
 
     let client = connect_modern_discover_client(addr).await;
 

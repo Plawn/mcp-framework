@@ -312,6 +312,12 @@ where
     // which some MCP clients (e.g. Claude) misinterpret, causing the connection to
     // close before the tool result is delivered.
     //
+    // Prefer plain JSON for terminal sessionless responses. In particular, Claude's
+    // first 2026-07-28 capability import can discard an otherwise valid SSE-framed
+    // tools/list response and show an empty list until the user refreshes it. rmcp
+    // automatically falls back to SSE when a handler emits an intermediate request
+    // or notification, and legacy protocol sessions remain SSE-based.
+    //
     // rmcp 1.5 validates the Host header against an allowlist (default: loopback
     // only). For public deployments we derive the allowed host from PUBLIC_URL.
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
@@ -329,6 +335,7 @@ where
     tracing::info!(allowed_hosts = ?allowed_hosts, "MCP host validation configured");
     let mut mcp_config = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
+        .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
         // Modern requests are self-contained. Require both the HTTP header and
         // the SEP-2575 request metadata instead of silently treating malformed
