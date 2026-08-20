@@ -123,9 +123,18 @@ fn setup_oauth_routes(
         .build()
         .expect("Failed to build HTTP client");
 
+    // RFC 9728: where clients are told to authenticate. A pure resource server
+    // proxies nothing, so it names the real authorization server; the proxying
+    // modes name themselves, because they front the authorize/token endpoints.
+    let authorization_server = if oauth_config.token_mode.is_stateful() {
+        public_url.to_string()
+    } else {
+        oauth_config.issuer_url.trim_end_matches('/').to_string()
+    };
+
     let well_known_state = Arc::new(WellKnownState {
         resource_url: format!("{}/mcp", public_url),
-        authorization_server: public_url.to_string(),
+        authorization_server,
         scopes: oauth_config.scopes.clone(),
     });
 
@@ -136,11 +145,20 @@ fn setup_oauth_routes(
         http_client.clone(),
     );
 
-    let oauth_state = OAuthState {
-        config: oauth_config.clone(),
-        store: token_store.clone(),
-        http_client,
-        app_name: app_name.to_string(),
+    // The browser login flow (`/oauth/login`, `/oauth/callback`, `/oauth/status`)
+    // performs a server-side code exchange and writes the grant into the
+    // `TokenStore` — exactly the state a pure resource server abolishes. It is
+    // therefore not mounted in `TokenMode::ResourceServer`.
+    let oauth_routes = if oauth_config.token_mode.is_stateful() {
+        let oauth_state = OAuthState {
+            config: oauth_config.clone(),
+            store: token_store.clone(),
+            http_client,
+            app_name: app_name.to_string(),
+        };
+        mcp_oauth_router(mcp_oauth_state.clone()).merge(oauth_router(oauth_state))
+    } else {
+        mcp_oauth_router(mcp_oauth_state.clone())
     };
 
     Router::new()
@@ -157,10 +175,7 @@ fn setup_oauth_routes(
             get(authorization_server_metadata_handler)
                 .with_state(Arc::new(mcp_oauth_state.clone())),
         )
-        .nest(
-            OAUTH_MOUNT,
-            mcp_oauth_router(mcp_oauth_state).merge(oauth_router(oauth_state)),
-        )
+        .nest(OAUTH_MOUNT, oauth_routes)
 }
 
 /// Build the axum router with all routes configured.
@@ -400,8 +415,23 @@ where
                 "OAuth server:    {}/.well-known/oauth-authorization-server",
                 public_url
             );
-            tracing::info!("OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token");
-            tracing::info!("Legacy OAuth:    /oauth/login, /oauth/callback, /oauth/status");
+            if oauth_config.token_mode.is_stateful() {
+                tracing::info!(
+                    "OAuth endpoints: /oauth/register, /oauth/authorize, /oauth/token"
+                );
+                tracing::info!("Legacy OAuth:    /oauth/login, /oauth/callback, /oauth/status");
+            } else {
+                tracing::info!("OAuth endpoints: /oauth/register (DCR translation only)");
+                tracing::info!(
+                    "Pure resource server: authorize/token/login are NOT proxied; clients \
+                     authenticate directly against {}",
+                    oauth_config.issuer_url
+                );
+                tracing::info!(
+                    "Accepted audiences: {}",
+                    oauth_config.expected_audiences.join(", ")
+                );
+            }
         }
     }
 

@@ -41,10 +41,24 @@ pub struct ClientRegistrationResponse {
 }
 
 /// Build a fallback registration response when Keycloak DCR fails.
-fn build_fallback_registration(request: &ClientRegistrationRequest) -> ClientRegistrationResponse {
-    let client_id = request
-        .client_name
-        .clone()
+///
+/// `configured_client_id` is `Some` only in [`TokenMode::ResourceServer`]. In
+/// the proxying modes a fabricated id is harmless: `/oauth/authorize` rewrites
+/// `client_id` to the configured one before forwarding to Keycloak, so whatever
+/// is handed out here never reaches the authorization server. A pure resource
+/// server proxies nothing — the client takes this id straight to Keycloak,
+/// where an invented one does not exist — so it is handed the configured client
+/// id instead. (As before, that Keycloak client must allow the client's
+/// `redirect_uri`.)
+///
+/// [`TokenMode::ResourceServer`]: super::TokenMode::ResourceServer
+fn build_fallback_registration(
+    request: &ClientRegistrationRequest,
+    configured_client_id: Option<&str>,
+) -> ClientRegistrationResponse {
+    let client_id = configured_client_id
+        .map(str::to_string)
+        .or_else(|| request.client_name.clone())
         .unwrap_or_else(|| format!("{}{}", MCP_CLIENT_ID_PREFIX, uuid::Uuid::new_v4()));
 
     ClientRegistrationResponse {
@@ -71,6 +85,10 @@ pub async fn register_handler(
         "{}/clients-registrations/openid-connect",
         state.keycloak_realm_url
     );
+
+    // See `build_fallback_registration`.
+    let fallback_client_id = (!state.token_mode.is_stateful())
+        .then(|| state.keycloak_client_id.clone());
 
     tracing::info!(
         "DCR request for client: {:?}, redirects: {:?}",
@@ -147,7 +165,7 @@ pub async fn register_handler(
                 );
 
                 // Keycloak DCR failed - return a fallback client
-                let response = build_fallback_registration(&request);
+                let response = build_fallback_registration(&request, fallback_client_id.as_deref());
                 Ok((StatusCode::CREATED, Json(response)))
             }
         }
@@ -156,7 +174,7 @@ pub async fn register_handler(
             tracing::warn!("Keycloak unreachable for DCR, returning fallback client");
 
             // Fallback: return a generated client_id so the flow can continue
-            let response = build_fallback_registration(&request);
+            let response = build_fallback_registration(&request, fallback_client_id.as_deref());
             Ok((StatusCode::CREATED, Json(response)))
         }
     }

@@ -217,6 +217,10 @@ fn build_passthrough_response(
 ///
 /// Dispatches to [`passthrough_token_handler`] or [`opaque_token_handler`]
 /// depending on the configured [`TokenMode`].
+///
+/// Not reachable in [`TokenMode::ResourceServer`]: `mcp_oauth_router` does not
+/// mount the route at all, so the request 404s in the router rather than
+/// arriving here. The arm exists because the match must be exhaustive.
 pub async fn token_handler(
     State(state): State<Arc<McpOAuthState>>,
     headers: HeaderMap,
@@ -225,6 +229,12 @@ pub async fn token_handler(
     match state.token_mode {
         TokenMode::Opaque => opaque_token_handler(state, headers, body).await,
         TokenMode::Passthrough => passthrough_token_handler(state, headers, body).await,
+        TokenMode::ResourceServer => Err(HttpError::oauth_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "invalid_request",
+            "This server is a pure OAuth resource server and does not proxy token \
+             requests. Use the token endpoint advertised by the authorization server.",
+        )),
     }
 }
 
