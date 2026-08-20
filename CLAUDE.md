@@ -93,9 +93,26 @@ The framework validates the inbound JWT locally and keeps **no** token state: no
 
 `TokenMode::is_stateful()` is the single predicate every stateful path keys off — the token proxy, the legacy login flow, `TokenStore` writes, server-side refresh.
 
-**Validation.** The middleware branches before any store access and calls the same `TokenStore::validate_unknown_bearer` described below, so the JWKS rules are unchanged: asymmetric algorithms only, keys cached by `kid`, rate-limited refetches, `iss` / `exp` / `nbf` / `aud` checked locally. `UnknownTokenValidation::Jwks` is the recommended policy — a pure resource server has no reason to ask the authorization server anything, and `reject` is refused outright (every bearer is "unknown" when the framework issues none).
+**Validation is JWKS-only, structurally.** The middleware branches before any store access and calls `TokenStore::validate_bearer_via_jwks` — *not* the policy-driven `validate_unknown_bearer` used by the proxying modes. The JWKS rules themselves are unchanged (asymmetric algorithms only, keys cached by `kid`, rate-limited refetches, `iss` / `exp` / `nbf` / `aud` checked locally), but introspection is not reachable from this path at all.
 
-**`OAUTH_EXPECTED_AUDIENCE` is mandatory here**, and `OAuthConfig::validate()` fails at boot without it (called from `McpAppBuilder::validate` and from `run_http_mode`, since `McpApp` can be built without the builder). The reason is not pedantry: this mode accepts a bearer on the strength of a signature alone, so an unconstrained `aud` would accept *every* token the issuer ever signed, including one minted for a different service — the confused-deputy case RFC 8707 and the MCP spec require a resource server to refuse. In the proxying modes the audience is implied by the fact that this server performed the exchange itself, which is why the check is scoped to this mode.
+The reason is the mandatory audience check below. RFC 7662 introspection answers "is this token active?" — it does not tell this server that the token was minted *for* it, and the framework accepts an `active: true` response without re-deriving `iss` / `aud`. Leaving introspection available as a fallback would therefore hand back the confused-deputy hole the `aud` check exists to close: a token for another service, or an opaque token this server cannot even read, would be accepted the moment JWKS declined it. So `OAuthConfig::validate()` settles the policy at boot:
+
+| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | In `ResourceServer` mode |
+|---|---|
+| `jwks` | used as-is |
+| `jwks_then_introspection` (the default) | **coerced to `jwks`**, with a startup `tracing::warn!` naming the coercion |
+| `introspection` | **boot error** — the mode cannot honour it |
+| `reject` | **boot error** — every bearer is "unknown" when the framework issues none |
+
+The default is coerced rather than refused so that an env file written for passthrough still boots. `OAuthConfig::effective_unknown_token_validation()` exposes the same resolution, and `configure_unknown_bearer_validation` uses it, so the store cannot be left holding a policy the middleware would not honour.
+
+**A protocol session belongs to the principal that opened it.** The proxying modes get this for free: passthrough compares the inbound bearer's principal against the token already bound to the session and 401s a mismatch, and opaque resolves the session id *from* the opaque token, overwriting whatever `mcp-session-id` the client sent. Resource-server mode keeps no token state, which removed that comparison — so Bob, holding a valid JWT of his own, could send Alice's `mcp-session-id` and land inside Alice's rmcp session and `SessionStore` entry.
+
+`SessionBindings` (`src/auth/binding.rs`) closes it: after JWT validation, when the client supplied a protocol session id, the middleware claims `session_id → credential_session_key(bearer)` — the `sha256`-derived identity, never token material. The first request establishes the binding; a later request presenting a different identity gets `401`. The table is bounded (`SESSION_BINDING_MAX_ENTRIES`) and expires with the transport session TTL, and is written through to persistence under `NS_SESSION_BINDING` so a peer instance behind a round-robin load balancer enforces the same binding. Keying on `sid`/`sub` rather than on the bearer bytes means client-side token rotation does not lock a user out of their own session. A *derived* session id needs no binding — it is already a function of the credential.
+
+**Nothing token-shaped is built, loaded, or swept.** The `TokenStore` is created without a `RefreshConfig` and without a persistence backend; `run_http` skips `load_persisted()` and never starts the token cleanup task. Session, capability and session-binding persistence stay wired. A deployment switching over from passthrough therefore keeps its Redis without this mode adopting — or garbage-collecting — the grants already in it.
+
+**`OAUTH_EXPECTED_AUDIENCE` is mandatory here**, and `OAuthConfig::validate()` fails at boot without it. The check lives at the bottom of the public entry points rather than only in the runner: **`build_app` returns `Result<(Router, TokenStore, CapabilityRegistry), ConfigError>`** and validates before assembling anything, and `run_http` calls it before binding the listener, so a consumer that builds an `McpApp` by hand — or calls `build_app` directly — cannot route around the guard. The reason is not pedantry: this mode accepts a bearer on the strength of a signature alone, so an unconstrained `aud` would accept *every* token the issuer ever signed, including one minted for a different service — the confused-deputy case RFC 8707 and the MCP spec require a resource server to refuse. In the proxying modes the audience is implied by the fact that this server performed the exchange itself, which is why the check is scoped to this mode.
 
 **What token consumers receive.** There is no store entry to look up, so the middleware attaches the validated credential to the request as a `RequestToken(StoredToken)` extension, and `resolve_token` (`src/capability/filter.rs`) prefers it over the store. rmcp injects the axum `http::request::Parts` — extensions included — into the MCP request context, which is how it survives the trip. Since every consumer path already funnels through `resolve_token`, capability filters, access validators and tool handlers see exactly what they see in the proxying modes:
 
@@ -130,7 +147,7 @@ What to check before flipping it:
 2. **The client must handle its own refresh.** Any MCP client implementing 2025-06-18 does; a client that relied on the framework proxying `/oauth/token` will not.
 3. **The Keycloak client must allow the client's `redirect_uri` directly**, since `/oauth/authorize` no longer rewrites anything.
 4. **Server-side code that read `token.refresh_token` stops working** — that value is gone by design. Code reading `access_token` or `claims::<C>()` is unaffected.
-5. **Existing sessions are not migrated.** Tokens the store holds from the previous mode are simply ignored; clients re-authenticate once.
+5. **Existing sessions are not migrated.** Grants persisted by the previous mode are neither loaded nor deleted — they simply sit there, so flipping back is possible; clients re-authenticate once.
 
 **Calling an upstream API with the inbound bearer is forbidden, and the framework does not do it for you.** The MCP spec is explicit: a token issued for this resource server must not be forwarded to another service — that is the confused deputy the audience check exists to prevent, and it is exactly what "just pass the bearer through" does. Two supported paths:
 
@@ -143,7 +160,7 @@ RFC 7662 introspection used to be the only check available for such a bearer, an
 
 Verifying the signature against the issuer's published keys has no such requirement, so `validate_unknown_bearer` tries, in order:
 
-1. **`TokenStore`** — a proxy-issued token is already trusted; it never causes a JWKS or introspection round-trip. (Not applicable in `ResourceServer` mode, where the store is always empty.)
+1. **`TokenStore`** — a proxy-issued token is already trusted; it never causes a JWKS or introspection round-trip. (Not applicable in `ResourceServer` mode: that mode does not go through `validate_unknown_bearer` at all, see above.)
 2. **JWKS** (`src/auth/jwks.rs`) — `jwks_uri` discovered from `{issuer}/.well-known/openid-configuration`, keys cached by `kid`, signature plus `iss` / `exp` / `nbf` (and `aud`, when configured) checked locally.
 3. **Introspection** — only if JWKS *could not answer*.
 
@@ -506,7 +523,7 @@ polling client would re-log the same finding on every call. So:
 
 ### Persistence layer (`src/persistence.rs`)
 
-`PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:
+`PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`, `"session_binding"`, …). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:
 
 - **Write-through**: mutations (`store_token`, `update`, `remove`, `purge_expired`) are written to the backend asynchronously (fire-and-forget via `tokio::spawn`)
 - **Load-at-startup**: `load_persisted()` reads all keys from the backend and populates the in-memory store. Called automatically during `run()` before the listener starts
@@ -570,7 +587,7 @@ If you already have a `redis::aio::ConnectionManager` (e.g. shared with other pa
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth | `openid,profile,email` |
 | `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` (also `opaque`, `resource_server`) |
-| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | `OAuthConfig::from_env()` | `jwks_then_introspection` (also `jwks`, `introspection`, `reject`) |
+| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | `OAuthConfig::from_env()` | `jwks_then_introspection` (also `jwks`, `introspection`, `reject`; in `resource_server` mode the default is coerced to `jwks` and the other two are boot errors) |
 | `OAUTH_EXPECTED_AUDIENCE` | `OAuthConfig::from_env()` | — (comma-separated; empty = `aud` unconstrained — **required** when `MCP_TOKEN_MODE=resource_server`) |
 | `MCP_METRICS_PATH` | `MetricsConfig::from_env()` (feature `metrics`) | `/metrics` (`off`/empty disables) |
 | `MCP_METRICS_NAMESPACE` | `MetricsConfig::from_env()` | `mcp` |

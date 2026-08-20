@@ -204,6 +204,22 @@ OAUTH_EXPECTED_AUDIENCE=my-mcp-server   # mandatory in this mode; boot fails wit
 The audience is mandatory here and only here: without it the server would accept
 every token the issuer ever signed, for any service. Keycloak must be configured
 to put that value in `aud` (audience mapper on the client or a client scope).
+Boot fails without it — `build_app` returns `Result<_, ConfigError>` and
+`run_http` validates before binding, so the guard cannot be routed around.
+
+Validation in this mode is JWKS-only by construction: introspection tells the
+server that a token is active, not that it was minted *for* this server, so it
+cannot enforce the audience. `OAUTH_UNKNOWN_TOKEN_VALIDATION=introspection` (and
+`reject`) are refused at boot; the default `jwks_then_introspection` is coerced
+to `jwks` with a startup warning, so an env file written for passthrough still
+boots.
+
+Because no token is bound to a session, the framework binds each protocol
+session id to the identity that opened it (a hash of the JWT's `sid`/`sub`, never
+token material) and refuses a request presenting a different one — otherwise any
+authenticated client could enter another user's session by sending its
+`mcp-session-id`. The bindings expire with the session TTL and are written
+through to persistence, so the check holds across instances.
 
 Capability filters, access validators and tool handlers see the credential as
 usual — use `ctx.token()` rather than `ctx.token_store().get_token(...)`, which
@@ -321,7 +337,7 @@ When using CLI mode (`settings: None`):
 | `OAUTH_REDIRECT_URL` | OAuth redirect URL | — |
 | `OAUTH_SCOPES` | Comma-separated scopes | `openid,profile,email` |
 | `MCP_TOKEN_MODE` | `passthrough`, `opaque`, or `resource_server` | `passthrough` |
-| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | How to check a bearer the proxy did not issue: `jwks`, `introspection`, `jwks_then_introspection`, `reject` | `jwks_then_introspection` |
+| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | How to check a bearer the proxy did not issue: `jwks`, `introspection`, `jwks_then_introspection`, `reject`. In `resource_server` mode only `jwks` is honoured (the default is coerced to it; the other two fail at boot) | `jwks_then_introspection` |
 | `OAUTH_EXPECTED_AUDIENCE` | Comma-separated audiences a locally validated JWT must carry. Required when `MCP_TOKEN_MODE=resource_server` | — (unconstrained) |
 
 A `.env` file is loaded automatically in CLI mode.

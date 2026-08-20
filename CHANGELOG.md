@@ -31,9 +31,31 @@ validates, it does not exchange.
   `OAuthConfig::validate()` fails at boot without it. The mode accepts a bearer on
   the strength of a signature alone, so an unconstrained `aud` would accept every
   token the issuer ever signed, for any service — the confused deputy an audience
-  check exists to prevent. `OAUTH_UNKNOWN_TOKEN_VALIDATION=reject` is refused for
-  the same class of reason: every bearer is "unknown" when the framework issues
-  none.
+  check exists to prevent. The check runs from `build_app` itself (see *Changed*
+  below), so it cannot be skipped by assembling an `McpApp` by hand.
+- **Validation is JWKS-only here, by construction.** Introspection reports that a
+  token is *active*; it does not establish that the token was minted for this
+  server, so it cannot enforce the audience above — as a fallback it would hand
+  back the exact hole the audience check closes. The middleware therefore calls a
+  dedicated JWKS-only path rather than the policy-driven one, and
+  `OAuthConfig::validate()` settles the policy at boot:
+  `introspection` and `reject` are refused, and the default
+  `jwks_then_introspection` is **coerced to `jwks`** with a startup warning so an
+  env file written for passthrough still boots.
+- **A protocol session belongs to the principal that opened it.** The proxying
+  modes get this from their token state (passthrough compares principals, opaque
+  derives the session id from the token); a stateless resource server has no such
+  comparison, so any authenticated client could enter another user's session by
+  sending its `mcp-session-id`. The framework now binds each protocol session id
+  to a hash of the presenting JWT's `sid`/`sub` — never token material — and
+  answers `401` when a later request presents a different identity. Bounded,
+  expiring with the session TTL, and written through to persistence
+  (`session_binding` namespace) so the check holds across instances.
+- **Zero token state means zero.** The `TokenStore` is built without a refresh
+  configuration and without a persistence backend, and startup skips both the
+  persisted-grant load and the token cleanup task. Session, capability and
+  session-binding persistence stay wired. Grants left in Redis by a previous
+  passthrough deployment are neither adopted nor collected.
 - **Consumers still get a token.** With no store entry to look up, the middleware
   attaches the validated credential to the request (`RequestToken`), and
   `resolve_token` prefers it over the store — so capability filters, access
@@ -61,6 +83,15 @@ validates, it does not exchange.
 Passthrough and opaque are unchanged. Migration notes, including what Keycloak
 needs and why forwarding the inbound bearer to an upstream API is not an option,
 are in `CLAUDE.md`.
+
+### Changed — `transport::build_app` is fallible
+
+`build_app` now returns `Result<(Router, TokenStore, CapabilityRegistry),
+ConfigError>` and validates the OAuth configuration before assembling anything;
+`run_http` propagates that error before it binds a listener. A configuration
+guard that only ran inside the runner was bypassable by every consumer calling
+the public builder directly. Callers add `?` or `.expect(..)`. `ConfigError` is
+re-exported from the crate root.
 
 ### Added — `transport::loopback`, an in-process caller that is a real client
 
