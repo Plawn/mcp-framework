@@ -1,3 +1,4 @@
+mod binding;
 mod config;
 mod jwks;
 mod metadata;
@@ -15,6 +16,7 @@ use axum::{
 };
 use std::sync::Arc;
 
+pub use binding::SessionBindings;
 pub use config::{
     AuthProvider, BasicAuthConfig, ConfigError, OAuthConfig, TokenMode, UnknownTokenValidation,
 };

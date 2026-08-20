@@ -12,6 +12,7 @@ use axum::{
 };
 use std::sync::Arc;
 
+use super::binding::SessionBindings;
 use super::config::TokenMode;
 use super::{BasicAuthConfig, StoredToken, TokenStore};
 use crate::constants::{
@@ -133,6 +134,12 @@ pub struct AuthMiddlewareState {
     pub resource_metadata_url: String,
     pub token_store: TokenStore,
     pub token_mode: TokenMode,
+    /// Protocol session id → the identity that opened it.
+    ///
+    /// Only consulted in [`TokenMode::ResourceServer`], which is the one mode
+    /// with no per-session token to compare a new bearer against — see
+    /// [`SessionBindings`].
+    pub session_bindings: SessionBindings,
 }
 
 /// Extension to store the Bearer token for downstream handlers
@@ -520,6 +527,12 @@ pub async fn bearer_auth_middleware(
 ///    modes do — see [`credential_session_key`]. This is what lets a
 ///    `SessionStore` entry survive the client rotating its bearer, which it now
 ///    does entirely on its own.
+///
+///    When the protocol *does* supply a session id, the same derived identity
+///    is claimed against it (see [`SessionBindings`]): a valid bearer proves who
+///    the caller is, never that the session they named is theirs. The proxying
+///    modes get that comparison for free from the token they keep per session;
+///    this mode keeps none.
 /// 3. **Attach** the credential to the request: [`BearerToken`] for handlers
 ///    that want the raw string, and [`RequestToken`] carrying a transient
 ///    [`StoredToken`] (with decoded claims) for everything that reads tokens
@@ -544,7 +557,32 @@ async fn authorize_as_resource_server(
         }
     };
 
+    // Whether the *protocol* supplied the id, i.e. whether it is a value the
+    // client could have copied from somebody else. A derived id is a function of
+    // this very credential, so it needs no binding.
+    let protocol_supplied = request.headers().contains_key(MCP_SESSION_ID_HEADER);
     let session_id = resolve_or_derive_session_id(request, token);
+
+    // A valid bearer says who you are; it does not say that this session is
+    // yours. Without this check Bob, holding his own perfectly valid JWT, enters
+    // Alice's session — and her `SessionStore` entry — simply by sending her
+    // `mcp-session-id`. The proxying modes get this from the token they keep per
+    // session; this mode keeps none, so the binding is explicit.
+    if protocol_supplied {
+        let identity = credential_session_key(token);
+        if !state.session_bindings.claim(&session_id, &identity).await {
+            tracing::warn!(
+                session = %session_id,
+                "bearer does not belong to the principal bound to this protocol session, returning 401"
+            );
+            // 401 rather than 403, as the passthrough principal check does: the
+            // client's way out is to re-initialize and be given a session id of
+            // its own, and an unauthenticated caller learns nothing about
+            // whether the session it guessed exists.
+            return Err(unauthorized_response(&state.resource_metadata_url));
+        }
+    }
+
     tracing::debug!(
         session = %session_id,
         source = ?validated.source,

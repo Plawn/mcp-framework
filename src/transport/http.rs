@@ -9,7 +9,7 @@ use rmcp::transport::streamable_http_server::{
 use crate::audit::ToolCallLogger;
 use crate::auth::{
     AuthMiddlewareState, AuthProvider, BasicAuthMiddlewareState, ConfigError, McpOAuthState,
-    OAuthConfig, OAuthState, RefreshConfig, TokenStore, WellKnownState,
+    OAuthConfig, OAuthState, RefreshConfig, SessionBindings, TokenStore, WellKnownState,
     authorization_server_metadata_handler, basic_auth_middleware, bearer_auth_middleware,
     mcp_oauth_router, not_proxied_handler, oauth_router, protected_resource_metadata_handler,
     strip_framework_session_header,
@@ -75,6 +75,7 @@ fn wrap_auth_middleware(
     auth: &AuthProvider,
     public_url: &str,
     token_store: &TokenStore,
+    session_bindings: SessionBindings,
 ) -> Router {
     let router = match auth {
         AuthProvider::None => router,
@@ -97,6 +98,7 @@ fn wrap_auth_middleware(
                 ),
                 token_store: token_store.clone(),
                 token_mode: oauth_config.token_mode.clone(),
+                session_bindings,
             });
             router.layer(axum::middleware::from_fn_with_state(
                 auth_middleware_state,
@@ -237,10 +239,16 @@ where
         token_store.claims_decoder = Some(decoder);
     }
 
+    // Expires with the session it protects, and is shared across instances so a
+    // peer that never saw the session still refuses a second principal
+    // presenting its id.
+    let mut session_bindings = SessionBindings::new(transport_session_ttl);
+
     let mut registry = config.capability_registry.unwrap_or_default();
     if let Some(ref backend) = config.persistence {
         token_store.set_persistence(backend.clone());
         registry.set_persistence(backend.clone());
+        session_bindings.set_persistence(backend.clone());
     }
 
     let mut app = Router::new();
@@ -340,7 +348,13 @@ where
             .extra_routes
             .unwrap_or_default()
             .fallback_service(mcp_fallback);
-        wrap_auth_middleware(base, &config.auth, &config.public_url, &token_store)
+        wrap_auth_middleware(
+            base,
+            &config.auth,
+            &config.public_url,
+            &token_store,
+            session_bindings,
+        )
     };
 
     // Use fallback_service so the MCP handler responds at ANY path (/, /mcp, etc.).

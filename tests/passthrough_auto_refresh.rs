@@ -16,8 +16,8 @@ use axum::{
 };
 use base64::Engine as _;
 use mcp_framework::auth::{
-    AuthMiddlewareState, BearerToken, RefreshConfig, StoredToken, TokenMode, TokenStore,
-    bearer_auth_middleware,
+    AuthMiddlewareState, BearerToken, RefreshConfig, SessionBindings, StoredToken, TokenMode,
+    TokenStore, bearer_auth_middleware,
 };
 
 fn make_jwt(exp_secs_from_now: i64) -> String {
@@ -115,6 +115,9 @@ async fn passthrough_auto_refreshes_expired_bearer_when_refresh_token_present() 
         resource_metadata_url: "http://test/.well-known".into(),
         token_store: token_store.clone(),
         token_mode: TokenMode::Passthrough,
+        // Unused in passthrough: the token kept per session is what compares
+        // principals there.
+        session_bindings: SessionBindings::new(Duration::from_secs(60)),
     });
     let addr = spawn_app(state).await;
 
@@ -159,6 +162,9 @@ async fn passthrough_preserves_refresh_token_across_requests() {
         resource_metadata_url: "http://test/.well-known".into(),
         token_store: token_store.clone(),
         token_mode: TokenMode::Passthrough,
+        // Unused in passthrough: the token kept per session is what compares
+        // principals there.
+        session_bindings: SessionBindings::new(Duration::from_secs(60)),
     });
     let addr = spawn_app(state).await;
 
@@ -190,6 +196,9 @@ async fn passthrough_returns_401_when_expired_and_no_refresh_token() {
         resource_metadata_url: "http://test/.well-known".into(),
         token_store: token_store.clone(),
         token_mode: TokenMode::Passthrough,
+        // Unused in passthrough: the token kept per session is what compares
+        // principals there.
+        session_bindings: SessionBindings::new(Duration::from_secs(60)),
     });
     let addr = spawn_app(state).await;
 

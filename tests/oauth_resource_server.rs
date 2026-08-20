@@ -388,6 +388,108 @@ async fn a_client_cannot_bind_itself_to_someone_elses_identity() {
     );
 }
 
+#[tokio::test]
+async fn a_protocol_session_belongs_to_the_principal_that_opened_it() {
+    // A valid bearer says who you are; it never says that the session you named
+    // is yours. Bob has his own perfectly good JWT — and Alice's session id.
+    let auth = issuer().await.auth;
+    let alice = format!("Bearer {}", Jwt::valid(&auth).sign());
+    let bob = format!(
+        "Bearer {}",
+        Jwt {
+            subject: "user-bob",
+            session_state: Some("kc-session-bob"),
+            ..Jwt::valid(&auth)
+        }
+        .sign()
+    );
+    let (app, _) = app_with(auth);
+
+    let session = "mcp-session-alice";
+
+    let (status, alice_identity) = whoami_request(
+        &app,
+        &[("authorization", &alice), (MCP_SESSION_ID_HEADER, session)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        alice_identity, session,
+        "the protocol id is what keys her session"
+    );
+
+    let (status, _) = whoami_request(
+        &app,
+        &[("authorization", &bob), (MCP_SESSION_ID_HEADER, session)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "Bob's own valid token must not let him into Alice's session"
+    );
+
+    // Bob is free to open a session of his own.
+    let (status, bob_identity) = whoami_request(
+        &app,
+        &[
+            ("authorization", &bob),
+            (MCP_SESSION_ID_HEADER, "mcp-session-bob"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bob_identity, "mcp-session-bob");
+
+    // And the rejection did not cost Alice hers.
+    let (status, _) = whoami_request(
+        &app,
+        &[("authorization", &alice), (MCP_SESSION_ID_HEADER, session)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_binding_follows_the_sso_session_not_the_bearer_bytes() {
+    // The client rotates its access token on its own in this mode, so a binding
+    // keyed on the credential's bytes would lock the user out of their own
+    // session at the first refresh.
+    let auth = issuer().await.auth;
+    let first = format!("Bearer {}", Jwt::valid(&auth).sign());
+    let rotated = format!(
+        "Bearer {}",
+        Jwt {
+            exp: now() + 900,
+            ..Jwt::valid(&auth)
+        }
+        .sign()
+    );
+    assert_ne!(
+        first, rotated,
+        "the two bearers really are different tokens"
+    );
+    let (app, _) = app_with(auth);
+
+    let session = "mcp-session-alice";
+    let (status, _) = whoami_request(
+        &app,
+        &[("authorization", &first), (MCP_SESSION_ID_HEADER, session)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = whoami_request(
+        &app,
+        &[
+            ("authorization", &rotated),
+            (MCP_SESSION_ID_HEADER, session),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "same `sid`, same session");
+}
+
 // ---------------------------------------------------------------------------
 // What the consumers of a token actually receive
 // ---------------------------------------------------------------------------
