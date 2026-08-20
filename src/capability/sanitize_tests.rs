@@ -669,3 +669,128 @@ fn audit_reports_a_schema_with_no_properties_only_for_the_tool() {
         vec!["the tool itself has no description".to_string()],
     );
 }
+
+// ── Blank descriptions are missing descriptions (918 follow-up) ────
+
+#[test]
+fn flatten_collision_prefers_a_real_description_over_a_blank_one() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "add" },
+                    "target": { "type": "string", "description": "   " }
+                },
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "remove" },
+                    "target": { "type": "string", "description": "What to act on." }
+                },
+                "required": ["action"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+    let props = tools[0].input_schema.as_ref()["properties"]
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // The retained entry's whitespace-only description documents nothing, so it
+    // must not shut out the real one that comes later.
+    assert_eq!(props["target"]["description"], "What to act on.");
+}
+
+#[test]
+fn flatten_discriminant_ignores_a_blank_variant_doc() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "description": "   ",
+                "properties": { "action": { "type": "string", "const": "add" } },
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "description": "Remove it.",
+                "properties": { "action": { "type": "string", "const": "remove" } },
+                "required": ["action"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+
+    assert_eq!(
+        tools[0].input_schema.as_ref()["properties"]["action"]["description"],
+        "`add` · `remove`: Remove it.",
+    );
+}
+
+#[test]
+fn flatten_discriminant_fallback_skips_a_blank_property_description() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "add", "description": "  " }
+                },
+                "required": ["action"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "remove", "description": "Which one." }
+                },
+                "required": ["action"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+
+    // No variant is documented, so the fallback is the discriminator property's
+    // own description — the first *real* one, not the first one.
+    assert_eq!(
+        tools[0].input_schema.as_ref()["properties"]["action"]["description"],
+        "Which one.",
+    );
+}
+
+#[test]
+fn flatten_required_suffix_replaces_a_blank_description() {
+    let schema: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "const": "add" },
+                    "body": { "type": "string", "description": "   " }
+                },
+                "required": ["action", "body"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut tools = vec![make_tool("t", schema)];
+    sanitize_tool_schemas(&mut tools);
+
+    assert_eq!(
+        tools[0].input_schema.as_ref()["properties"]["body"]["description"],
+        "Required when action=add.",
+    );
+}

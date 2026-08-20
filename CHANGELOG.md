@@ -86,6 +86,10 @@ any description the first variant did not happen to carry.
   the only place the per-variant `required` can survive a flat object schema.
 - A homonymous property across variants still resolves first-wins, but a
   description from a later variant now fills in for a missing one.
+- A blank description counts as no description throughout (one `nonblank`
+  helper): a whitespace-only string on an earlier variant no longer shuts out a
+  real description from a later one, and it is never used as the discriminator's
+  fallback. This is the rule the documentation audit already applied.
 
 ### Dependencies
 

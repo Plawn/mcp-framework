@@ -3,6 +3,21 @@ use std::sync::Arc;
 use rmcp::model::Tool;
 use serde_json::Value;
 
+/// A string value that is present *and* not blank.
+///
+/// Blank means missing, everywhere: a `description` of `"   "` documents
+/// nothing, so it must not win over a real one on a collision, nor satisfy
+/// [`audit_descriptions`], nor block a `title` from being folded in. One helper
+/// keeps every one of those decisions on the same rule.
+fn nonblank(value: Option<&Value>) -> Option<&str> {
+    value?.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// The `description` of a schema node, when it is a non-blank string.
+fn nonblank_description(node: &Value) -> Option<&str> {
+    nonblank(node.get("description"))
+}
+
 /// Strip schemars 1.x meta-fields (`$schema`, `title`) from a JSON schema object,
 /// and recursively sanitize the entire schema tree:
 /// - Removes `$schema` and `title` at every nesting level. `title` is folded
@@ -39,11 +54,7 @@ fn fold_title_into_description(map: &mut serde_json::Map<String, Value>) {
     if title_str.trim().is_empty() {
         return;
     }
-    let has_description = map
-        .get("description")
-        .and_then(Value::as_str)
-        .is_some_and(|d| !d.trim().is_empty());
-    if !has_description {
+    if nonblank(map.get("description")).is_none() {
         map.insert("description".to_string(), title);
     }
 }
@@ -242,9 +253,9 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
             }
             variant_tag = Some(const_val.clone());
             if tag_prop_description.is_none()
-                && let Some(Value::String(d)) = prop_schema.get("description")
+                && let Some(d) = nonblank_description(prop_schema)
             {
-                tag_prop_description = Some(d.clone());
+                tag_prop_description = Some(d.to_string());
             }
             if !tag_entries.iter().any(|(v, _)| v == const_val) {
                 tag_entries.push((const_val.clone(), v_obj.get("description").cloned()));
@@ -270,16 +281,12 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
                 // Homonymous property across variants: first wins, but never at
                 // the cost of a description the retained entry does not have.
                 serde_json::map::Entry::Occupied(mut slot) => {
-                    let kept_has_description = slot
-                        .get()
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .is_some_and(|d| !d.is_empty());
-                    if !kept_has_description
-                        && let Some(new_description) = prop_schema.get("description")
+                    if nonblank_description(slot.get()).is_none()
+                        && let Some(new_description) =
+                            nonblank_description(prop_schema).map(str::to_string)
                         && let Some(kept) = slot.get_mut().as_object_mut()
                     {
-                        kept.insert("description".to_string(), new_description.clone());
+                        kept.insert("description".to_string(), Value::String(new_description));
                     }
                 }
             }
@@ -318,11 +325,9 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
                 continue;
             };
             let suffix = format!("Required when {tk}={}.", tags.join(", "));
-            let merged = match prop.get("description").and_then(Value::as_str) {
-                Some(existing) if !existing.is_empty() => {
-                    format!("{} {suffix}", existing.trim_end())
-                }
-                _ => suffix,
+            let merged = match nonblank(prop.get("description")) {
+                Some(existing) => format!("{} {suffix}", existing.trim_end()),
+                None => suffix,
             };
             prop.insert("description".to_string(), Value::String(merged));
         }
@@ -351,12 +356,10 @@ fn value_label(value: &Value) -> String {
 /// Returns `None` when no variant is documented — the enum values alone would
 /// only restate the `enum` keyword.
 fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Option<String> {
-    let documented = entries.iter().any(|(_, d)| {
-        d.as_ref()
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    });
-    if !documented {
+    if !entries
+        .iter()
+        .any(|(_, d)| nonblank(d.as_ref()).is_some())
+    {
         return None;
     }
 
@@ -364,9 +367,9 @@ fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Optio
         .iter()
         .map(|(value, description)| {
             let label = format!("`{}`", value_label(value));
-            match description.as_ref().and_then(Value::as_str) {
-                Some(d) if !d.trim().is_empty() => format!("{label}: {}", d.trim()),
-                _ => label,
+            match nonblank(description.as_ref()) {
+                Some(d) => format!("{label}: {}", d.trim()),
+                None => label,
             }
         })
         .collect();
@@ -400,12 +403,7 @@ fn audit_descriptions(tool: &Tool) -> Vec<String> {
     if let Some(Value::Object(props)) = tool.input_schema.get("properties") {
         let undocumented: Vec<&str> = props
             .iter()
-            .filter(|(_, schema)| {
-                !schema
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .is_some_and(|d| !d.trim().is_empty())
-            })
+            .filter(|(_, schema)| nonblank_description(schema).is_none())
             .map(|(name, _)| name.as_str())
             .collect();
         if !undocumented.is_empty() {
