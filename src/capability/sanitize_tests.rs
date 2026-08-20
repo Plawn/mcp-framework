@@ -487,7 +487,12 @@ fn flatten_collision_keeps_the_available_description() {
     // First variant wins the slot but had no description; the later one's is copied.
     assert_eq!(props["target"]["description"], "What to act on.");
     // No variant is documented → no invented description on the discriminant.
-    assert!(!props["action"].as_object().unwrap().contains_key("description"));
+    assert!(
+        !props["action"]
+            .as_object()
+            .unwrap()
+            .contains_key("description")
+    );
 }
 
 #[test]

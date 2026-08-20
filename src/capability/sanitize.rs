@@ -311,8 +311,8 @@ fn flatten_top_level_combinator(schema: &mut serde_json::Map<String, Value>) {
             "type": "string",
             "enum": tag_entries.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
         });
-        if let Some(description) = compose_discriminant_description(&tag_entries)
-            .or(tag_prop_description)
+        if let Some(description) =
+            compose_discriminant_description(&tag_entries).or(tag_prop_description)
             && let Some(obj) = discriminant.as_object_mut()
         {
             obj.insert("description".to_string(), Value::String(description));
@@ -358,10 +358,7 @@ fn value_label(value: &Value) -> String {
 /// Returns `None` when no variant is documented — the enum values alone would
 /// only restate the `enum` keyword.
 fn compose_discriminant_description(entries: &[(Value, Option<Value>)]) -> Option<String> {
-    if !entries
-        .iter()
-        .any(|(_, d)| nonblank(d.as_ref()).is_some())
-    {
+    if !entries.iter().any(|(_, d)| nonblank(d.as_ref()).is_some()) {
         return None;
     }
 
