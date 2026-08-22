@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+It is an index. The rationale, invariants and worked examples for each subsystem live in `docs/` — read the relevant file **before** changing that subsystem:
+
+| Area | Doc |
+|---|---|
+| `AuthProvider`, OAuth token modes, bearer validation, Keycloak harness | [`docs/auth.md`](docs/auth.md) |
+| Session identity, sessionless revisions, transport session recovery, persistence backends | [`docs/sessions.md`](docs/sessions.md) |
+| In-process (loopback) transport | [`docs/loopback.md`](docs/loopback.md) |
+| Access validation, claims decoder, MCP Apps, tool schema sanitization | [`docs/capabilities.md`](docs/capabilities.md) |
+| Audit logging, effectiveness metrics | [`docs/observability.md`](docs/observability.md) |
+
 ## Build & Check Commands
 
 ```bash
@@ -14,26 +24,44 @@ cargo test <name>    # run a single test by name
 
 Requires **nightly** Rust (pinned in `rust-toolchain.toml`).
 
+The OAuth lifecycle tests are `#[ignore]`d and need Docker — `cargo test --test oauth_lifecycle_rmcp -- --ignored --test-threads=1`. See [`docs/auth.md`](docs/auth.md).
+
 ## Architecture
 
-This is a Rust library crate that provides an opinionated framework for building MCP (Model Context Protocol) servers on top of [`rmcp`](https://crates.io/crates/rmcp). It handles transport selection, authentication, and CLI argument parsing so consumers only need to implement `rmcp::ServerHandler`.
+A Rust library crate providing an opinionated framework for building MCP (Model Context Protocol) servers on top of [`rmcp`](https://crates.io/crates/rmcp). It handles transport selection, authentication, and CLI argument parsing so consumers only need to implement `rmcp::ServerHandler`.
+
+| Module | Responsibility |
+|---|---|
+| `src/runner.rs` | `run()` / `McpApp` / `McpAppBuilder` — `.env`, CLI (clap), tracing, transport dispatch |
+| `src/transport/` | `http.rs` (axum + `StreamableHttpService` at `/mcp`), `stdio.rs`, `session_persistence.rs` |
+| `src/auth/` | `AuthProvider`, `TokenStore`, middleware, OAuth proxy, JWKS, session bindings |
+| `src/session/` | `SessionStore<T>`, session identity resolution |
+| `src/capability/` | `CapabilityRegistry`, `DynamicHandler`, filters, access validators, schema sanitization |
+| `src/persistence.rs` | `PersistenceBackend` trait, `InMemoryBackend`, `RedisBackend` (feature `redis`) |
+| `src/audit/`, `src/metrics/` | `ToolCallLogger` stream and the feature-gated collector built on it |
+| `src/http_util/` | `HttpError` (converts to axum responses), `QueryBuilder` |
 
 ### Entry point pattern
 
-Consumers create a `McpApp` with a name, auth provider, and server factory closure, then call `run()`:
+`McpAppBuilder` is the recommended surface — a name, an auth provider, a server factory, then `run()`:
 
 ```rust
-mcp_framework::run(McpApp {
-    name: "my-server",
-    auth: AuthProvider::Basic(BasicAuthConfig::from_env().unwrap()),
-    server_factory: |token_store, session_store| MyServer::new(token_store, session_store),
-    stdio_token_env: Some("MY_TOKEN"),
-    session_store: None,
-    ..
-}).await
+McpAppBuilder::new("my-server")
+    .auth(AuthProvider::Basic(BasicAuthConfig::from_env()?))
+    .with_sessions::<MySession>()
+    .server(|| MyServer::new())
+    .run()
+    .await
 ```
 
-`run()` (`src/runner.rs`) handles `.env` loading, CLI parsing (clap), tracing setup, and dispatches to the chosen transport.
+The server factory takes **no arguments** — a handler reaches the stores through `RequestContextExt`
+(`ctx.session::<T>()`, `ctx.session_id()`, `ctx.token()`, `ctx.token_store()`) on the rmcp
+`RequestContext`. `run(McpApp { .. })` remains as the struct API; every builder field maps to a
+struct field of the same name.
+
+Other builder methods: `.settings()`, `.stdio_token_env()`, `.persistence()`, `.capability_registry()`, `.capability_filter()`, `.access_validator()`, `.claims_decoder()`, `.tool_call_logger()`, `.metrics()`, `.protocol_lifecycle()`, `.extra_routes()` (behind auth), `.public_routes()` (outside auth), `.loopback()`, `.build()`.
+
+`build_app()` (`src/transport/http.rs`) is extracted as a pure function for testability and returns `Result<(Router, TokenStore, CapabilityRegistry), ConfigError>` — it validates the configuration before assembling anything, so a consumer building an `McpApp` by hand cannot route around the boot-time guards.
 
 ### rmcp version & the MRTR response types
 
@@ -44,668 +72,48 @@ Pinned to **rmcp 3.1**. Two upstream changes shape every consumer `ServerHandler
 
 `DynamicHandler` also forwards the 3.x additions to the inner handler so wrapping stays transparent: `discover` (the 2026-07-28 replacement for `initialize` — it gets the same registry capability augmentation), `supported_protocol_versions`, `accepted_subscription_filter` / `listen`, `on_custom_request` / `on_custom_notification`, and the Tasks extension (`get_task` / `update_task` / `cancel_task`). The legacy `set_level` / `subscribe` / `unsubscribe` delegations are kept behind `#[allow(deprecated)]` because they still serve clients on older revisions.
 
-### Transport layer (`src/transport/`)
+### Transport layer
 
-Two modes selected via `--transport` CLI flag:
-- **HTTP** (`http.rs`): Axum router with `rmcp::StreamableHttpService` at `/mcp`, OAuth well-known endpoints, CORS. `build_app()` is extracted as a pure function for testability.
-- **Stdio** (`stdio.rs`): stdin/stdout via `rmcp` transport, used for Claude Desktop local integration.
+Two modes selected via the `--transport` CLI flag: **HTTP** (axum router, OAuth well-known endpoints, CORS) and **stdio** (used for Claude Desktop local integration). There is no SSE transport — `TransportMode` is `Http | Stdio`.
 
-### Auth layer (`src/auth/`)
+`ProtocolLifecyclePolicy` (`src/transport/protocol.rs`, `.protocol_lifecycle()`) decides what happens to a client that announces a sessionless protocol version through the legacy `initialize` lifecycle:
 
-`AuthProvider` enum drives which middleware and routes are registered:
-- **None**: no auth middleware
-- **Basic**: HTTP Basic auth middleware, credentials from `BASIC_AUTH_*` env vars
-- **OAuth**: OAuth2/OIDC for Keycloak — RFC 8414/9728 metadata endpoints, RFC 7591 dynamic client registration, PKCE authorization flow, and (in the proxying token modes) token proxying. All OAuth routes live under `/oauth/`. How much of the flow is actually proxied depends on `TokenMode` — see below.
+- `Hybrid` (default) — such an `initialize` is negotiated down to `2025-11-25`, so rmcp creates a session and the rest of the client's legacy lifecycle stays coherent. Correct 2026-07-28 clients using `server/discover` are always served statelessly.
+- `Strict` — rmcp's routing, unmodified. Only for a deployment where every client picks the lifecycle matching the version it advertises.
 
-Key type: `TokenStore` — thread-safe token storage shared between auth middleware and the server handler via the factory closure. Supports automatic token refresh for OAuth mode.
+### In-process transport (loopback) → [`docs/loopback.md`](docs/loopback.md)
 
-#### Token modes (`TokenMode`)
+`McpAppBuilder::loopback()` hands out a `LoopbackEndpoint`: an in-process caller (agent loop, scheduler, job) becomes a real MCP client over a channel pair instead of a socket, so it goes through the same `DynamicHandler`, registry, capability filter, access validator and tool-call logger as network traffic. Calling `CapabilityRegistry::call_tool` directly is the shortcut it exists to remove — that path silently bypasses all four.
 
-When using OAuth, three modes are available. They differ on one question — **who holds the grant** — and everything else follows from the answer:
+The endpoint is a **snapshot** of the builder, so it must be taken last: `validate()` refuses to build when a captured field was configured afterwards. It keeps its own `TokenStore` and `SessionStore` (both keyed by a session id the in-process caller chooses), which is also why in-process session data is not persisted.
 
-| | `Passthrough` (default) | `Opaque` | `ResourceServer` |
-|---|---|---|---|
-| What the client holds | the real Keycloak JWT | a framework UUID | the real Keycloak JWT |
-| What the server keeps | access + refresh token | access + refresh token | **nothing** |
-| Who refreshes | both (see below) | the framework | the client, alone |
-| `/oauth/token` | proxied | proxied, response rewritten | not proxied (`404`) |
-| `/oauth/authorize` | proxied | proxied | not proxied (`404`) |
-| Bearer validation | store, then `validate_unknown_bearer` | opaque → store | `validate_unknown_bearer` only |
-| Horizontal scaling | needs shared persistence | needs shared persistence | stateless |
+### Auth layer → [`docs/auth.md`](docs/auth.md)
 
-- **Passthrough**: simple, but client and server co-own the same refresh token. Keycloak rotates refresh tokens, so the first server-side refresh invalidates the client's copy and the link breaks one cycle later. A platform logout also kills the MCP session.
-- **Opaque**: the client never sees a JWT; the framework refreshes internally. Costs server-side state that every instance must share.
-- **ResourceServer**: what MCP 2025-06-18 and later actually specify — the MCP server is an OAuth *resource server*, not an authorization server. See below.
+`AuthProvider` (None / Basic / OAuth) drives which middleware and routes are registered. Under OAuth, `TokenMode` decides who holds the grant:
 
-Configurable via:
-- `OAuthConfig` field: `token_mode: TokenMode::Opaque`
-- Environment variable: `MCP_TOKEN_MODE=passthrough|opaque|resource_server` (default: `passthrough`, read by `OAuthConfig::from_env()`; `resource-server` is accepted as an alias)
+- `Passthrough` (default) — the framework proxies `/oauth/token` and co-owns the refresh token with the client.
+- `Opaque` — the client holds a framework UUID; the framework refreshes internally. Needs shared persistence.
+- `ResourceServer` — what MCP 2025-06-18 and later specify: JWKS-only validation, **no** token state, `OAUTH_EXPECTED_AUDIENCE` mandatory. Stateless.
 
-`TokenMode` lives inside `OAuthConfig`, making misconfiguration structurally impossible (e.g. setting opaque mode with Basic auth).
+Bearers the proxy did not issue go through `validate_unknown_bearer` (`TokenStore` → JWKS → introspection), governed by `OAUTH_UNKNOWN_TOKEN_VALIDATION`.
 
-**Architecture**: The `token_handler` (`src/auth/proxy.rs`) dispatches to either `passthrough_token_handler` or `opaque_token_handler` based on the configured `TokenMode`. In opaque mode, the handler intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
+### Session layer → [`docs/sessions.md`](docs/sessions.md)
 
-In passthrough mode, the HTTP middleware treats tokens captured by `/oauth/token` as trusted grants and enforces the expiry recorded in `TokenStore`. A bearer unknown to the store (for example, a bring-your-own or token-exchange Keycloak token) goes through `TokenStore::validate_unknown_bearer` (see below). Inactive, malformed, expired, or unrefreshable credentials return `401` with the protected-resource `WWW-Authenticate` challenge before rmcp dispatches the request.
+`SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration (default 30 min), purged by a background task in HTTP mode. `resolve_session_id(extensions)` / `session_id_from_parts(&Parts)` resolve the identity, shared with `resolve_token`.
 
-#### Pure resource server mode (`TokenMode::ResourceServer`)
+MCP 2026-07-28 removes protocol-level sessions, so identity is derived from the credential's claims (`credential_session_key`) and injected under `MCP_FALLBACK_SESSION_HEADER`. That header is authoritative and is therefore stripped from every inbound request before auth runs.
 
-The framework validates the inbound JWT locally and keeps **no** token state: no `TokenStore` entry, no server-side refresh, no proxied exchange. An expired or invalid bearer gets `401` plus the protected-resource `WWW-Authenticate` challenge; the client re-authenticates against the authorization server on its own, with a refresh token nobody else has touched.
+### Persistence layer → [`docs/sessions.md`](docs/sessions.md)
 
-`TokenMode::is_stateful()` is the single predicate every stateful path keys off — the token proxy, the legacy login flow, `TokenStore` writes, server-side refresh.
+`PersistenceBackend` — async key-value interface with namespace separation. Write-through on mutation, load-at-startup, read-through on a memory miss (this is what makes multi-instance deployment work without sticky sessions). No backend configured = zero overhead. `InMemoryBackend` ships for testing; `RedisBackend` behind the `redis` feature.
 
-**Validation is JWKS-only, structurally.** The middleware branches before any store access and calls `TokenStore::validate_bearer_via_jwks` — *not* the policy-driven `validate_unknown_bearer` used by the proxying modes. The JWKS rules themselves are unchanged (asymmetric algorithms only, keys cached by `kid`, rate-limited refetches, `iss` / `exp` / `nbf` / `aud` checked locally), but introspection is not reachable from this path at all.
+### Capability layer → [`docs/capabilities.md`](docs/capabilities.md)
 
-The reason is the mandatory audience check below. RFC 7662 introspection answers "is this token active?" — it does not tell this server that the token was minted *for* it, and the framework accepts an `active: true` response without re-deriving `iss` / `aud`. Leaving introspection available as a fallback would therefore hand back the confused-deputy hole the `aud` check exists to close: a token for another service, or an opaque token this server cannot even read, would be accepted the moment JWKS declined it. So `OAuthConfig::validate()` settles the policy at boot:
+`CapabilityFilter` controls **visibility** (what clients see), `AccessValidator` controls **execution** (what clients may do) — a hidden tool can still be called by name. Both read decoded JWT claims via the global claims decoder. The registry also supports MCP Apps (`ui://` resources tagged into `_meta.ui`), and `sanitize_tool_schemas` rewrites every schema on its way to `tools/list`.
 
-| `OAUTH_UNKNOWN_TOKEN_VALIDATION` | In `ResourceServer` mode |
-|---|---|
-| `jwks` | used as-is |
-| `jwks_then_introspection` (the default) | **coerced to `jwks`**, with a startup `tracing::warn!` naming the coercion |
-| `introspection` | **boot error** — the mode cannot honour it |
-| `reject` | **boot error** — every bearer is "unknown" when the framework issues none |
+### Audit & metrics → [`docs/observability.md`](docs/observability.md)
 
-The default is coerced rather than refused so that an env file written for passthrough still boots. `OAuthConfig::effective_unknown_token_validation()` exposes the same resolution, and `configure_unknown_bearer_validation` uses it, so the store cannot be left holding a policy the middleware would not honour.
-
-**A protocol session belongs to the principal that opened it.** The proxying modes get this for free: passthrough compares the inbound bearer's principal against the token already bound to the session and 401s a mismatch, and opaque resolves the session id *from* the opaque token, overwriting whatever `mcp-session-id` the client sent. Resource-server mode keeps no token state, which removed that comparison — so Bob, holding a valid JWT of his own, could send Alice's `mcp-session-id` and land inside Alice's rmcp session and `SessionStore` entry.
-
-`SessionBindings` (`src/auth/binding.rs`) closes it: after JWT validation, when the client supplied a protocol session id, the middleware claims `session_id → credential_session_key(bearer)` — the `sha256`-derived identity, never token material. The first request establishes the binding; a later request presenting a different identity gets `401`. The table is bounded (`SESSION_BINDING_MAX_ENTRIES`) and expires with the transport session TTL, and is written through to persistence under `NS_SESSION_BINDING` so a peer instance behind a round-robin load balancer enforces the same binding. Keying on `sid`/`sub` rather than on the bearer bytes means client-side token rotation does not lock a user out of their own session. A *derived* session id needs no binding — it is already a function of the credential.
-
-**Nothing token-shaped is built, loaded, or swept.** The `TokenStore` is created without a `RefreshConfig` and without a persistence backend; `run_http` skips `load_persisted()` and never starts the token cleanup task. Session, capability and session-binding persistence stay wired. A deployment switching over from passthrough therefore keeps its Redis without this mode adopting — or garbage-collecting — the grants already in it.
-
-**`OAUTH_EXPECTED_AUDIENCE` is mandatory here**, and `OAuthConfig::validate()` fails at boot without it. The check lives at the bottom of the public entry points rather than only in the runner: **`build_app` returns `Result<(Router, TokenStore, CapabilityRegistry), ConfigError>`** and validates before assembling anything, and `run_http` calls it before binding the listener, so a consumer that builds an `McpApp` by hand — or calls `build_app` directly — cannot route around the guard. The reason is not pedantry: this mode accepts a bearer on the strength of a signature alone, so an unconstrained `aud` would accept *every* token the issuer ever signed, including one minted for a different service — the confused-deputy case RFC 8707 and the MCP spec require a resource server to refuse. In the proxying modes the audience is implied by the fact that this server performed the exchange itself, which is why the check is scoped to this mode.
-
-**What token consumers receive.** There is no store entry to look up, so the middleware attaches the validated credential to the request as a `RequestToken(StoredToken)` extension, and `resolve_token` (`src/capability/filter.rs`) prefers it over the store. rmcp injects the axum `http::request::Parts` — extensions included — into the MCP request context, which is how it survives the trip. Since every consumer path already funnels through `resolve_token`, capability filters, access validators and tool handlers see exactly what they see in the proxying modes:
-
-- `access_token` — the bearer the client sent, verbatim
-- `decoded_claims` — populated by the global claims decoder, as usual
-- `expires_at` — from the JWT's `exp`
-- `refresh_token` — **always `None`**. It belongs to the client and never reaches this process.
-
-From a `RequestContext`, use `ctx.token()` (`RequestContextExt`) rather than `ctx.token_store().get_token(ctx.session_id())`: the latter returns `None` in this mode even though the request is perfectly authenticated.
-
-**Session identity.** Unchanged from passthrough: `credential_session_key` derives a stable per-user key from the JWT's `sid` (else `sub`), injected under `MCP_FALLBACK_SESSION_HEADER`. `SessionStore<T>` therefore still works — it is application data, not credentials, and nothing about this mode says the application may not keep state.
-
-**Routing.** Five paths stop proxying: `/oauth/token`, `/oauth/authorize`, `/oauth/login`, `/oauth/callback`, `/oauth/status`. They answer `404` with a reason rather than being absent from the router — an absent path falls through to the auth-wrapped MCP fallback and answers `401`, blaming the client's credentials for a route that does not exist.
-
-`/oauth/token` is the point of the mode. `/oauth/authorize` goes with it for a reason worth stating: the proxy rewrites `client_id` to the configured `OAUTH_CLIENT_ID`, so the authorization code it returns is bound to *that* client, while the client then redeems it at Keycloak's token endpoint under its own `client_id` — `invalid_grant`. Half a proxied flow is worse than none. The legacy login routes perform the exchange server-side and write the grant into `TokenStore`, which is the state this mode abolishes.
-
-**`/oauth/register` stays.** Keycloak's `clients-registrations/openid-connect` endpoint sends no CORS headers, so a browser-based MCP client cannot perform RFC 7591 dynamic client registration against it directly; the framework's translation is still needed. It forwards the request's `scope` (RFC 7591 §2) — a client registered without the scopes it asked for is refused `invalid_scope` at authorization time, and dropping the field silently gave it the realm's defaults instead. Empty or absent `scope` is *not* forwarded: Keycloak replaces the client's default scopes the moment the field is present. Its offline fallback now returns the **configured** `OAUTH_CLIENT_ID` instead of a fabricated UUID — nothing rewrites `client_id` downstream any more, so an invented id would simply not exist at Keycloak. (As before, that Keycloak client must allow the client's `redirect_uri`.)
-
-**Discovery.** `/.well-known/oauth-protected-resource` (and `.../mcp`) advertises the Keycloak issuer in `authorization_servers` — RFC 9728, the resource server pointing at the AS instead of at itself. `/.well-known/oauth-authorization-server` is still served, because MCP 2025-03-26 clients probe the resource server for it and a `404` strands them, but it now describes **Keycloak**: `issuer`, `authorization_endpoint` and `token_endpoint` are Keycloak's, and only `registration_endpoint` remains ours (the CORS reason above). A welcome side effect: the advertised issuer finally matches the `iss` the tokens carry, which is the RFC 9207 mismatch rmcp's client reports as `AuthorizationServerIssuerMismatch` under passthrough.
-
-Both documents advertise the **configured** scopes — `OAUTH_SCOPES`, verbatim, in `scopes_supported` — rather than a hard-coded `openid profile email`. The default is unchanged, so nothing moves for a deployment that never set the variable; a deployment that defines MCP-specific scopes (`OAUTH_SCOPES=openid,profile,email,mcp:tools,mcp:resources`) can finally get clients to ask for them, since a client picks its scopes out of exactly these documents. This applies to every token mode, not only to resource-server.
-
-**Migrating from passthrough.** The framework side is three settings:
-
-```bash
-MCP_TOKEN_MODE=resource_server
-OAUTH_UNKNOWN_TOKEN_VALIDATION=jwks
-OAUTH_EXPECTED_AUDIENCE=my-mcp-server   # mandatory; boot fails without it
-```
-
-`keycloak/mcp-realm.json` is an import-ready realm for exactly this shape — a
-public PKCE client, the audience mapper Keycloak needs in place of RFC 8707
-`resource`, DCR policies and MCP-length lifetimes; `keycloak/README.md` explains
-what to substitute per deployment and which values are still proposals.
-
-What to check before flipping it:
-
-1. **Keycloak must put that audience in the token.** Add an audience mapper to the client (or a client scope) so `aud` contains the value above. Without it every request 401s — the failure is loud, and the accepted `aud` / `azp` are logged on every acceptance in the other modes, which is how to read the right value off real traffic first.
-2. **The client must handle its own refresh.** Any MCP client implementing 2025-06-18 does; a client that relied on the framework proxying `/oauth/token` will not.
-3. **The Keycloak client must allow the client's `redirect_uri` directly**, since `/oauth/authorize` no longer rewrites anything.
-4. **Server-side code that read `token.refresh_token` stops working** — that value is gone by design. Code reading `access_token` or `claims::<C>()` is unaffected.
-5. **Existing sessions are not migrated.** Grants persisted by the previous mode are neither loaded nor deleted — they simply sit there, so flipping back is possible; clients re-authenticate once.
-
-**Calling an upstream API with the inbound bearer is forbidden, and the framework does not do it for you.** The MCP spec is explicit: a token issued for this resource server must not be forwarded to another service — that is the confused deputy the audience check exists to prevent, and it is exactly what "just pass the bearer through" does. Two supported paths:
-
-- **Token exchange (RFC 8693)** — the server exchanges the inbound token for one whose `aud` is the upstream service. Requires a confidential client; the framework does not implement this, a consumer that needs it does the exchange in its own tool handler using the credential from `ctx.token()`.
-- **An explicitly shared audience** — the deployment deliberately mints tokens carrying both services in `aud`, and both list each other in `OAUTH_EXPECTED_AUDIENCE`. Simpler, and correspondingly blunter: the two services become one trust boundary.
-
-#### OAuth lifecycle harness (`tests/oauth_lifecycle_rmcp.rs`)
-
-The mode above is the one where the framework does the *least*, which makes it the
-one hardest to test with fakes: everything that matters happens between a real
-authorization server and a real MCP client. So this binary runs both. An
-ephemeral **Keycloak 26.3** (testcontainers, importing `keycloak/mcp-realm.json`)
-plays the AS, the framework runs in-process behind `build_app` on `127.0.0.1:0`,
-and the client is rmcp's own `OAuthState` / `AuthorizationManager` / `AuthClient`
-stack over `StreamableHttpClientTransport` — the same code path a real MCP client
-executes, PKCE and automatic refresh included.
-
-Every test is `#[ignore]`d (`run with --ignored`) and the CI job
-`integration-keycloak` runs them with `--test-threads=1`. A missing Docker daemon
-skips **locally only**: with `CI` set it panics, since a job whose whole purpose
-is to run these tests passing without a container is the same green-for-nothing
-failure as before. A daemon that is present but produces a broken Keycloak
-**panics** everywhere — a silent skip once hid a real failure.
-
-**Fixture.** One container per test binary, behind a `tokio::sync::OnceCell`
-holding a leaked `ContainerAsync`. The shipped realm is deliberately *not* a test
-fixture — it demands TLS and ships no users — so `write_patched_realm` injects
-everything a test needs and a deployment must not have, keeping the harness
-pointed at the artefact that is actually released: `accessTokenLifespan` down to
-5 s (expiry has to be observable), every `oidc-audience-mapper` rewritten to the
-audience the framework is configured with — **exactly one** demanded in each of
-`mcp-audience`, `mcp:tools` and `mcp:resources` (see the DCR note below), since a
-realm that lost two of the three would otherwise fail three tests later as an
-unexplained `401` — `sslRequired: none`, and the users `alice` and `bob`. The
-DCR policies are patched **not at all**: they are exercised as shipped.
-Readiness is **not** a log line — Quarkus logs to stderr and
-"Listening on:" does not mean the import landed — it is a poll of
-`{issuer}/.well-known/openid-configuration` asserting the `issuer` field.
-
-**What the scenarios pin.**
-
-| Test | Property |
-|---|---|
-| `lifecycle_discovery_auth_and_refresh_{legacy_session,sessionless}` | 401 → `WWW-Authenticate` → PRM discovery → PKCE → tool call; past expiry the *client* refreshes and the same session's counter continues at 2. The access token is asserted to have **rotated**, so "the client refreshed" cannot be confused with "the old token still worked". |
-| `expired_bearer_is_refused_once_the_skew_leeway_passes` | the framework's own side of that: a bearer well past `exp` gets `401`. Split out because `JWKS_CLOCK_SKEW_LEEWAY` (30 s) means "expired" and "refused" are half a minute apart, which scenario 1 cannot pay on every run. |
-| `lifecycle_session_loss_then_reinitialize_legacy_session` | the **server-side** session really disappearing under a running client: a raw `DELETE /mcp` with that `mcp-session-id`, then another call through the *same* rmcp client. rmcp 3.1 defaults to `reinit_on_expired_session`, so the `404` is absorbed — `perform_reinitialization` aborts the old streams and replays the message, and the caller sees a result, not a `SessionExpired`. On 2025-11-25 the identity *is* the `mcp-session-id`, so the new session is a new identity and the counter restarts at 1. Then two consecutive refresh cycles. |
-| `lifecycle_session_loss_then_reinitialize_sessionless` | the same reconnect on 2026-07-28, where identity is `credential_session_key`: the `SessionStore<T>` entry survives a full client teardown and the counter continues. |
-| `lifecycle_revoked_grant_requires_reauthorization` | admin-side revocation → `AuthError::AuthorizationRequired` → full re-auth succeeds, with a **new** identity. Run sessionless on purpose: only there is the identity derived from the credential's `sid`, so "the grant was revoked" and "the identity changed" are causally linked — on 2025-11-25 the assertion would only be observing that a new `initialize` returns a new session id. |
-| `lifecycle_dynamic_client_registration` | the RFC 7591 path, with no client id configured anywhere on the client side: rmcp registers, authorizes (answering the consent form the realm's `Consent Required` policy imposes), and calls a tool. Keycloak's admin API is asked whether the client really exists, with the redirect URI it asked for. The framework's own `/oauth/register` proxy is exercised separately in the same test, since a spec-current client does not go through it — and the client *it* created is read back from the admin API too: it must carry the `mcp:tools` / `mcp:resources` it asked for (proof the proxy forwards `scope`) and at least one scope injecting the expected audience (proof that forwarding did not cost it its `aud`). |
-| `direct_registration_from_an_untrusted_redirect_host_is_refused` | the other half of the `trusted-hosts` policy, as shipped: a registration posted straight at Keycloak asking for a `redirect_uri` on an untrusted host gets `403` naming that policy. `client-uris-must-match` is what the realm relies on once the sender-IP half is off (see below), so it is checked rather than assumed. |
-| `realm_injects_the_expected_audience_and_scopes` | the realm actually mints `aud` containing `OAUTH_EXPECTED_AUDIENCE`, and a `scope` claim containing the MCP scopes — without it every other test would fail for the wrong reason. Also asserts the PRM advertises them. |
-
-`assert_no_token_state` is what catches a regression reintroducing token state,
-and it looks in **both** places: the `tokens` namespace of the wired
-`InMemoryBackend` *and* the in-memory store — this mode builds the store without
-a persistence backend, so an in-memory `store_token` would leave the namespace
-empty and slip past a backend-only check. In memory it checks twice:
-`TokenStore::token_count` (a diagnostic accessor next to `peek_token`, counting
-the map and deliberately not reading through to persistence) must be 0, which
-catches an entry under *any* key including one no test ever observes, and
-`TokenStore::peek_token` is asked for each identity the test did observe, so the
-likely regression fails with that identity in the message rather than as a bare
-count. Every scenario that gets a request accepted calls it — the four lifecycle
-ones, the DCR test, and the expiry test (which accepts a bearer before proving
-the expired one is refused, and passes an empty identity list: `token_count` is
-the assertion there). Only the audience test does not.
-
-Four implementation notes that are not obvious:
-
-- **The container is reaped by the *next* run.** testcontainers 0.27 ships no
-  reaper — removal happens in `ContainerAsync::drop`, and a `static` fixture is
-  never dropped. Paying a 30 s boot per test to get a droppable local is the
-  only alternative, so instead every container is labelled
-  `app.mcp-framework.harness=oauth-lifecycle` and each run removes the previous
-  one's before starting. Steady state is one idle Keycloak between runs.
-- **Revocation needs the consent deleted too.** rmcp appends `offline_access`
-  when the AS advertises it, so `POST /admin/realms/mcp/users/{id}/logout` leaves
-  the offline grant — and the refresh token — perfectly usable. The harness pairs
-  it with `DELETE …/consents/mcp-client`.
-- **Dynamic registration does not go through the framework.** In resource-server
-  mode the protected-resource metadata points at Keycloak, so an RFC 9728 client
-  follows `authorization_servers` to the AS, reads *its* metadata, and posts its
-  RFC 7591 registration to Keycloak's own `clients-registrations` endpoint.
-  `/oauth/register` stays served — and is still needed — for browser clients and
-  for MCP 2025-03-26 clients that probe the resource server itself, because
-  Keycloak's endpoint sends no CORS headers; the test asserts both documents say
-  so, then exercises the proxy by hand. Three Keycloak behaviours had to be
-  accommodated in the realm for the direct path to work at all, all documented
-  in `keycloak/README.md`: a registration request carrying `scope` (rmcp always
-  sends one, and `/oauth/register` now forwards it) makes Keycloak **replace**
-  the client's default scopes — leaving `basic` as the only default and
-  everything requested as optional, dropping `mcp-audience` and with it the
-  `aud` the resource server requires — hence the audience mapper is also
-  attached to `mcp:tools` / `mcp:resources`; declaring the `offline_access`
-  client scope in an export suppresses Keycloak's own offline-token setup,
-  leaving the realm role uncreated so that the `offline_access` rmcp appends
-  (SEP-2207) fails the exchange — hence the export omits that scope and lets
-  Keycloak build it; and `trusted-hosts` has a sender-IP half
-  (`host-sending-registration-request-must-match`) which, in this mode, rejects
-  every legitimate client — the registration comes from the MCP client itself,
-  from anywhere — so the realm ships it **off** and leans on
-  `client-uris-must-match`, which the test above pins.
-- **Two reqwest majors coexist.** rmcp 3.1 is built on reqwest 0.13, the
-  framework on 0.12, and `AuthClient::new` wants rmcp's. The dev-dependency is
-  renamed `reqwest13` so only this binary sees it and every other test keeps
-  resolving `reqwest` to 0.12.
-
-#### Validating bearers the proxy did not issue (`UnknownTokenValidation`)
-
-RFC 7662 introspection used to be the only check available for such a bearer, and it is not always reachable: **Keycloak refuses the introspection endpoint to public clients**, answering `403 {"error":"invalid_request","error_description":"Client not allowed."}`. That refusal is a property of the configured `OAUTH_CLIENT_ID`, not of the token, so on a public-client deployment *every* unknown bearer was rejected — including a perfectly valid token-exchange token whose `aud` is the downstream service.
-
-Verifying the signature against the issuer's published keys has no such requirement, so `validate_unknown_bearer` tries, in order:
-
-1. **`TokenStore`** — a proxy-issued token is already trusted; it never causes a JWKS or introspection round-trip. (Not applicable in `ResourceServer` mode: that mode does not go through `validate_unknown_bearer` at all, see above.)
-2. **JWKS** (`src/auth/jwks.rs`) — `jwks_uri` discovered from `{issuer}/.well-known/openid-configuration`, keys cached by `kid`, signature plus `iss` / `exp` / `nbf` (and `aud`, when configured) checked locally.
-3. **Introspection** — only if JWKS *could not answer*.
-
-The order is governed by `OAUTH_UNKNOWN_TOKEN_VALIDATION` / `OAuthConfig::unknown_token_validation`:
-
-| Value | Behaviour |
-|---|---|
-| `jwks_then_introspection` (default) | JWKS first, introspection as a fallback |
-| `jwks` | local validation only — never contacts the authorization server |
-| `introspection` | the pre-0.3 behaviour |
-| `reject` | refuse every bearer the proxy did not issue |
-
-Two properties are worth knowing:
-
-- **A verdict from the issuer's own keys is final.** `JwksRejection::Invalid` (bad signature, wrong `iss`, expired) is *not* re-litigated through introspection; only `NotAJwt` / `UnknownKey` / `Unavailable` fall through. This is what keeps `jwks_then_introspection` as strict as `jwks`.
-- **Fetches are rate-limited.** An unknown `kid` triggers a refetch (Keycloak rotates signing keys) but at most once per `JWKS_REFRESH_COOLDOWN`, and the cooldown keys off the last *attempt* — so neither a forged `kid` nor an issuer that is down can turn one inbound request into one outbound request. Keys already fetched survive a failed refresh.
-
-`OAUTH_EXPECTED_AUDIENCE` (comma-separated) constrains `aud` on a locally validated token. It is empty by default **except in `ResourceServer` mode, where it is mandatory** (see above). Elsewhere it is empty because: a token-exchange token legitimately carries an audience this server was never told about, so refusing it out of the box would break the case this path exists for. The observed `aud` / `azp` are logged on every acceptance, which is how a deployment tightens the list from real traffic.
-
-Rejections are typed (`BearerRejection`) so the logs separate the three cases the client cannot distinguish behind its uniform `401`: introspection not permitted (a server misconfiguration — warned once, then never retried), the token being genuinely invalid, and an unknown token validated locally via JWKS.
-
-Only signature algorithms from asymmetric families are accepted, so the issuer's public key can never double as an HMAC shared secret (`alg` confusion).
-
-**Session key at token exchange**: no MCP session exists yet when `/oauth/token` runs, so `mcp-session-id` is never present — reading it collapsed every grant, for every user, onto `"default"`. Each mode uses the key it can actually resolve later:
-
-- **Passthrough** keys by `credential_session_key(access_token)`, the same derivation `bearer_auth_middleware` applies to the bearer it receives. When a protocol session id shows up later, the middleware **adopts** that entry under the session key — carrying over `refresh_token` / `expires_at`, and writing it *before* attempting refresh, since `get_token` operates on the session key.
-- **Opaque** mints a fresh per-grant UUID. It cannot be derived from a credential: the client never sees the Keycloak token, and the opaque tokens it does see rotate on every refresh while this key must stay put. It is resolved from the opaque token instead, via `TokenStore::resolve_opaque_access`. The middleware then binds the request to that grant id via `MCP_FALLBACK_SESSION_HEADER`, so `ctx.session_id()` and the token store agree and a reconnect lands back on the same session.
-
-**Retiring the superseded passthrough grant**: the key is derived from the access token, so a `refresh_token` grant stores the rotated credentials under a *new* key — and used to leave the previous entry behind. That entry still held the refresh token Keycloak had just rotated away, and the middleware would happily adopt it: refresh → `invalid_grant` → a spurious `401` for a client holding a perfectly good bearer. `/oauth/token` therefore indexes every passthrough grant by `sha256(refresh_token)` → `grant_key` in `NS_GRANT_REFRESH` (in memory, write-through to persistence, read-through on a memory miss — the same shape as `NS_OPAQUE_REFRESH`). On a `refresh_token` grant the handler resolves the spent refresh token to the grant it belongs to, removes that token entry and its index entry, *then* stores the new grant. The removal is skipped when the old key equals the new one. On this branch that never happens — a rotated access token always hashes to a different key — but the guard is what keeps the cleanup correct once identity is claims-derived (task 920's `sid`/`sub`), where both grants land on the same entry. **Limitation**: only the instance serving the refresh drops the entry from its own memory. A peer that already cached the old grant keeps treating it as trusted until it expires, since read-through fires only on a miss — the consistency caveat documented under *Persistence layer*. Left as-is on purpose: passthrough disappears with the arrival of a ResourceServer mode, so this is a transition-period mitigation, not a design to build on. Covered by `tests/passthrough_grant_cleanup.rs`, including a two-replica case sharing one backend (exchange on A, refresh on B, verified from a third store built fresh over persistence).
-
-**Persistence**: The forward opaque mapping is stored in the `NS_OPAQUE` namespace (keyed by session_id). To support multi-instance read-through (resolving an opaque token on an instance that did not mint it), two inverse indexes are also persisted: `NS_OPAQUE_ACCESS` (`opaque_access → session_id`) and `NS_OPAQUE_REFRESH` (`opaque_refresh → session_id`). All survive restarts when a persistence backend (e.g. Redis) is configured. `resolve_opaque_access`/`resolve_opaque_refresh` fall back to the inverse index on a memory miss and then hydrate the full in-memory index from the forward mapping.
-
-**Zombie handling**: When a Keycloak refresh fails (e.g. token revoked via platform logout), the opaque mapping is cleaned up and the client receives a 401, forcing re-authentication.
-
-```rust
-let mut oauth = OAuthConfig::from_env().unwrap();
-oauth.token_mode = TokenMode::Opaque;
-
-McpAppBuilder::new("my-server")
-    .auth(AuthProvider::OAuth(oauth))
-    .persistence(Arc::new(redis))
-    .server(|| MyServer::new())
-    .run()
-    .await?;
-```
-
-### Session layer (`src/session/`)
-
-`SessionStore<T>` — generic, thread-safe per-session data store with TTL expiration. The type parameter `T` (must implement `Send + Sync + Default + Clone + Serialize + DeserializeOwned + 'static`) is defined by the consumer. Default TTL is 30 minutes. A background cleanup task purges expired sessions in HTTP mode.
-
-Helper function `resolve_session_id(extensions)` extracts the session identity from MCP request context extensions, falling back to `"default"` for stdio mode. It delegates to `session_id_from_parts(&Parts)`, shared with `resolve_token` in `src/capability/filter.rs` so both resolve identity identically.
-
-#### Sessionless protocol revisions (MCP 2026-07-28 / SEP-2567)
-
-MCP 2026-07-28 removes protocol-level sessions, so `mcp-session-id` is absent for clients negotiating that revision — and rmcp serves those requests statelessly regardless of `legacy_session_mode`. Since this framework keys `TokenStore`, `SessionStore<T>`, and the opaque-token mappings by session id, collapsing every such client onto `"default"` would let concurrent users read and overwrite each other's tokens.
-
-The auth middleware therefore derives a stable identity from the credential when the protocol supplies none — `credential_session_key(cred)` — injected under `MCP_FALLBACK_SESSION_HEADER` (`x-mcp-framework-session`). The framework header is deliberately distinct from `mcp-session-id` — writing that one back onto the request would make rmcp's Streamable HTTP transport look up a session that never existed and reject it.
-
-**The identity comes from claims, not from the bearer bytes.** Hashing the token was the original scheme and it does not survive a refresh: in a resource-server deployment the client's access token rotates every 5-15 minutes, so a byte-derived id changes with it and the `SessionStore<T>` entry it keyed is orphaned for its whole TTL. `credential_session_key` therefore reads the JWT payload (via `jwt_claim`) and takes the first stable thing it finds:
-
-| source | key | stability |
-|---|---|---|
-| `sid` claim | `cred-sid-{sha256(sid)[..16]}` | Keycloak SSO session — unchanged across every refresh |
-| `sub` claim | `cred-sub-{sha256(sub)[..16]}` | the principal — stable, but shared by all their SSO sessions |
-| raw bytes | `cred-{sha256(credential)[..16]}` | rotates with the credential (non-JWT only: opaque bearers, Basic auth passwords) |
-
-The three families carry distinct prefixes, so a `sid` value that happens to equal another token's `sub` can never collapse two identities into one.
-
-Hashing keeps the literal claim out of logs and store keys — that is all it does. A truncated sha256 is unsalted and unkeyed, so a low-entropy `sub` (a username, an email, a sequential id) is dictionary-testable: anyone holding a candidate value can confirm it against an observed key. Real unlinkability would need an HMAC under a server-held secret, which is **not** implemented. Treat the derived id as pseudonymous, not confidential.
-
-Claims are read through `jwt_payload`, which first checks that the credential is *shaped* like a JWT: exactly three non-empty dot-separated segments, a header decoding to a JSON object with a string `alg` (`typ` optional), and a payload decoding to a JSON object. Decoding only the second segment is not enough — plenty of opaque credentials contain dots, and one whose middle segment happens to be base64 JSON (`opaque.<b64 json>.handle`) would otherwise be keyed by claims it never asserts. Anything failing the shape check falls through to the byte-hash family.
-
-`jwt_payload` decodes **without verifying the signature** (`jwt_claim`, `jwt_subject`, `jwt_is_expired` and `jwt_is_strictly_newer` all sit on top of it). That is deliberate and safe here: the values only *partition* state — which session id, which principal, which of two bearers is newer — and never grant access. Whether the bearer may be used at all is decided independently by `validate_unknown_bearer` (JWKS or introspection) before any of that state is written.
-
-**Consequences on the passthrough store/adopt path.** `/oauth/token` keys its grant by `credential_session_key(access_token)`, so a `refresh_token` grant for the same SSO session now **replaces** that entry instead of adding a sibling: the store keeps one live entry per grant whose `refresh_token` is always the most recently issued one. On the middleware side a sessionless rotation now lands on the entry the previous bearer wrote, so it goes through the principal comparison (which accepts it — same `sub`, and additionally same derived key, which covers a token carrying `sid` but no `sub`).
-
-**Invariant: an observed bearer never downgrades proxy-issued grant material.** A stable key means several bearers of one grant map to one entry, and HTTP orders none of them — once `/oauth/token` has refreshed the grant to `t2 + rt2`, a request already in flight with the superseded `t1` still arrives. Overwriting the entry with `t1 + None` would leave the grant permanently unrefreshable while the client believes otherwise. So when the entry under the key already carries a `refresh_token`, an arriving bearer that does not match it byte-for-byte may only *advance* it: the access token is replaced solely when `jwt_is_strictly_newer` says so (`iat`, falling back to `exp`), and the stored `refresh_token` is carried over either way. An older or unorderable bearer leaves the entry untouched and is still served — from the grant's material, which is why an expired straggler can be rescued by a server-side refresh instead of a spurious `401`. Carrying the refresh token forward is not a widening: both bearers were validated and belong to the same principal, which is the same reasoning that already permits `matching_grant_token` adoption. Entries with no refresh material (bring-your-own-token clients) are unaffected and rotate freely.
-
-**Risks accepted.** Existing sessionless sessions get a new key at deploy: their `SessionStore<T>` data is lost once and the stale entries expire on their own within the 30 min TTL (tokens re-register on the next request). And two clients of the same user in the same SSO session share one identity — with a `sub`-only token, all of that user's sessions do. That is intended: it is the same human, and it is what makes a refresh transparent. A consumer needing per-connection rather than per-user state must key it itself.
-
-**Precedence.** `session_id_from_parts` reads `MCP_FALLBACK_SESSION_HEADER` **first**, then `mcp-session-id`, then `DEFAULT_SESSION_ID`. The framework header wins because the middleware only writes it where it is the more accurate identity — either the protocol supplied nothing, or opaque mode resolved the grant (see below). On 2025-11-25 and earlier the middleware returns `mcp-session-id` untouched and never writes the framework header, so behaviour there is unchanged.
-
-**Anti-spoofing.** Because the framework header is authoritative, `strip_framework_session_header` is layered outermost in `wrap_auth_middleware` and removes any client-supplied value before auth runs. It is applied to *every* request, including under `AuthProvider::None` where no auth middleware runs to overwrite it. Without it a client could send `x-mcp-framework-session: <victim-id>` and bind its request to another user's tokens.
-
-Covered by `tests/session_identity.rs`, which drives the real `build_app` router (strip layer + auth middleware) through an `extra_routes` handler that echoes `session_id_from_parts`, and by `tests/oauth_passthrough_identity.rs` for the claims-derived key end to end (refresh keeps one identity, two SSO sessions of one user stay isolated).
-
-#### Transport session recovery (`src/transport/session_persistence.rs`)
-
-Three stores are keyed by the session id, and each owns exactly one kind of data — never duplicate one into another:
-
-| Store | Namespace | Holds | Written by |
-|---|---|---|---|
-| rmcp transport session (`TransportSessionStore`, adapts `rmcp::…::SessionStore`) | `mcp_transport_sessions` | the `initialize` parameters rmcp needs to rebuild a protocol session | rmcp, once at `initialize`; re-armed by the framework on `load` |
-| `SessionStore<T>` | `sessions` | consumer-defined application data | the consumer, through `update` |
-| `TokenStore` | `tokens` / `opaque*` / `grant_refresh` | credentials and grant material | the auth layer |
-
-The transport store is what turns a legacy-session request landing on an instance that did not create it into a restored session instead of a `404` → client re-`initialize`. It is mounted in `build_app` whenever a persistence backend is configured, with the same TTL as `SessionStore<T>`; without persistence rmcp keeps sessions in process memory as before. Sessionless revisions (2026-07-28) have no protocol session to restore and are unaffected.
-
-**TTL.** rmcp writes the entry once and never refreshes it while an instance that already holds the session in memory serves traffic, so the entry's lifetime is counted from creation, not from last activity. The framework re-arms the TTL on every successful `load` through `PersistenceBackend::touch` — atomic, so a session a peer deleted between the read and the re-arm is reported gone rather than resurrected; `Unsupported` (a backend without the primitive) restores without re-arming; an error answers "unknown session" (rmcp: `404`, the client re-initializes) rather than a `500` the client would retry. The remaining gap is a **warmed pool**: once every instance has restored the session, no `load` happens any more and the entry expires after one TTL of the last restore even under continuous traffic — an instance joining (or restarting) after that point re-initializes the client, exactly the pre-recovery behaviour. Touching the entry on every legacy-session request would close it at one backend round-trip per request; not done.
-
-Covered by `http_legacy_session_is_restored_on_another_instance` (`tests/http_integration.rs`, two `build_app` instances sharing one `InMemoryBackend`), the unit tests in `session_persistence.rs` (re-arm, delete-between-read-and-touch, touch error → unknown session, backend without `touch` → restores without re-arming) and `touch_re_arms_a_live_key_and_reports_a_deleted_one` against a real Redis.
-
-### Audit logging (`src/audit/`)
-
-Pluggable tool call audit logging. Every `call_tool` invocation can be logged via a `ToolCallLogger` trait implementation. The framework ships two built-in loggers:
-- `NoopLogger` — discards all records
-- `TracingLogger` — emits structured `tracing::info!` events
-
-Key types:
-- `ToolCallRecord` — captures tool name, arguments (`Option<Map<String, Value>>`), session ID, timestamp (`SystemTime`), duration (`Duration`), dispatch source (registry vs inner handler), and outcome
-- `ToolCallOutcome` — `Success { is_error, content_summary }` or `McpError { code, message }`. `is_error: true` means the tool reported a tool-level error (e.g. bad LLM input) but the MCP protocol call itself succeeded
-- `ToolCallSource` — `Registry` (dynamic tools from `CapabilityRegistry`) or `Inner` (static tools from `ServerHandler`)
-
-Logging is fire-and-forget via `tokio::spawn` — zero impact on tool call latency. When no logger is configured, the hot path has zero overhead (no clones, no allocations).
-
-The interception point is `DynamicHandler::call_tool` in `src/capability/handler.rs`.
-
-#### Using a built-in logger
-
-```rust
-McpAppBuilder::new("my-server")
-    .tool_call_logger(Arc::new(TracingLogger))
-    .server(|| MyServer::new())
-    .run()
-    .await?;
-```
-
-#### Implementing a custom storage backend
-
-Implement the `ToolCallLogger` trait. The `log` method returns `Pin<Box<dyn Future<Output = ()> + Send>>` — this allows async I/O (database writes, HTTP calls). Handle errors internally; the framework cannot act on them since logging is fire-and-forget.
-
-```rust
-use mcp_framework::audit::{ToolCallLogger, ToolCallRecord, ToolCallOutcome};
-use std::future::Future;
-use std::pin::Pin;
-
-struct FileLogger { path: std::path::PathBuf }
-
-impl ToolCallLogger for FileLogger {
-    fn log(&self, record: ToolCallRecord) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let path = self.path.clone();
-        Box::pin(async move {
-            let line = format!(
-                "{} tool={} session={} duration={}ms outcome={}\n",
-                humantime::format_rfc3339(record.timestamp),
-                record.tool_name,
-                record.session_id,
-                record.duration.as_millis(),
-                match &record.outcome {
-                    ToolCallOutcome::Success { is_error, .. } =>
-                        if *is_error { "tool_error" } else { "success" },
-                    ToolCallOutcome::McpError { code, .. } =>
-                        &format!("mcp_error({code})"),
-                },
-            );
-            if let Err(e) = tokio::fs::OpenOptions::new()
-                .create(true).append(true).open(&path).await
-                .and_then(|mut f| {
-                    use tokio::io::AsyncWriteExt;
-                    // write_all requires a mutable borrow in an async block
-                    Box::pin(async move { f.write_all(line.as_bytes()).await })
-                }).await
-            {
-                tracing::warn!("audit log write failed: {e}");
-            }
-        })
-    }
-}
-```
-
-Then wire it via the builder: `.tool_call_logger(Arc::new(FileLogger { path: "audit.log".into() }))`
-
-### Effectiveness metrics (`src/metrics/`, feature `metrics`)
-
-Opt-in, feature-gated aggregation of tool call effectiveness. Compiled out entirely unless the `metrics` cargo feature is enabled — zero cost (no module, no fields populated) otherwise.
-
-The `MetricsCollector` **is** a `ToolCallLogger`: it consumes the same `ToolCallRecord` stream as audit logging, so there is no new interception point and no added tool-call latency. `.metrics(collector)` composes with any logger already set via `.tool_call_logger()` (both receive every record, via `CompositeLogger`).
-
-What's measured (cumulative since process start):
-- **Per tool**: call frequency, success / `tool_error` / `mcp_error` counts, success & error rates, latency p50/p95/p99 + mean. Percentiles come from a bounded-memory bucketed histogram (`histogram.rs`), interpolated like Prometheus `histogram_quantile` — no per-call sample retention.
-- **Per session**: call count, error rate, per-tool distribution. Cardinality-capped (`max_sessions`).
-
-Exposure (both, answering the ticket's open question):
-- **In-process**: `collector.snapshot() -> MetricsSnapshot` (serde-serializable; per-tool + per-session). Works in stdio mode too.
-- **HTTP endpoint**: served *outside* the auth layer (so a Prometheus scraper needs no credentials) at `MetricsConfig::endpoint_path` (default `/metrics`). Prometheus text by default; `?format=json` returns the snapshot. Per-session data is JSON-only — session ids would explode Prometheus label cardinality, so the exposition emits per-tool series + an `mcp_active_sessions` gauge.
-
-Key types: `MetricsCollector`, `MetricsConfig` (with `Default` and `from_env`), `MetricsSnapshot` / `ToolMetrics` / `SessionMetrics`. The endpoint is mounted via the general `public_routes: Option<Router>` field (the un-authed counterpart to `extra_routes`, threaded through `McpApp` → `HttpAppConfig`); `.metrics()` merges its router there. `public_routes` is a feature-independent type, so there's no `cfg` churn on struct literals, and it doubles as the mounting point for health checks / probes via `McpAppBuilder::public_routes`.
-
-```rust
-use mcp_framework::prelude::*;
-
-let metrics = MetricsCollector::new(MetricsConfig::default());
-
-McpAppBuilder::new("my-server")
-    .metrics(metrics.clone())     // logs records + mounts /metrics
-    .server(|| MyServer::new())
-    .run()
-    .await?;
-
-// query in-process anytime:
-let snap = metrics.snapshot();
-println!("{} calls, p95 of busiest tool: {:?}ms",
-    snap.total_calls, snap.tools.first().map(|t| t.p95_ms));
-```
-
-Enable the feature in `Cargo.toml`: `mcp-framework = { version = "0.1", features = ["metrics"] }`.
-
-### Access validation (`src/capability/validator.rs`)
-
-Pre-execution authorization for tool calls, prompt access, and resource reads. Unlike `CapabilityFilter` which controls **visibility** (what clients can *see*), `AccessValidator` controls **execution** (what clients can *do*). A tool hidden by the filter can still be called directly if the client knows its name — the access validator closes that gap.
-
-Key types:
-- `AccessDecision` — `Allow` or `Deny(reason)`
-- `AccessValidator` trait — three async methods with default `Allow` implementations: `validate_tool_call`, `validate_prompt_access`, `validate_resource_access`
-- `ToolCallValidator<F>` — convenience wrapper for a closure that validates only tool calls
-
-The interception point is `DynamicHandler::call_tool` / `get_prompt` / `read_resource` in `src/capability/handler.rs`, before dispatch to the registry or inner handler.
-
-#### Global claims decoder
-
-A claims decoder can be configured once on the `TokenStore` (or via `McpAppBuilder::claims_decoder`). It decodes the JWT access token into a typed struct and caches the result in `StoredToken::decoded_claims`. Every component that touches a token — filters, validators, handlers — can access the decoded claims via `token.claims::<C>()`.
-
-The decoder is applied automatically during `TokenStore::store_token`, including after token refresh.
-
-#### Using access validation with JWT roles
-
-```rust
-#[derive(Debug, Clone, serde::Deserialize)]
-struct Claims { roles: Vec<String> }
-
-fn decode_jwt(token: &str) -> Option<Claims> {
-    let payload = base64::decode(token.split('.').nth(1)?).ok()?;
-    serde_json::from_slice(&payload).ok()
-}
-
-fn is_admin(token: Option<&StoredToken>) -> bool {
-    token.and_then(|t| t.claims::<Claims>())
-        .map_or(false, |c| c.roles.contains(&"admin".into()))
-}
-
-McpAppBuilder::new("my-server")
-    .claims_decoder(decode_jwt)                            // global, defined ONCE
-    .capability_filter(Arc::new(ToolFilter(|tools, token| {
-        if is_admin(token) { tools } else {
-            tools.into_iter().filter(|t| !t.name.starts_with("admin_")).collect()
-        }
-    })))
-    .access_validator(Arc::new(ToolCallValidator(|name, _args, token, _session| {
-        if name.starts_with("admin_") && !is_admin(token) {
-            AccessDecision::Deny("admin role required".into())
-        } else {
-            AccessDecision::Allow
-        }
-    })))
-    .server(|| MyServer::new())
-    .run()
-    .await?;
-```
-
-### MCP Apps / ext-apps (`src/capability/registry.rs`)
-
-Support for [MCP Apps](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/ext-apps) (ext-apps, spec v1.7.0) — tools that declare a companion UI rendered by the host inline in the chat.
-
-#### How it works
-
-MCP Apps let a tool return both **structured data** (JSON text for the LLM) and a **visual UI** (HTML for the human) in a single interaction. The flow has three steps:
-
-1. **Tool call** — the host calls a tool (e.g. `get_nps`). The tool returns JSON text as usual. But the tool's metadata contains `_meta.ui.resourceUri` pointing to a `ui://` URI.
-2. **Resource fetch** — the host sees the `_meta.ui` pointer and calls `resources/read` on the **same MCP server** with that `ui://` URI. The server returns a self-contained HTML bundle with MIME type `text/html;profile=mcp-app`.
-3. **Render** — the host renders the HTML in a sandboxed iframe inline next to the text response.
-
-The HTML is served over the MCP protocol itself (via `resources/read`), not over a separate HTTP endpoint. The bundle must be **single-file** — all CSS, JS, and assets inlined — because it is delivered as a string in the resource contents.
-
-#### API
-
-Two helpers on `CapabilityRegistry`:
-
-- **`register_app_resource(uri, html)`** — registers a `ui://` resource with MIME type `text/html;profile=mcp-app`. The HTML string is stored in memory and returned verbatim when the host calls `resources/read`. The resource appears in `resources/list` automatically.
-- **`app_tool(tool, resource_uri)`** — static method that injects `_meta.ui.resourceUri` into a `Tool`'s existing metadata (preserving any other `_meta` fields). Returns the enriched `Tool`. Does **not** register the tool — call `add_tool` separately.
-
-The MIME type constant `APP_MIME_TYPE` is in `src/constants.rs`.
-
-#### Usage
-
-```rust
-use mcp_framework::prelude::*;
-
-// In your server setup, with access to a CapabilityRegistry:
-
-// 1. Register the HTML bundle as a ui:// resource.
-//    Use include_str! to embed the file at compile time,
-//    or pass a String loaded at runtime.
-registry.register_app_resource(
-    "ui://my-server/nps-chart",
-    include_str!("../ui/dist/nps-chart.html"),
-).await;
-
-// 2. Create a tool and tag it with the resource URI.
-let tool = CapabilityRegistry::app_tool(
-    Tool::new("get_nps", "Get NPS scores", serde_json::Map::new()),
-    "ui://my-server/nps-chart",
-);
-
-// 3. Register the tool with its handler as usual.
-//    The handler returns JSON for the LLM; the host fetches
-//    the HTML separately via resources/read.
-registry.add_tool(tool, |args| async {
-    let data = compute_nps(args).await;
-    Ok(CallToolResult::success(vec![
-        Content::text(serde_json::to_string(&data).unwrap()),
-    ]))
-}).await;
-```
-
-#### Passing data to the UI
-
-The HTML bundle runs in an isolated iframe — it does not receive the tool call arguments or result automatically. To pass data, embed it in the HTML at build time (e.g. template variables in the Vite build), or use a convention like a `<script id="data">` tag populated by the resource handler. The current implementation serves the HTML as a static string; dynamic per-call rendering would require creating a unique resource per invocation.
-
-### Tool schema sanitization (`src/capability/sanitize.rs`)
-
-`sanitize_tool_schemas` rewrites every `Tool` on its way to `tools/list`, so the
-schema schemars emits is one an MCP client actually accepts. It runs, in order:
-
-1. **`$schema` / `title` stripping** at every *schema node*. The walker is
-   schema-aware: `properties` / `patternProperties` / `$defs` / `definitions`
-   / `dependentSchemas` are maps of user-chosen names and are traversed without
-   being treated as nodes (a parameter named `title` survives), and the data
-   keywords `enum` / `const` / `default` / `examples` are never entered. `title` is *folded
-   into `description`* first when the node has none — a `#[schemars(title =
-   "...")]` or a type name is sometimes the only documentation there is, and it
-   is what the LLM would otherwise never see. Once a `description` is present,
-   the title is dropped as before.
-2. **`$defs` inlining** — `$ref` pointers are resolved recursively, sibling keys
-   merged per JSON Schema semantics (`properties` deep-merged, `required`
-   unioned, everything else overriding).
-3. **Root-level `oneOf` / `anyOf` / `allOf` flattening** — the Anthropic API
-   rejects a combinator at the root of `input_schema`, and schemars emits one
-   for every `#[serde(tag = "...")]` tagged enum. The variants' properties are
-   merged into one flat object with a synthesized `string` `enum` discriminator.
-4. **`"type": "object"` patching** for schemas that have no `type` (e.g. a
-   `serde_json::Value` parameter), with a `tracing::warn!`.
-5. **A documentation audit** (`audit_descriptions`), warned once per tool
-   *version*.
-
-**Flattening keeps the documentation.** Flattening is lossy by nature — runtime
-`serde` still enforces the real per-variant contract, but the schema can no
-longer express it. What it must *not* lose is what `tools/list` exposes as prose:
-
-- the synthesized discriminator carries the composed variant docs,
-  ``` `add`: Add a note · `remove`: Remove a note ``` (an undocumented variant
-  contributes just its value; if none is documented, no description is invented
-  — the `enum` already lists the values);
-- every other property states the variants that require it, appended to its own
-  description: `Required when action=add, remove.` This is the only place the
-  per-variant `required` survives;
-- a property name shared by several variants still resolves first-wins, but a
-  description from a later variant fills in for a missing one.
-
-**The audit** is a pure `audit_descriptions(&Tool) -> Vec<String>`; the logging
-and the deduplication live in `DescriptionAudit`, so the rule is testable
-without capturing `tracing` output. It reports a tool with no `description`,
-and — in a single aggregated finding, to keep the log readable on a large
-server — the input-schema properties that have none. It runs **after**
-sanitization, so a description folded from a `title` counts as documentation,
-and a blank description counts as none.
-
-**Where it runs, and how often.** `tools/list` alone would be both too late and
-too often: a tool registered but never listed would never be checked, while a
-polling client would re-log the same finding on every call. So:
-
-- **dynamic tools are audited at registration** (`CapabilityRegistry::add_tool`
-  / `add_tool_with_context`), on a throwaway sanitized copy — the author sees
-  the warning even if no client ever connects;
-- **inner-handler tools** are only observable at list time, so they are audited
-  there;
-- both paths share **one** `DescriptionAudit`, owned by the registry and handed
-  to `DynamicHandler`. It keeps the set of tool versions already audited, keyed
-  by a hash of name + description + input schema — so a tool warns once, and
-  again only if it is edited.
-
-### Persistence layer (`src/persistence.rs`)
-
-`PersistenceBackend` trait — async key-value interface with namespace separation (`"tokens"`, `"sessions"`, `"session_binding"`, …). Both `TokenStore` and `SessionStore<T>` accept an optional backend via `.with_persistence()` or `.set_persistence()`. When configured:
-
-- **Write-through**: mutations (`store_token`, `update`, `remove`, `purge_expired`) are written to the backend asynchronously (fire-and-forget via `tokio::spawn`)
-- **Load-at-startup**: `load_persisted()` reads all keys from the backend and populates the in-memory store. Called automatically during `run()` before the listener starts
-- **Read-through**: on a memory miss, the read paths (`TokenStore::get_token_raw`, `TokenStore::resolve_opaque_*`, `SessionStore::get`) fall back to the backend, deserialize, and write-back into the in-memory cache. This is what makes **multi-instance / horizontal scaling without sticky sessions** work: a request that lands on an instance which did not create the session still resolves the token/opaque-mapping/session from Redis instead of returning a 401. A memory hit never touches the backend (zero overhead on the hot path).
-- **No backend = current behavior**: zero overhead, no serialization
-
-**`touch`**: `PersistenceBackend::touch(ns, key, ttl) -> Touch` re-arms an entry's TTL atomically and reports `Armed` / `Missing` (`RedisBackend`: `EXPIRE`; `InMemoryBackend`: presence check under its lock). The default answers `Unsupported` without doing anything: callers keep what they read but get no TTL extension — the behaviour of a backend written before the method existed, with no write and therefore no resurrection. It exists so that transport session recovery never resurrects a deleted session — see the session layer.
-
-**Distributed refresh lock**: the `PersistenceBackend` trait exposes `try_acquire_lock(ns, key, token, ttl)`/`release_lock(ns, key, token)` (default: no-op that always acquires; `RedisBackend` overrides with atomic `SET key token NX PX`, `InMemoryBackend` with an in-process lock map). The caller passes a unique per-acquisition `token` (a fresh UUID); `release_lock` is **compare-and-delete** (Redis: a Lua `GET==token then DEL` script) so a late release after TTL expiry cannot drop a lock a peer has since re-acquired. On token expiry, `TokenStore::get_token` first takes the process-local per-session lock, then the distributed lock (`NS_REFRESH_LOCK`) before refreshing — serializing refresh across instances so Keycloak refresh-token rotation isn't broken by concurrent refreshes (distributed thundering herd). While a peer holds the lock, the waiter polls persistence and **adopts** the peer's refreshed token instead of issuing a duplicate refresh. `REFRESH_LOCK_TTL` auto-expires a crashed holder's lock, and `REFRESH_LOCK_WAIT` is kept above it so a waiter eventually acquires rather than racing.
-
-**Consistency caveat**: read-through resolves the "never seen on this instance" case. A value that was *updated* on a peer after being cached locally can still be served stale until it expires (read-through only fires on a miss, by design — to keep zero overhead on hits). For tokens this is bounded: on expiry the refresh path re-reads persistence and adopts a peer's fresh token. For session data, callers needing strict cross-instance freshness should not rely on the local cache for mutable shared state.
-
-The trait uses `Pin<Box<dyn Future>>` returns for object safety (`Arc<dyn PersistenceBackend>`). `InMemoryBackend` is shipped for testing. `Instant` fields are serialized as seconds-remaining and reconstructed on load. `StoredToken::decoded_claims` is not serialized — it is re-decoded via the existing `claims_decoder`.
-
-Builder API: `.persistence(Arc::new(MyBackend::new()))` wires the backend into both stores.
-
-#### Built-in backends
-
-- `InMemoryBackend` — always available, useful for testing. TTL is ignored.
-- `RedisBackend` — requires the `redis` cargo feature. Stores keys as `{ns}:{key}` with a companion index Set (`{ns}:__idx__`) per namespace so that `keys()` is O(members) via `SMEMBERS` rather than scanning the keyspace. `set` and `delete` maintain the index atomically using pipelined transactions. TTL is handled natively via Redis `EXPIRE`.
-
-#### Using Redis persistence
-
-Enable the feature in `Cargo.toml`:
-
-```toml
-[dependencies]
-mcp-framework = { version = "0.1", features = ["redis"] }
-```
-
-Then wire it via the builder:
-
-```rust
-use std::sync::Arc;
-use mcp_framework::prelude::*;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let redis = RedisBackend::connect("redis://127.0.0.1/").await?;
-
-    McpAppBuilder::new("my-server")
-        .persistence(Arc::new(redis))
-        .server(|| MyServer::new())
-        .run()
-        .await
-}
-```
-
-If you already have a `redis::aio::ConnectionManager` (e.g. shared with other parts of your application), use `RedisBackend::from_connection_manager(conn)` instead.
-
-### HTTP utilities (`src/http_util/`)
-
-- `HttpError`: unified error type that converts to Axum responses with proper status codes and JSON bodies
-- `QueryBuilder`: fluent API for constructing URL query parameters
+Every `call_tool` produces a `ToolCallRecord`, dispatched fire-and-forget to a `ToolCallLogger` (`NoopLogger`, `TracingLogger`, or a custom one). The feature-gated `MetricsCollector` *is* a logger, so metrics add no new interception point; it exposes `snapshot()` in-process and a Prometheus/JSON endpoint mounted outside the auth layer.
 
 ## Environment Variables
 

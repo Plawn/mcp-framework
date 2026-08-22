@@ -6,7 +6,7 @@ Handles transport selection, authentication, CLI parsing, and tracing so you onl
 
 ## Features
 
-- **Triple transport** — HTTP (Streamable HTTP), SSE (Server-Sent Events), and stdio
+- **Two transports** — HTTP (Streamable HTTP) and stdio, plus an in-process loopback client
 - **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE and dynamic client registration, or a stateless pure resource server)
 - **Automatic token refresh** — expired OAuth tokens are refreshed lazily on access
 - **Dynamic capabilities** — add/remove tools, prompts, and resources at runtime
@@ -66,7 +66,7 @@ Tokens and sessions are accessible via `RequestContextExt` on the request contex
 
 ### Struct API
 
-The original struct-based API is still supported:
+The original struct-based API is still supported. `McpApp` has no `Default`, so every field is spelled out:
 
 ```rust
 use mcp_framework::{run, McpApp, AuthProvider, ProtocolLifecyclePolicy};
@@ -81,8 +81,14 @@ async fn main() -> anyhow::Result<()> {
         settings: None,
         capability_registry: None,
         capability_filter: None,
+        access_validator: None,
+        claims_decoder: None,
         session_store: None,
+        tool_call_logger: None,
+        persistence: None,
         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        extra_routes: None,
+        public_routes: None,
     }).await
 }
 ```
@@ -107,8 +113,14 @@ run(McpApp {
     }),
     capability_registry: None,
     capability_filter: None,
+    access_validator: None,
+    claims_decoder: None,
     session_store: None,
+    tool_call_logger: None,
+    persistence: None,
     protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+    extra_routes: None,
+    public_routes: None,
 }).await
 ```
 
@@ -126,7 +138,6 @@ client is known to use the lifecycle matching its advertised protocol version.
 
 ```
 my-server --transport http      # default, starts Streamable HTTP server
-my-server --transport sse       # SSE transport (legacy MCP)
 my-server --transport stdio     # stdio for Claude Desktop
 my-server --debug               # debug logging
 my-server --trace               # trace-level logging
@@ -320,6 +331,30 @@ let filter = Arc::new(ToolFilter(|tools, token| {
 
 // Or implement CapabilityFilter directly for full control over all three types
 ```
+
+## In-process clients (loopback)
+
+An in-process caller — an agent loop, a scheduler, a background job — that reaches into the
+`CapabilityRegistry` directly takes a path no network client takes, and so slips past the capability
+filter, the access validator and the tool-call logger: metrics and audit trails then describe
+external traffic only. `McpAppBuilder::loopback()` hands out an endpoint whose clients take the same
+path as everyone else, minus the socket.
+
+```rust
+let mut builder = McpAppBuilder::new("my-server").server(|| MyServer::new());
+// … configure everything else first
+let loopback = builder.loopback();      // does not consume the builder
+tokio::spawn(async move { builder.run().await });
+
+let session = loopback.connect(LoopbackIdentity::new("thread-42")).await?;
+let tools = session.list_all_tools().await?;
+```
+
+The endpoint is a snapshot of the builder, so take it **last** — configuring a captured field
+afterwards makes `build()` fail, naming the field. It keeps its own `TokenStore` and `SessionStore`
+(a loopback session id is chosen by the caller and would otherwise collide with a network client's),
+which also means in-process session data is not persisted. `Arc<dyn DynLoopback>` is the object-safe
+form for storing an endpoint.
 
 ## Environment variables
 

@@ -48,7 +48,8 @@
 //!
 //! ## Features
 //!
-//! - **Triple transport** — HTTP (Streamable HTTP), SSE (Server-Sent Events), and stdio
+//! - **Two transports** — HTTP (Streamable HTTP) and stdio, plus an in-process loopback client
+//!   ([`LoopbackEndpoint`](transport::LoopbackEndpoint)) that takes the same path as network traffic
 //! - **Pluggable auth** — None, HTTP Basic, or OAuth 2.0 (Keycloak OIDC proxy with PKCE)
 //! - **Automatic token refresh** — expired OAuth tokens are refreshed lazily on access
 //! - **Dynamic capabilities** — add/remove tools, prompts, and resources at runtime
