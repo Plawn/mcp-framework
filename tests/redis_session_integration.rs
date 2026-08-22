@@ -169,6 +169,7 @@ async fn start_server(redis: Arc<RedisBackend>) -> TestServer {
         tool_call_logger: None,
         persistence: Some(redis),
         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: None,
         public_routes: None,
     };

@@ -24,6 +24,8 @@ pub use crate::persistence::{InMemoryBackend, PersistenceBackend, PersistenceErr
 pub use crate::runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
 pub use crate::session::{RequestContextExt, Session, SessionData, SessionStore};
 pub use crate::transport::ProtocolLifecyclePolicy;
+/// Re-exported so `.max_protocol_version(..)` can be called without reaching into `rmcp`.
+pub use rmcp::model::ProtocolVersion;
 
 // Re-exports from rmcp so consumers don't need it as a direct dependency
 pub use rmcp::model::{

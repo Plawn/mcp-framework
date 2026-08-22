@@ -178,6 +178,7 @@ async fn start_server() -> std::net::SocketAddr {
         tool_call_logger: None,
         persistence: None,
         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: None,
         public_routes: None,
     };
@@ -209,6 +210,7 @@ async fn start_server_with_persistence(persistence: Arc<InMemoryBackend>) -> std
         tool_call_logger: None,
         persistence: Some(persistence),
         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: None,
         public_routes: None,
     };
@@ -842,4 +844,148 @@ async fn http_sse_priming_causes_client_issues() {
 
     // The fixed server (start_server) always works — that's covered by the other tests.
     // This test just documents the priming behavior.
+}
+
+// ── Protocol-lifecycle framing (the "~1 in 2 tools/list empty in Claude" bug) ──
+//
+// A client that announces 2026-07-28 through the *legacy* `initialize`
+// lifecycle (rather than `server/discover`) is, under `Hybrid`, negotiated
+// down to a 2025-11-25 session. rmcp delivers every request-response on a
+// legacy session over `text/event-stream` — `with_json_response(true)` only
+// reaches the *stateless* path — and Claude's capability import can drop an
+// SSE-framed `tools/list`, leaving an empty tool list until a manual refresh.
+//
+// Under `Strict` the same `initialize` stays stateless (no session) and a
+// modern client's `tools/list` (which carries per-request 2026-07-28 metadata)
+// comes back as plain `application/json`.
+
+async fn start_server_with_policy(policy: ProtocolLifecyclePolicy) -> std::net::SocketAddr {
+    let config: HttpAppConfig<_, ()> = HttpAppConfig {
+        public_url: "http://localhost".to_string(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        auth: AuthProvider::None,
+        server_factory: || TestServer::new(),
+        app_name: "http-policy-test".to_string(),
+        capability_registry: None,
+        capability_filter: None,
+        access_validator: None,
+        claims_decoder: None,
+        session_store: SessionStore::default(),
+        tool_call_logger: None,
+        persistence: None,
+        protocol_lifecycle: policy,
+        max_protocol_version: None,
+        extra_routes: None,
+        public_routes: None,
+    };
+    let (app, _token_store, _registry) = build_app(config).expect("valid test configuration");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+async fn raw_initialize(
+    http: &reqwest::Client,
+    addr: std::net::SocketAddr,
+) -> Option<String> {
+    let init = http
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28", "capabilities": {},
+                "clientInfo": { "name": "lifecycle-test", "version": "1" }
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize failed");
+    assert_eq!(init.status(), reqwest::StatusCode::OK);
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let _ = init.text().await;
+    session_id
+}
+
+#[tokio::test]
+async fn hybrid_legacy_initialize_serves_tools_list_over_sse() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server_with_policy(ProtocolLifecyclePolicy::Hybrid).await;
+    let http = reqwest::Client::new();
+    let session_id = raw_initialize(&http, addr).await;
+    assert!(
+        session_id.is_some(),
+        "Hybrid must mint a session for a legacy initialize"
+    );
+
+    // A legacy session client sends a plain tools/list carrying the session id.
+    let list = http
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-11-25")
+        .header("mcp-session-id", session_id.unwrap())
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+        }))
+        .send()
+        .await?;
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        list.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "Hybrid delivers a legacy-session tools/list over SSE (the framing that Claude can drop)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_modern_initialize_serves_tools_list_over_json() -> anyhow::Result<()> {
+    init_test_tracing();
+    let addr = start_server_with_policy(ProtocolLifecyclePolicy::Strict).await;
+    let http = reqwest::Client::new();
+    let session_id = raw_initialize(&http, addr).await;
+    assert!(
+        session_id.is_none(),
+        "Strict must not mint a session for a modern initialize"
+    );
+
+    // A modern client attaches per-request 2026-07-28 metadata to tools/list.
+    let list = http
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/list")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": { "name": "lifecycle-test", "version": "1" }
+            }}
+        }))
+        .send()
+        .await?;
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        list.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "Strict serves a modern tools/list as plain JSON"
+    );
+    let body: serde_json::Value = list.json().await?;
+    assert!(
+        body["result"]["tools"].as_array().is_some_and(|a| !a.is_empty()),
+        "tools/list must not be empty"
+    );
+    Ok(())
 }

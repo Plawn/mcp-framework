@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::Router;
 use clap::{Parser, ValueEnum};
 use rmcp::ServerHandler;
+use rmcp::model::ProtocolVersion;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use std::any::Any;
@@ -116,6 +117,13 @@ where
     pub persistence: Option<Arc<dyn PersistenceBackend>>,
     /// Streamable HTTP lifecycle compatibility policy.
     pub protocol_lifecycle: ProtocolLifecyclePolicy,
+    /// Highest MCP revision advertised to clients. `None` advertises every
+    /// revision the handler supports — which is rmcp's default, and offers
+    /// revisions the deployment may never have been exercised against.
+    ///
+    /// Overridden at runtime by
+    /// [`MAX_PROTOCOL_VERSION_ENV`](crate::transport::MAX_PROTOCOL_VERSION_ENV).
+    pub max_protocol_version: Option<ProtocolVersion>,
     /// Extra axum routes merged into the auth-wrapped MCP router.
     ///
     /// See [`HttpAppConfig::extra_routes`](crate::transport::HttpAppConfig::extra_routes).
@@ -160,6 +168,7 @@ where
             tool_call_logger: None,
             persistence: None,
             protocol_lifecycle: ProtocolLifecyclePolicy::default(),
+            max_protocol_version: None,
             extra_routes: None,
             public_routes: None,
             loopback: LoopbackGuard::default(),
@@ -205,6 +214,7 @@ pub struct McpAppBuilder<T: SessionData = (), F = ()> {
     tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
     persistence: Option<Arc<dyn PersistenceBackend>>,
     protocol_lifecycle: ProtocolLifecyclePolicy,
+    max_protocol_version: Option<ProtocolVersion>,
     extra_routes: Option<Router>,
     public_routes: Option<Router>,
     loopback: LoopbackGuard,
@@ -262,6 +272,7 @@ impl McpAppBuilder<()> {
             tool_call_logger: None,
             persistence: None,
             protocol_lifecycle: ProtocolLifecyclePolicy::default(),
+            max_protocol_version: None,
             extra_routes: None,
             public_routes: None,
             loopback: LoopbackGuard::default(),
@@ -296,6 +307,7 @@ impl<F> McpAppBuilder<(), F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             protocol_lifecycle: self.protocol_lifecycle,
+            max_protocol_version: self.max_protocol_version,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
             loopback: self.loopback,
@@ -490,6 +502,32 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
         self
     }
 
+    /// Cap the highest MCP revision this server advertises.
+    ///
+    /// rmcp advertises every revision it knows, including ones whose lifecycle
+    /// the deployment has never been exercised against — a client that picks
+    /// one gets a handshake nobody chose to support. Naming a ceiling makes
+    /// that an explicit decision:
+    ///
+    /// ```rust,ignore
+    /// McpAppBuilder::new("my-server")
+    ///     .max_protocol_version(ProtocolVersion::V_2025_11_25)
+    ///     .server(|| MyServer::new())
+    /// ```
+    ///
+    /// A client asking for a higher revision is answered with rmcp's
+    /// `-32022 Unsupported protocol version`, whose `data.supported` lists what
+    /// is on offer, and well-behaved clients retry against that list.
+    ///
+    /// [`MAX_PROTOCOL_VERSION_ENV`](crate::transport::MAX_PROTOCOL_VERSION_ENV)
+    /// overrides this at boot, so the ceiling can be lowered or lifted per
+    /// environment without a rebuild.
+    pub fn max_protocol_version(mut self, version: ProtocolVersion) -> Self {
+        self.max_protocol_version = Some(version);
+        self.loopback.note("max_protocol_version");
+        self
+    }
+
     /// Transfer all non-factory fields into a new builder with a different factory type.
     fn with_factory<G>(mut self, factory: G) -> McpAppBuilder<T, G> {
         self.loopback.note("server");
@@ -507,6 +545,7 @@ impl<T: SessionData, F> McpAppBuilder<T, F> {
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             protocol_lifecycle: self.protocol_lifecycle,
+            max_protocol_version: self.max_protocol_version,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
             loopback: self.loopback,
@@ -677,6 +716,7 @@ where
             tool_call_logger: self.tool_call_logger,
             persistence: self.persistence,
             protocol_lifecycle: self.protocol_lifecycle,
+            max_protocol_version: self.max_protocol_version,
             extra_routes: self.extra_routes,
             public_routes: self.public_routes,
         })
@@ -821,6 +861,7 @@ where
         tool_call_logger: app.tool_call_logger,
         persistence,
         protocol_lifecycle: app.protocol_lifecycle,
+        max_protocol_version: app.max_protocol_version,
         extra_routes: app.extra_routes,
         public_routes: app.public_routes,
     })
@@ -833,6 +874,17 @@ where
     S: ServerHandler + Send + 'static,
     T: SessionData,
 {
+    // Same ceiling as HTTP, resolved on the same rules — stdio has no
+    // `build_app` to run the boot check, so it happens here.
+    let resolved_max_protocol_version =
+        crate::transport::resolve_max_protocol_version(app.max_protocol_version)?;
+    if let Some(ref version) = resolved_max_protocol_version {
+        tracing::info!(
+            max_protocol_version = version.as_str(),
+            "advertised MCP revisions capped"
+        );
+    }
+
     let mut token_store = TokenStore::new();
     if let Some(decoder) = app.claims_decoder {
         token_store.claims_decoder = Some(decoder);
@@ -891,6 +943,7 @@ where
             token_store,
             session_store,
             tool_call_logger: app.tool_call_logger,
+            max_protocol_version: resolved_max_protocol_version,
             loopback_identity: None,
         },
     );

@@ -15,6 +15,7 @@ use super::filter::{CapabilityFilter, resolve_query_filter, resolve_token};
 use super::registry::CapabilityRegistry;
 use super::sanitize::sanitize_tool_schemas;
 use super::validator::{AccessDecision, AccessValidator};
+use crate::transport::protocol::cap_protocol_versions;
 
 /// Infrastructure concerns shared across transport modes.
 ///
@@ -26,6 +27,10 @@ pub(crate) struct HandlerContext<T: SessionData> {
     pub token_store: TokenStore,
     pub session_store: SessionStore<T>,
     pub tool_call_logger: Option<Arc<dyn ToolCallLogger>>,
+    /// Highest MCP revision this server advertises, or `None` for whatever the
+    /// inner handler supports. See
+    /// [`resolve_max_protocol_version`](crate::transport::resolve_max_protocol_version).
+    pub max_protocol_version: Option<ProtocolVersion>,
     /// Set only by the loopback transport, which has no HTTP request to carry the caller's
     /// identity. Synthesizes the request parts a network client would have sent, so session
     /// resolution and token extraction keep working off a single mechanism.
@@ -136,11 +141,26 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
         self.enrich_extensions(&mut context.extensions);
         let mut result = self.inner.discover(context).await?;
         self.augment_capabilities(&mut result.capabilities).await;
+        // rmcp's default `discover` builds `supported_versions` from the *inner*
+        // handler's `supported_protocol_versions()`, which never sees the
+        // ceiling. Left alone, `server/discover` would advertise a revision the
+        // very next request is refused for.
+        result.supported_versions = self.supported_protocol_versions().into_owned();
         Ok(result)
     }
 
+    /// The single point where the advertised revision set is decided.
+    ///
+    /// rmcp's trait default returns every [`ProtocolVersion::KNOWN_VERSIONS`],
+    /// so a server that never opted into a revision still offers it — and a
+    /// client that picks it gets a lifecycle the deployment has never been
+    /// tested against. Capping here rather than in each transport keeps
+    /// `server/discover`, `initialize` and the loopback on one answer.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        self.inner.supported_protocol_versions()
+        cap_protocol_versions(
+            self.inner.supported_protocol_versions(),
+            self.context.max_protocol_version.as_ref(),
+        )
     }
 
     // ── list_tools: merge + filter ───────────────────────────────────

@@ -370,6 +370,13 @@ where
                 token_store: self.token_store.clone(),
                 session_store: self.session_store.clone(),
                 tool_call_logger: self.tool_call_logger.clone(),
+                // Deliberately uncapped. `max_protocol_version` steers *third-party*
+                // clients away from a lifecycle the deployment has not been exercised
+                // against; the peer here is the framework's own rmcp client negotiating
+                // in-process, with no wire and no third party to steer. Honouring a
+                // ceiling set below rmcp's client default would only refuse our own
+                // caller.
+                max_protocol_version: None,
                 loopback_identity: Some(identity.clone()),
             },
         );

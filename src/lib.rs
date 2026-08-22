@@ -108,4 +108,4 @@ pub use persistence::RedisBackend;
 pub use persistence::{InMemoryBackend, PersistenceBackend, PersistenceError};
 pub use runner::{LogLevel, McpApp, McpAppBuilder, Settings, TransportMode, run};
 pub use session::{RequestContextExt, Session, SessionData, SessionStore, resolve_session_id};
-pub use transport::ProtocolLifecyclePolicy;
+pub use transport::{MAX_PROTOCOL_VERSION_ENV, ProtocolLifecyclePolicy, resolve_max_protocol_version};

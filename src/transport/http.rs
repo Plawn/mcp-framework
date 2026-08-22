@@ -23,7 +23,9 @@ use crate::constants::{
 };
 use crate::persistence::PersistenceBackend;
 use crate::session::{SessionData, SessionStore};
-use crate::transport::protocol::{ProtocolLifecyclePolicy, normalize_protocol_lifecycle};
+use crate::transport::protocol::{
+    ProtocolLifecyclePolicy, normalize_protocol_lifecycle, resolve_max_protocol_version,
+};
 use crate::transport::session_persistence::TransportSessionStore;
 
 /// Configuration for building the HTTP app
@@ -50,6 +52,12 @@ pub struct HttpAppConfig<F, T: SessionData = ()> {
     pub persistence: Option<Arc<dyn PersistenceBackend>>,
     /// Streamable HTTP lifecycle compatibility policy.
     pub protocol_lifecycle: ProtocolLifecyclePolicy,
+    /// Highest MCP revision advertised to clients, or `None` to advertise every
+    /// revision the handler supports.
+    ///
+    /// Set via [`McpAppBuilder::max_protocol_version`](crate::McpAppBuilder::max_protocol_version)
+    /// or [`MAX_PROTOCOL_VERSION_ENV`](crate::transport::MAX_PROTOCOL_VERSION_ENV).
+    pub max_protocol_version: Option<rmcp::model::ProtocolVersion>,
     /// Extra routes merged into the auth-wrapped MCP router.
     ///
     /// Routes registered here sit inside the same `AuthProvider` middleware as
@@ -224,6 +232,16 @@ where
         oauth_config.validate()?;
     }
 
+    // Boot-time, not first-request: a ceiling naming a revision rmcp does not
+    // know would otherwise be discovered as a client that cannot connect.
+    let max_protocol_version = resolve_max_protocol_version(config.max_protocol_version.clone())?;
+    if let Some(ref version) = max_protocol_version {
+        tracing::info!(
+            max_protocol_version = version.as_str(),
+            "advertised MCP revisions capped"
+        );
+    }
+
     let transport_session_ttl = config.session_store.ttl();
     let transport_persistence = config.persistence.clone();
 
@@ -361,6 +379,7 @@ where
                     token_store: token_store_clone.clone(),
                     session_store: session_store.clone(),
                     tool_call_logger: tool_call_logger.clone(),
+                    max_protocol_version: max_protocol_version.clone(),
                     loopback_identity: None,
                 },
             ))

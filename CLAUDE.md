@@ -8,6 +8,7 @@ It is an index. The rationale, invariants and worked examples for each subsystem
 |---|---|
 | `AuthProvider`, OAuth token modes, bearer validation, Keycloak harness | [`docs/auth.md`](docs/auth.md) |
 | Session identity, sessionless revisions, transport session recovery, persistence backends | [`docs/sessions.md`](docs/sessions.md) |
+| Advertised protocol revisions, the `max_protocol_version` ceiling, lifecycle policy | [`docs/protocol.md`](docs/protocol.md) |
 | In-process (loopback) transport | [`docs/loopback.md`](docs/loopback.md) |
 | Access validation, claims decoder, MCP Apps, tool schema sanitization | [`docs/capabilities.md`](docs/capabilities.md) |
 | Audit logging, effectiveness metrics | [`docs/observability.md`](docs/observability.md) |
@@ -76,6 +77,10 @@ Pinned to **rmcp 3.1**. Two upstream changes shape every consumer `ServerHandler
 
 Two modes selected via the `--transport` CLI flag: **HTTP** (axum router, OAuth well-known endpoints, CORS) and **stdio** (used for Claude Desktop local integration). There is no SSE transport — `TransportMode` is `Http | Stdio`.
 
+Two independent knobs decide how a client is served — `.max_protocol_version()` controls which revisions are **offered**, `.protocol_lifecycle()` controls what happens to a client that announces a modern revision through the **legacy** lifecycle. Full treatment in [`docs/protocol.md`](docs/protocol.md).
+
+`.max_protocol_version(ProtocolVersion::V_2025_11_25)` (env override `MCP_MAX_PROTOCOL_VERSION`) caps the advertised set. Without it rmcp's trait default offers every `KNOWN_VERSIONS`, so a server advertises `2026-07-28` — and its sessionless `server/discover` lifecycle — without anyone deciding to. The cap is applied at the single forward point in `DynamicHandler`, validated at boot in `build_app()`, and deliberately **not** applied to the loopback.
+
 `ProtocolLifecyclePolicy` (`src/transport/protocol.rs`, `.protocol_lifecycle()`) decides what happens to a client that announces a sessionless protocol version through the legacy `initialize` lifecycle:
 
 - `Hybrid` (default) — such an `initialize` is negotiated down to `2025-11-25`, so rmcp creates a session and the rest of the client's legacy lifecycle stays coherent. Correct 2026-07-28 clients using `server/discover` are always served statelessly.
@@ -124,6 +129,7 @@ Every `call_tool` produces a `ToolCallRecord`, dispatched fire-and-forget to a `
 | `BASIC_AUTH_USERNAME`, `BASIC_AUTH_PASSWORD` | Basic auth | — |
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ISSUER_URL`, `OAUTH_REDIRECT_URL` | OAuth | — |
 | `OAUTH_SCOPES` | OAuth; also advertised as `scopes_supported` in the RFC 8414 and RFC 9728 documents | `openid,profile,email` |
+| `MCP_MAX_PROTOCOL_VERSION` | `build_app()` / stdio boot | — (uncapped; `none`/`off`/`latest` lift a builder ceiling, any other value must be a known revision) |
 | `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` (also `opaque`, `resource_server`) |
 | `OAUTH_UNKNOWN_TOKEN_VALIDATION` | `OAuthConfig::from_env()` | `jwks_then_introspection` (also `jwks`, `introspection`, `reject`; in `resource_server` mode the default is coerced to `jwks` and the other two are boot errors) |
 | `OAUTH_EXPECTED_AUDIENCE` | `OAuthConfig::from_env()` | — (comma-separated; empty = `aud` unconstrained — **required** when `MCP_TOKEN_MODE=resource_server`) |
