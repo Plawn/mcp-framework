@@ -521,6 +521,7 @@ fn app_with_filter(
         tool_call_logger: None,
         persistence: None,
         protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: None,
         public_routes: None,
     };
@@ -955,6 +956,7 @@ fn config_with(auth: AuthProvider) -> HttpAppConfig<fn() -> NoopServer, ()> {
         tool_call_logger: None,
         persistence: None,
         protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: Some(Router::new().route("/whoami", get(echo_session_id))),
         public_routes: None,
     }

@@ -54,6 +54,7 @@ fn app_with_optional_persistence(
         tool_call_logger: None,
         persistence,
         protocol_lifecycle: mcp_framework::ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: Some(Router::new().route("/whoami", get(whoami))),
         public_routes: None,
     };

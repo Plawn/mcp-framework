@@ -485,6 +485,7 @@ async fn start_framework(issuer_url: String) -> anyhow::Result<Framework> {
         tool_call_logger: None,
         persistence: Some(backend.clone()),
         protocol_lifecycle: ProtocolLifecyclePolicy::Hybrid,
+        max_protocol_version: None,
         extra_routes: None,
         public_routes: None,
     };
