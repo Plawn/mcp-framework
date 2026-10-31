@@ -15,9 +15,10 @@ use super::config::UnknownTokenValidation;
 use super::jwks::{JwksRejection, JwksValidator};
 use super::middleware::credential_session_key;
 use crate::constants::{
-    NS_GRANT_REFRESH, NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH, NS_REFRESH_LOCK, NS_TOKENS,
-    OPAQUE_ACCESS_TTL, OPAQUE_REFRESH_TTL, PENDING_AUTH_TIMEOUT, REFRESH_LOCK_POLL,
-    REFRESH_LOCK_TTL, REFRESH_LOCK_WAIT, TOKEN_EXPIRY_BUFFER,
+    NS_GRANT_REFRESH, NS_OAUTH_CLIENTS, NS_OPAQUE, NS_OPAQUE_ACCESS, NS_OPAQUE_REFRESH,
+    NS_PROXIED_AUTH, NS_REFRESH_LOCK, NS_TOKENS, OPAQUE_ACCESS_TTL, OPAQUE_REFRESH_TTL,
+    PENDING_AUTH_TIMEOUT, PROXIED_AUTH_TIMEOUT, REFRESH_LOCK_POLL, REFRESH_LOCK_TTL,
+    REFRESH_LOCK_WAIT, TOKEN_EXPIRY_BUFFER,
 };
 use crate::persistence::{
     PersistenceBackend, PersistenceError, instant_to_unix_millis, persist, persist_raw,
@@ -111,6 +112,30 @@ impl PendingAuth {
         Instant::now() > self.created_at + PENDING_AUTH_TIMEOUT
     }
 }
+
+/// A client's `/oauth/authorize` request, parked while the browser is at
+/// Keycloak.
+///
+/// In the proxying token modes the framework presents itself as the
+/// authorization server, so Keycloak must send the browser back **here**
+/// (`/oauth/callback`), not to the client: otherwise the client receives
+/// Keycloak's `iss` and, per RFC 9207, refuses a response from an issuer it
+/// was not talking to. This is what the callback needs to finish the client's
+/// leg of the flow.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxiedAuthorization {
+    /// Where the client asked to receive the code. Already validated.
+    pub redirect_uri: String,
+    /// The client's own `state`, echoed back verbatim.
+    pub client_state: Option<String>,
+    /// The `iss` to put on the response: the issuer this server advertises.
+    pub issuer: String,
+}
+
+/// Upper bound on the in-memory `client_id → redirect_uris` table. Registration
+/// is anonymous, so it must not be an unbounded allocation; past the cap a new
+/// registration is only persisted (when a backend exists) and read through.
+const MAX_CACHED_CLIENTS: usize = 10_000;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedToken {
@@ -336,6 +361,10 @@ pub struct TokenStore {
     tokens: Arc<RwLock<HashMap<String, StoredToken>>>,
     /// Map from state to pending auth (for PKCE flow)
     pending_auths: Arc<RwLock<HashMap<String, PendingAuth>>>,
+    /// Map from server `state` to a proxied authorization in flight.
+    proxied_auths: Arc<RwLock<HashMap<String, (ProxiedAuthorization, Instant)>>>,
+    /// `client_id` → `redirect_uris` registered through `/oauth/register`.
+    client_redirects: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// HTTP client for token refresh requests
     http_client: HttpClient,
     /// OAuth config for refresh (optional - not available in all modes)
@@ -369,6 +398,8 @@ impl TokenStore {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             pending_auths: Arc::new(RwLock::new(HashMap::new())),
+            proxied_auths: Arc::new(RwLock::new(HashMap::new())),
+            client_redirects: Arc::new(RwLock::new(HashMap::new())),
             http_client: HttpClient::new(),
             refresh_config: Arc::new(RwLock::new(None)),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -817,6 +848,110 @@ impl TokenStore {
     pub async fn take_pending_auth(&self, state: &str) -> Option<PendingAuth> {
         let mut pending = self.pending_auths.write().await;
         pending.remove(state)
+    }
+
+    /// Park a proxied authorization under the server `state` sent to Keycloak.
+    ///
+    /// Written through to the persistence backend (with the same TTL) so the
+    /// callback may be served by another instance.
+    pub async fn store_proxied_authorization(&self, state: String, auth: ProxiedAuthorization) {
+        {
+            let mut proxied = self.proxied_auths.write().await;
+            proxied.retain(|_, (_, created)| created.elapsed() <= PROXIED_AUTH_TIMEOUT);
+            proxied.insert(state.clone(), (auth.clone(), Instant::now()));
+        }
+        if let Some(ref backend) = self.persistence {
+            persist(
+                backend,
+                NS_PROXIED_AUTH,
+                &state,
+                &auth,
+                Some(PROXIED_AUTH_TIMEOUT),
+            )
+            .await;
+        }
+    }
+
+    /// Take (single use) the proxied authorization parked under `state`.
+    ///
+    /// `None` for an unknown or expired state — including every `state` minted
+    /// by the historical `/oauth/login` flow, which is how `/oauth/callback`
+    /// tells the two flows apart.
+    pub async fn take_proxied_authorization(&self, state: &str) -> Option<ProxiedAuthorization> {
+        let local = self.proxied_auths.write().await.remove(state);
+        let backend = self.persistence.as_ref();
+
+        if let Some((auth, created)) = local {
+            if let Some(backend) = backend {
+                let _ = backend.delete(NS_PROXIED_AUTH, state).await;
+            }
+            return (created.elapsed() <= PROXIED_AUTH_TIMEOUT).then_some(auth);
+        }
+
+        // Read-through: the redirect may have been issued by another instance.
+        // The backend TTL bounds the entry's life there.
+        let backend = backend?;
+        let bytes = match backend.get(NS_PROXIED_AUTH, state).await {
+            Ok(bytes) => bytes?,
+            Err(e) => {
+                tracing::warn!("Read-through get failed for {NS_PROXIED_AUTH}: {e}");
+                return None;
+            }
+        };
+        let _ = backend.delete(NS_PROXIED_AUTH, state).await;
+        serde_json::from_slice(&bytes)
+            .inspect_err(|e| tracing::warn!("Corrupted proxied authorization: {e}"))
+            .ok()
+    }
+
+    /// Remember the `redirect_uris` a client registered, merged with any it
+    /// registered before under the same `client_id`.
+    pub async fn register_client_redirects(&self, client_id: &str, redirect_uris: &[String]) {
+        let merged = {
+            let mut clients = self.client_redirects.write().await;
+            let mut merged = clients.get(client_id).cloned().unwrap_or_default();
+            for uri in redirect_uris {
+                if !merged.contains(uri) {
+                    merged.push(uri.clone());
+                }
+            }
+            if clients.contains_key(client_id) || clients.len() < MAX_CACHED_CLIENTS {
+                clients.insert(client_id.to_string(), merged.clone());
+            } else {
+                tracing::warn!(
+                    "Registered-client cache full ({MAX_CACHED_CLIENTS}); '{client_id}' is only \
+                     kept in the persistence backend, if any"
+                );
+            }
+            merged
+        };
+        if let Some(ref backend) = self.persistence {
+            persist(backend, NS_OAUTH_CLIENTS, client_id, &merged, None).await;
+        }
+    }
+
+    /// The `redirect_uris` registered for `client_id`, read through to the
+    /// persistence backend on a miss. `None` when the client is unknown here.
+    pub async fn client_redirects(&self, client_id: &str) -> Option<Vec<String>> {
+        if let Some(uris) = self.client_redirects.read().await.get(client_id) {
+            return Some(uris.clone());
+        }
+        let backend = self.persistence.as_ref()?;
+        let bytes = match backend.get(NS_OAUTH_CLIENTS, client_id).await {
+            Ok(bytes) => bytes?,
+            Err(e) => {
+                tracing::warn!("Read-through get failed for {NS_OAUTH_CLIENTS}/{client_id}: {e}");
+                return None;
+            }
+        };
+        let uris: Vec<String> = serde_json::from_slice(&bytes)
+            .inspect_err(|e| tracing::warn!("Corrupted client registration '{client_id}': {e}"))
+            .ok()?;
+        let mut clients = self.client_redirects.write().await;
+        if clients.len() < MAX_CACHED_CLIENTS {
+            clients.insert(client_id.to_string(), uris.clone());
+        }
+        Some(uris)
     }
 
     /// Build a [`StoredToken`] for a bearer that must **not** enter the store.
@@ -1387,6 +1522,11 @@ impl TokenStore {
 
     /// Purge all expired tokens and their associated refresh locks and opaque mappings.
     pub async fn purge_expired(&self) {
+        self.proxied_auths
+            .write()
+            .await
+            .retain(|_, (_, created)| created.elapsed() <= PROXIED_AUTH_TIMEOUT);
+
         let _mutation = self.mutation_lock.lock().await;
         let expired_keys: Vec<String> = {
             let tokens = self.tokens.read().await;

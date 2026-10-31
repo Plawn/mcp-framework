@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use super::templates;
-use super::{OAuthConfig, StoredToken, TokenStore};
+use super::{OAuthConfig, ProxiedAuthorization, StoredToken, TokenStore};
 use crate::constants::{OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATUS_PATH};
 use crate::http_util::HttpError;
 
@@ -22,11 +22,18 @@ pub struct OAuthState {
     pub app_name: String,
 }
 
-/// Query params for the callback
+/// Query params for the callback.
+///
+/// `code` is absent on an error response (RFC 6749 §4.1.2.1). Keycloak's other
+/// parameters (`iss`, `session_state`) are ignored: on the proxied flow the
+/// framework issues its own `iss`.
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
-    pub code: String,
+    pub code: Option<String>,
     pub state: String,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+    pub error_uri: Option<String>,
 }
 
 /// Query params for starting auth flow
@@ -85,11 +92,95 @@ async fn login_handler(
     Ok(Redirect::temporary(auth_url.as_str()))
 }
 
-/// Handler for OAuth callback
+/// Handler for `/oauth/callback`, shared by two flows told apart by `state`:
+///
+/// - a `state` minted by `/oauth/authorize` (the proxy an MCP client drives):
+///   the response is forwarded to the client's `redirect_uri` — see
+///   [`forward_proxied_callback`];
+/// - anything else is the historical server-side login started at
+///   `/oauth/login`, unchanged.
+///
+/// One route rather than two because this is the server callback the Keycloak
+/// client is already configured to allow.
 async fn callback_handler(
     State(state): State<Arc<OAuthState>>,
     Query(query): Query<CallbackQuery>,
-) -> Result<impl IntoResponse, HttpError> {
+) -> Result<axum::response::Response, HttpError> {
+    if let Some(proxied) = state.store.take_proxied_authorization(&query.state).await {
+        return forward_proxied_callback(&proxied, &query);
+    }
+    login_callback(&state, query)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+/// Complete the client's leg of a proxied authorization: `302` to its
+/// `redirect_uri` with Keycloak's `code` (or error), the client's own `state`,
+/// and `iss` set to the issuer this server advertises (RFC 9207 §2).
+fn forward_proxied_callback(
+    proxied: &ProxiedAuthorization,
+    query: &CallbackQuery,
+) -> Result<axum::response::Response, HttpError> {
+    let mut target = url::Url::parse(&proxied.redirect_uri).map_err(|e| {
+        tracing::error!("Stored redirect_uri no longer parses: {e}");
+        HttpError::internal("Invalid stored redirect_uri")
+    })?;
+
+    {
+        let mut pairs = target.query_pairs_mut();
+        match (&query.code, &query.error) {
+            (Some(code), None) => {
+                pairs.append_pair("code", code);
+            }
+            (_, Some(error)) => {
+                pairs.append_pair("error", error);
+                if let Some(description) = &query.error_description {
+                    pairs.append_pair("error_description", description);
+                }
+                if let Some(uri) = &query.error_uri {
+                    pairs.append_pair("error_uri", uri);
+                }
+            }
+            (None, None) => {
+                return Err(HttpError::bad_request(
+                    "Authorization response carries neither code nor error",
+                ));
+            }
+        }
+        if let Some(client_state) = &proxied.client_state {
+            pairs.append_pair("state", client_state);
+        }
+        pairs.append_pair("iss", &proxied.issuer);
+    }
+
+    tracing::info!(
+        error = query.error.as_deref(),
+        "Forwarding proxied authorization response to the client"
+    );
+
+    Ok((
+        axum::http::StatusCode::FOUND,
+        [(axum::http::header::LOCATION, target.to_string())],
+    )
+        .into_response())
+}
+
+/// The historical `/oauth/login` flow: server-side code exchange.
+async fn login_callback(
+    state: &OAuthState,
+    query: CallbackQuery,
+) -> Result<impl IntoResponse + use<>, HttpError> {
+    let Some(code) = query.code else {
+        tracing::warn!(
+            "OAuth login failed at the authorization server: {:?}",
+            query.error
+        );
+        return Err(HttpError::bad_request(format!(
+            "Authentication failed: {}",
+            query.error.as_deref().unwrap_or("no authorization code")
+        )));
+    };
+
     // Retrieve pending auth
     let pending = state
         .store
@@ -116,7 +207,7 @@ async fn callback_handler(
 
     // Exchange code for token using the shared HTTP client
     let token_response = client
-        .exchange_code(AuthorizationCode::new(query.code))
+        .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(PkceCodeVerifier::new(pending.pkce_verifier))
         .request_async(&state.http_client)
         .await

@@ -25,6 +25,12 @@ pub struct AuthorizationServerMetadata {
     pub grant_types_supported: Vec<String>,
     pub code_challenge_methods_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// RFC 9207 §3. Declared in the proxying modes, where `/oauth/callback`
+    /// puts `iss = issuer` on every authorization response. Left out in
+    /// resource-server mode, where this document describes Keycloak and the
+    /// framework has no say in its responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_response_iss_parameter_supported: Option<bool>,
 }
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728)
@@ -117,6 +123,10 @@ fn authorization_server_metadata(state: &McpOAuthState) -> AuthorizationServerMe
             "client_secret_post".to_string(),
             "none".to_string(),
         ],
+        authorization_response_iss_parameter_supported: state
+            .token_mode
+            .is_stateful()
+            .then_some(true),
     }
 }
 
@@ -149,6 +159,7 @@ mod tests {
             token_mode,
             unknown_token_validation: UnknownTokenValidation::Jwks,
             expected_audiences: vec!["https://mcp.example.com/mcp".to_string()],
+            allowed_redirect_uris: vec![],
         }
     }
 

@@ -45,6 +45,20 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// A comma-separated environment variable, trimmed, empty items dropped.
+/// Unset reads as empty.
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// OAuth configuration for Keycloak OIDC
 #[derive(Clone)]
 pub struct OAuthConfig {
@@ -60,6 +74,13 @@ pub struct OAuthConfig {
     /// constrained (the observed `aud`/`azp` is logged instead, so the
     /// deployment can be hardened later from real traffic).
     pub expected_audiences: Vec<String>,
+    /// `redirect_uri`s `/oauth/authorize` accepts from any client, on top of
+    /// the ones a client registered through `/oauth/register`, loopback URIs
+    /// and URIs on the `PUBLIC_URL` origin. Exact matches only. Meant for the
+    /// fixed callbacks of hosted clients (`https://claude.ai/api/mcp/auth_callback`)
+    /// whose registration this process may not remember — after a restart
+    /// without a persistence backend, for instance.
+    pub allowed_redirect_uris: Vec<String>,
 }
 
 impl OAuthConfig {
@@ -75,6 +96,7 @@ impl OAuthConfig {
     /// - OAUTH_SCOPES (comma-separated, defaults to "openid,profile,email")
     /// - OAUTH_UNKNOWN_TOKEN_VALIDATION (see [`UnknownTokenValidation`])
     /// - OAUTH_EXPECTED_AUDIENCE (comma-separated, defaults to unconstrained)
+    /// - OAUTH_ALLOWED_REDIRECT_URIS (comma-separated, defaults to none)
     pub fn from_env() -> Result<Self, String> {
         let client_id = std::env::var("OAUTH_CLIENT_ID").map_err(|_| "OAUTH_CLIENT_ID not set")?;
         let client_secret = std::env::var("OAUTH_CLIENT_SECRET").ok();
@@ -91,15 +113,8 @@ impl OAuthConfig {
 
         let token_mode = TokenMode::from_env();
         let unknown_token_validation = UnknownTokenValidation::from_env();
-        let expected_audiences = std::env::var("OAUTH_EXPECTED_AUDIENCE")
-            .map(|raw| {
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let expected_audiences = env_list("OAUTH_EXPECTED_AUDIENCE");
+        let allowed_redirect_uris = env_list("OAUTH_ALLOWED_REDIRECT_URIS");
 
         Ok(Self {
             client_id,
@@ -110,6 +125,7 @@ impl OAuthConfig {
             token_mode,
             unknown_token_validation,
             expected_audiences,
+            allowed_redirect_uris,
         })
     }
 

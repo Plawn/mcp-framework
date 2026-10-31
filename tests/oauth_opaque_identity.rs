@@ -19,6 +19,7 @@ fn oauth() -> AuthProvider {
         token_mode: TokenMode::Opaque,
         unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
         expected_audiences: vec![],
+        allowed_redirect_uris: vec![],
     })
 }
 

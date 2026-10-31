@@ -138,6 +138,7 @@ async fn issuer(
         token_mode: TokenMode::Passthrough,
         unknown_token_validation: policy,
         expected_audiences: vec![],
+        allowed_redirect_uris: vec![],
     });
 
     (auth, hits)

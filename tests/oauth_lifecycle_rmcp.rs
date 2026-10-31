@@ -433,6 +433,7 @@ fn resource_server_auth(issuer_url: String) -> AuthProvider {
         token_mode: TokenMode::ResourceServer,
         unknown_token_validation: UnknownTokenValidation::Jwks,
         expected_audiences: vec![AUDIENCE.to_string()],
+        allowed_redirect_uris: vec![],
     })
 }
 
