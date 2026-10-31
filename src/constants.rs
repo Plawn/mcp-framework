@@ -21,6 +21,10 @@ pub const MCP_FALLBACK_SESSION_HEADER: &str = "x-mcp-framework-session";
 // === Durations ===
 pub const TOKEN_EXPIRY_BUFFER: Duration = Duration::from_secs(30);
 pub const PENDING_AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+/// Lifetime of a proxied `/oauth/authorize` round-trip: from the redirect to
+/// Keycloak until the browser comes back to `/oauth/callback`. Covers a human
+/// typing a password and a second factor.
+pub const PROXIED_AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,6 +59,13 @@ pub const NS_OPAQUE_REFRESH: &str = "opaque_refresh";
 pub const NS_GRANT_REFRESH: &str = "grant_refresh";
 /// Distributed refresh locks (SETNX) to serialize token refresh across instances.
 pub const NS_REFRESH_LOCK: &str = "refresh_lock";
+/// Proxied authorizations in flight: server `state` → the client's
+/// `redirect_uri` and `state`. Persisted so the Keycloak callback can land on
+/// another instance than the one that issued the redirect.
+pub const NS_PROXIED_AUTH: &str = "proxied_auth";
+/// `client_id` → the `redirect_uris` it registered through `/oauth/register`.
+/// What `/oauth/authorize` checks a client's `redirect_uri` against.
+pub const NS_OAUTH_CLIENTS: &str = "oauth_clients";
 /// Distributed session mutation locks used to serialize replicas.
 pub const NS_SESSION_LOCK: &str = "session_lock";
 /// Protocol session id → the verified identity that opened it.

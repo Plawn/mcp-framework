@@ -107,6 +107,7 @@ fn oauth_config() -> OAuthConfig {
         // test qui n'a rien à valider à distance.
         unknown_token_validation: UnknownTokenValidation::Reject,
         expected_audiences: vec![],
+        allowed_redirect_uris: vec![],
     }
 }
 

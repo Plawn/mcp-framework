@@ -36,6 +36,31 @@ Configurable via:
 
 `TokenMode` lives inside `OAuthConfig`, making misconfiguration structurally impossible (e.g. setting opaque mode with Basic auth).
 
+### The proxied authorization response (`Passthrough` / `Opaque`)
+
+In the two proxying modes the framework advertises **itself** as the authorization server (`issuer = public_url` in `/.well-known/oauth-authorization-server`). The authorization response the client receives must therefore come from it and carry its `iss` (RFC 9207) — relaying Keycloak's redirect straight to the client hands over Keycloak's `iss`, and a strict client (Claude Code, rmcp) refuses it as an issuer mismatch. Task #1190.
+
+The flow is split at `/oauth/callback`:
+
+1. `/oauth/authorize` checks the client's `redirect_uri` (below), parks `{redirect_uri, client state, issuer}` in `TokenStore` under a fresh server `state` (10 min, single use, written through to the persistence backend so the callback may land on another replica), and sends Keycloak `redirect_uri = {public_url}/oauth/callback` with that server `state`. The client's PKCE `code_challenge` is forwarded untouched.
+2. Keycloak returns to `/oauth/callback`. A `state` found among the parked authorizations is forwarded — `302` to the client's `redirect_uri` with `code` (or `error` / `error_description` / `error_uri`), the client's `state` and `iss = public_url`; Keycloak's `iss` and `session_state` are dropped. Any other `state` is the historical `/oauth/login` flow, unchanged — one route because it is the server callback the Keycloak client already allows.
+3. `/oauth/token` replaces `redirect_uri` with `{public_url}/oauth/callback` on an `authorization_code` grant, since Keycloak requires the value of the authorization request. The client still presents its own `code_verifier`.
+
+The metadata declares `authorization_response_iss_parameter_supported: true`, which makes conforming clients *require* `iss`.
+
+**Keycloak config.** The Keycloak client (`OAUTH_CLIENT_ID`) must allow `{public_url}/oauth/callback`. The clients' own redirect URIs no longer need to be listed there.
+
+**The `redirect_uri` guard** (`src/auth/redirect.rs`). Keycloak's allowlist no longer sees the client's `redirect_uri`, so without a check `/oauth/authorize` would be an open redirector handing out codes. Accepted:
+
+- a URI the `client_id` registered through `/oauth/register` (kept in `TokenStore`, persisted under `oauth_clients` when a backend exists);
+- a loopback URI — `http://localhost`, `127.0.0.1`, `[::1]`, any port (RFC 8252);
+- a URI on the `PUBLIC_URL` origin (the deployment's own SPA);
+- a URI listed verbatim in `OAUTH_ALLOWED_REDIRECT_URIS`.
+
+Fragments are always refused; a refusal is a `400`, never a redirect. Without a persistence backend, registrations are forgotten on restart, while hosted clients (claude.ai) keep their `client_id` — list their fixed callback in `OAUTH_ALLOWED_REDIRECT_URIS` (e.g. `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback`).
+
+Covered by `tests/oauth_proxy_callback.rs`, against a fake Keycloak that adds its own `iss`, with rmcp's strict client end to end in both modes.
+
 **Architecture**: The `token_handler` (`src/auth/proxy.rs`) dispatches to either `passthrough_token_handler` or `opaque_token_handler` based on the configured `TokenMode`. In opaque mode, the handler intercepts the Keycloak response, stores the real token in `TokenStore`, generates opaque UUIDs, and returns those to the client. The `bearer_auth_middleware` (`src/auth/middleware.rs`) resolves opaque tokens back to real Keycloak tokens. Refresh requests are intercepted to swap opaque refresh tokens for real ones before contacting Keycloak.
 
 In passthrough mode, the HTTP middleware treats tokens captured by `/oauth/token` as trusted grants and enforces the expiry recorded in `TokenStore`. A bearer unknown to the store (for example, a bring-your-own or token-exchange Keycloak token) goes through `TokenStore::validate_unknown_bearer` (see below). Inactive, malformed, expired, or unrefreshable credentials return `401` with the protected-resource `WWW-Authenticate` challenge before rmcp dispatches the request.

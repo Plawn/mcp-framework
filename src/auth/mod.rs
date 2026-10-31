@@ -4,12 +4,15 @@ mod jwks;
 mod metadata;
 mod middleware;
 mod proxy;
+mod redirect;
 mod registration;
 mod routes;
 mod store;
 mod templates;
 
-use crate::constants::{OAUTH_AUTHORIZE_PATH, OAUTH_REGISTER_PATH, OAUTH_TOKEN_PATH};
+use crate::constants::{
+    OAUTH_AUTHORIZE_PATH, OAUTH_CALLBACK_PATH, OAUTH_MOUNT, OAUTH_REGISTER_PATH, OAUTH_TOKEN_PATH,
+};
 use axum::{
     Router,
     routing::{get, post},
@@ -26,7 +29,7 @@ pub use metadata::{
 };
 pub use proxy::not_proxied_handler;
 pub use routes::{OAuthState, oauth_router};
-pub use store::{ClaimsDecoderFn, RefreshConfig, StoredToken, TokenStore};
+pub use store::{ClaimsDecoderFn, ProxiedAuthorization, RefreshConfig, StoredToken, TokenStore};
 
 // Re-export middleware
 #[allow(unused_imports)]
@@ -49,6 +52,9 @@ pub struct McpOAuthState {
     /// verbatim in the RFC 8414 document, so a deployment that defines
     /// MCP-specific scopes can make clients ask for them.
     pub scopes: Vec<String>,
+    /// `OAUTH_ALLOWED_REDIRECT_URIS`: extra `redirect_uri`s `/oauth/authorize`
+    /// accepts. See [`redirect`] for the full rule.
+    pub allowed_redirect_uris: Vec<String>,
 }
 
 impl McpOAuthState {
@@ -67,7 +73,18 @@ impl McpOAuthState {
             token_store,
             token_mode: oauth_config.token_mode.clone(),
             scopes: oauth_config.scopes.clone(),
+            allowed_redirect_uris: oauth_config.allowed_redirect_uris.clone(),
         }
+    }
+
+    /// The framework's own callback, `{public_url}/oauth/callback`: the only
+    /// `redirect_uri` Keycloak sees from the `/oauth/authorize` proxy, and the
+    /// one `/oauth/token` must present for the code exchange.
+    pub fn callback_url(&self) -> String {
+        format!(
+            "{}{OAUTH_MOUNT}{OAUTH_CALLBACK_PATH}",
+            self.public_url.trim_end_matches('/')
+        )
     }
 }
 

@@ -17,7 +17,8 @@ use url::form_urlencoded;
 
 use super::config::TokenMode;
 use super::middleware::credential_session_key;
-use super::{McpOAuthState, StoredToken};
+use super::redirect::redirect_uri_allowed;
+use super::{McpOAuthState, ProxiedAuthorization, StoredToken};
 use crate::constants::{CONTENT_TYPE_FORM, OPAQUE_ACCESS_TTL};
 use crate::http_util::HttpError;
 use std::time::{Duration, Instant};
@@ -26,7 +27,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
     pub response_type: String,
-    #[allow(dead_code)]
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
@@ -38,25 +38,70 @@ pub struct AuthorizeRequest {
 }
 
 /// Handler for `/oauth/authorize` - redirects to Keycloak.
+///
+/// In the proxying modes this server is the authorization server the client
+/// talks to (its metadata says `issuer = public_url`), so it must also be the
+/// one that answers the authorization request. Keycloak is therefore sent the
+/// framework's own callback as `redirect_uri` and a server-minted `state`; the
+/// client's `redirect_uri` and `state` are parked in the [`TokenStore`] and
+/// `/oauth/callback` completes the client's leg with `iss = public_url`
+/// (RFC 9207). Relaying Keycloak's redirect straight to the client — what this
+/// did before — hands the client Keycloak's `iss`, and a strict client such as
+/// Claude Code refuses it.
+///
+/// PKCE stays end to end: the client's `code_challenge` is forwarded, and it is
+/// the client that presents the verifier at `/oauth/token`.
+///
+/// [`TokenStore`]: super::TokenStore
 pub async fn authorize_handler(
     State(state): State<Arc<McpOAuthState>>,
     Query(request): Query<AuthorizeRequest>,
-) -> impl IntoResponse {
+) -> Result<Redirect, HttpError> {
+    // Keycloak no longer sees the client's `redirect_uri`, so its per-client
+    // allowlist no longer guards it. Refused with a 400 rather than an error
+    // redirect: RFC 6749 §4.1.2.1 forbids redirecting to an invalid URI.
+    let registered = state.token_store.client_redirects(&request.client_id).await;
+    if !redirect_uri_allowed(
+        &request.redirect_uri,
+        registered.as_deref(),
+        &state.public_url,
+        &state.allowed_redirect_uris,
+    ) {
+        tracing::warn!(
+            client_id = %request.client_id,
+            redirect_uri = %request.redirect_uri,
+            "Refusing /oauth/authorize: redirect_uri is not registered for this client"
+        );
+        return Err(HttpError::invalid_request(
+            "redirect_uri is not registered for this client",
+        ));
+    }
+
+    let server_state = uuid::Uuid::new_v4().simple().to_string();
+    state
+        .token_store
+        .store_proxied_authorization(
+            server_state.clone(),
+            ProxiedAuthorization {
+                redirect_uri: request.redirect_uri.clone(),
+                client_state: request.state.clone(),
+                issuer: state.public_url.clone(),
+            },
+        )
+        .await;
+
     // Use our configured Keycloak client_id, not the one from the MCP client
     let mut keycloak_auth_url = format!(
-        "{}/protocol/openid-connect/auth?response_type={}&client_id={}&redirect_uri={}",
+        "{}/protocol/openid-connect/auth?response_type={}&client_id={}&redirect_uri={}&state={}",
         state.keycloak_realm_url,
         urlencoding::encode(&request.response_type),
         urlencoding::encode(&state.keycloak_client_id),
-        urlencoding::encode(&request.redirect_uri),
+        urlencoding::encode(&state.callback_url()),
+        urlencoding::encode(&server_state),
     );
 
     if let Some(scope) = &request.scope {
         keycloak_auth_url.push_str(&format!("&scope={}", urlencoding::encode(scope)));
-    }
-
-    if let Some(state_param) = &request.state {
-        keycloak_auth_url.push_str(&format!("&state={}", urlencoding::encode(state_param)));
     }
 
     if let Some(code_challenge) = &request.code_challenge {
@@ -80,7 +125,7 @@ pub async fn authorize_handler(
 
     tracing::info!("Redirecting to Keycloak: {}", keycloak_auth_url);
 
-    Redirect::temporary(&keycloak_auth_url)
+    Ok(Redirect::temporary(&keycloak_auth_url))
 }
 
 /// Parse the token request body into a list of key-value parameters.
@@ -130,7 +175,21 @@ fn parse_token_params(
 }
 
 /// Inject the Keycloak client credentials into the parameter list.
+///
+/// On an `authorization_code` grant this also replaces `redirect_uri` with the
+/// framework's callback: that is what `/oauth/authorize` sent Keycloak, and
+/// Keycloak requires the exchange to repeat it. The client's own
+/// `redirect_uri` was checked at `/oauth/authorize`, and PKCE binds the code
+/// to the client that started the flow.
 fn inject_keycloak_credentials(params: &mut Vec<(String, String)>, state: &McpOAuthState) {
+    let is_code_grant = params
+        .iter()
+        .any(|(k, v)| k == "grant_type" && v == "authorization_code");
+    if is_code_grant {
+        params.retain(|(k, _)| k != "redirect_uri");
+        params.push(("redirect_uri".to_string(), state.callback_url()));
+    }
+
     for (key, value) in params.iter_mut() {
         if key == "client_id" {
             *value = state.keycloak_client_id.clone();

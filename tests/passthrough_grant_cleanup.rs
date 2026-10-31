@@ -54,6 +54,7 @@ fn passthrough_oauth(issuer_url: String) -> AuthProvider {
         token_mode: TokenMode::Passthrough,
         unknown_token_validation: UnknownTokenValidation::Introspection,
         expected_audiences: vec![],
+        allowed_redirect_uris: vec![],
     })
 }
 

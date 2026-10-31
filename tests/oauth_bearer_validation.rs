@@ -56,6 +56,7 @@ async fn oauth() -> AuthProvider {
         // introspection that these assertions depend on.
         unknown_token_validation: UnknownTokenValidation::JwksThenIntrospection,
         expected_audiences: vec![],
+        allowed_redirect_uris: vec![],
     })
 }
 

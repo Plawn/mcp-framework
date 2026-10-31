@@ -74,6 +74,21 @@ fn build_fallback_registration(
     }
 }
 
+/// Record what the client registered, for the `redirect_uri` check of
+/// `/oauth/authorize` (see [`super::redirect`]).
+///
+/// Only in the proxying modes: a pure resource server proxies no authorization
+/// request, so Keycloak's own client record is what guards the redirect there,
+/// and the mode keeps no state.
+async fn remember_registration(state: &McpOAuthState, client_id: &str, redirect_uris: &[String]) {
+    if state.token_mode.is_stateful() {
+        state
+            .token_store
+            .register_client_redirects(client_id, redirect_uris)
+            .await;
+    }
+}
+
 /// Handler for Dynamic Client Registration (RFC 7591).
 /// Proxies to Keycloak's DCR endpoint with fallback support.
 pub async fn register_handler(
@@ -145,6 +160,7 @@ pub async fn register_handler(
                             .map(|s| s.to_string());
 
                         tracing::info!("DCR successful, client_id: {}", client_id);
+                        remember_registration(&state, &client_id, &request.redirect_uris).await;
 
                         let response = ClientRegistrationResponse {
                             client_id,
@@ -182,6 +198,7 @@ pub async fn register_handler(
 
                 // Keycloak DCR failed - return a fallback client
                 let response = build_fallback_registration(&request, fallback_client_id.as_deref());
+                remember_registration(&state, &response.client_id, &response.redirect_uris).await;
                 Ok((StatusCode::CREATED, Json(response)))
             }
         }
@@ -191,6 +208,7 @@ pub async fn register_handler(
 
             // Fallback: return a generated client_id so the flow can continue
             let response = build_fallback_registration(&request, fallback_client_id.as_deref());
+            remember_registration(&state, &response.client_id, &response.redirect_uris).await;
             Ok((StatusCode::CREATED, Json(response)))
         }
     }

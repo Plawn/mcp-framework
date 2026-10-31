@@ -143,6 +143,7 @@ fn resource_server_config(issuer_url: String) -> OAuthConfig {
         // the authorization server anything.
         unknown_token_validation: UnknownTokenValidation::Jwks,
         expected_audiences: vec![AUDIENCE.to_string()],
+        allowed_redirect_uris: vec![],
     }
 }
 

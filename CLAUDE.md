@@ -132,6 +132,7 @@ Every `call_tool` produces a `ToolCallRecord`, dispatched fire-and-forget to a `
 | `MCP_MAX_PROTOCOL_VERSION` | `build_app()` / stdio boot | — (uncapped; `none`/`off`/`latest` lift a builder ceiling, any other value must be a known revision) |
 | `MCP_TOKEN_MODE` | `OAuthConfig::from_env()` | `passthrough` (also `opaque`, `resource_server`) |
 | `OAUTH_UNKNOWN_TOKEN_VALIDATION` | `OAuthConfig::from_env()` | `jwks_then_introspection` (also `jwks`, `introspection`, `reject`; in `resource_server` mode the default is coerced to `jwks` and the other two are boot errors) |
+| `OAUTH_ALLOWED_REDIRECT_URIS` | `OAuthConfig::from_env()` — extra `redirect_uri`s `/oauth/authorize` accepts in passthrough/opaque (see [`docs/auth.md`](docs/auth.md)) | — (comma-separated, exact match) |
 | `OAUTH_EXPECTED_AUDIENCE` | `OAuthConfig::from_env()` | — (comma-separated; empty = `aud` unconstrained — **required** when `MCP_TOKEN_MODE=resource_server`) |
 | `MCP_METRICS_PATH` | `MetricsConfig::from_env()` (feature `metrics`) | `/metrics` (`off`/empty disables) |
 | `MCP_METRICS_NAMESPACE` | `MetricsConfig::from_env()` | `mcp` |
