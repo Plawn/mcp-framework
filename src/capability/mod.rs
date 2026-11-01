@@ -8,10 +8,12 @@
 pub(crate) mod filter;
 mod handler;
 mod registry;
+mod request;
 mod sanitize;
 mod validator;
 
 pub use filter::{CapabilityFilter, PromptFilter, ResourceFilter, ToolFilter};
 pub(crate) use handler::{DynamicHandler, HandlerContext};
 pub use registry::{CapabilityRegistry, ToolCallContext};
+pub use request::{CallInfo, CallRequest};
 pub use validator::{AccessDecision, AccessValidator, ToolCallValidator};

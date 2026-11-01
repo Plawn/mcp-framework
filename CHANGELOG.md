@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > History before `0.2.0` was not retro-documented; see `git log` for earlier releases.
 
+## [Unreleased]
+
+### Added — the request and the credential reach tools, validators and filters
+
+A tool had its session id and nothing else of the call: a tenant chosen by a
+header or a query parameter, or a structured identity an in-process caller
+wanted to carry, had to be re-derived from rmcp's `RequestContext` — which a
+registry tool never sees.
+
+- `CallRequest { headers, uri, extensions }` (`Clone`, `Debug`) — the request
+  a call arrived on, built with `CallRequest::from_parts(&Parts)`;
+  `query_param(name)` reads one decoded query parameter.
+- `ToolCallContext` gains `token: Option<StoredToken>` — the *same* value the
+  access validator was handed for that call — and `request: Option<CallRequest>`
+  (`None` in stdio). A literal `ToolCallContext { .. }` (only useful with
+  `call_tool_with_context`) must add both fields.
+- `AccessValidator::validate_call(tool, args, &CallInfo)` and
+  `CapabilityFilter::filter_tools_for(tools, &CallInfo)`, where
+  `CallInfo { session_id, token, request }` (`#[non_exhaustive]`, built with
+  `CallInfo::new`). The framework now calls these; their defaults delegate to
+  `validate_tool_call` / `filter_tools`, so existing implementations are
+  unchanged.
+- `LoopbackIdentity::with_extension(value)` — a typed value copied into every
+  synthesized request's extensions, readable as `ctx.request.extensions`.
+  The middleware-owned `RequestToken` / `BearerToken` are refused at `connect`
+  (`InvalidIdentity`): a loopback credential goes through `with_bearer_token`.
+
 ## [0.4.0] — 2026-08-20
 
 > Released as `0.4.0` rather than `0.3.1`: the `v0.3.1` tag was cut by CI on

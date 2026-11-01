@@ -34,6 +34,8 @@ The registry is materialized at that point if it was unset, so both sides dispat
 
 `LoopbackIdentity::new(session_id)` names an anonymous caller; `.with_bearer_token(t)` presents a bearer exactly as a network client would in its `Authorization` header (it is also written to the endpoint's `TokenStore` under that session id, so capability filters receive it the same way they do over HTTP). The endpoint synthesizes the `http::request::Parts` a network client would have sent, so identity resolution stays the single mechanism it is everywhere else — no second one.
 
+`.with_extension(value)` attaches a typed value (a service principal, a tenant) to the extensions of every synthesized request — where the HTTP auth middleware attaches what it learned about a network caller. Tools read it from `ctx.request.extensions`, validators and filters from `CallInfo::request`. The two credential types the middleware owns (`RequestToken`, `BearerToken`) are refused there: a `RequestToken` would take precedence over the token store as a credential nothing validated.
+
 The endpoint owns its own `TokenStore` **and** `SessionStore`, distinct from the ones the HTTP transport builds. Both are keyed by session id alone, and a loopback session id is chosen by the in-process caller — often from data it received from outside (a chat thread id straight out of a request body). Sharing either store would let a caller that names its session after a network client's read and write that client's state.
 
 Consequences worth knowing rather than discovering: **in-process session data is not persisted** (a persistence backend attached to the app reaches the HTTP store only) and does not survive a restart. Sessions of `T = ()` — the common case — hold nothing anyway.
@@ -44,6 +46,6 @@ Consequences worth knowing rather than discovering: **in-process session data is
 
 | Variant | Cause |
 |---|---|
-| `InvalidIdentity` | an **empty** session id (a valid header value, so nothing downstream would complain — the session store would take `""` as a real key), or a session id / token no header can hold (a newline, a NUL), which would make the parts unbuildable and collapse several broken callers onto `DEFAULT_SESSION_ID`, sharing one session |
+| `InvalidIdentity` | a `RequestToken` / `BearerToken` posed with `with_extension`; an **empty** session id (a valid header value, so nothing downstream would complain — the session store would take `""` as a real key), or a session id / token no header can hold (a newline, a NUL), which would make the parts unbuildable and collapse several broken callers onto `DEFAULT_SESSION_ID`, sharing one session |
 | `UnresolvableCredential` | a bearer presented under `TokenMode::Opaque`, where the credential is a UUID the **HTTP** transport's store resolves and this endpoint cannot. Storing it as-is would hand filters, validators and forwarded backends something that looks real and authenticates nothing. The caller may retry anonymously — a de-escalation, safe by construction — as long as it logs that it did |
 | `Initialize` | the MCP `initialize` handshake failed (boxed: rmcp's error is several hundred bytes and this is the rarest of the three) |

@@ -10,6 +10,7 @@ use std::pin::Pin;
 
 use serde_json::{Map, Value};
 
+use super::request::CallInfo;
 use crate::auth::StoredToken;
 
 /// The result of an access validation check.
@@ -33,8 +34,29 @@ pub enum AccessDecision {
 /// [`StoredToken::claims::<C>()`](StoredToken::claims).
 ///
 /// The default implementations allow all requests. Override only the methods you need.
+///
+/// For `call_tool`, the framework calls [`validate_call`](Self::validate_call), whose default
+/// delegates to [`validate_tool_call`](Self::validate_tool_call): override `validate_call` when the
+/// decision depends on the request itself (a header, a query parameter, an extension), and
+/// `validate_tool_call` otherwise. Overriding both makes `validate_tool_call` dead code.
 pub trait AccessValidator: Send + Sync + 'static {
-    /// Validate access for a `call_tool` request.
+    /// Validate a `call_tool` request with everything known about it — this is the method the
+    /// framework calls.
+    ///
+    /// The default delegates to [`validate_tool_call`](Self::validate_tool_call) with the same
+    /// token and session id, so a validator written against that method keeps working unchanged.
+    fn validate_call(
+        &self,
+        tool_name: &str,
+        arguments: Option<&Map<String, Value>>,
+        call: &CallInfo<'_>,
+    ) -> Pin<Box<dyn Future<Output = AccessDecision> + Send + '_>> {
+        self.validate_tool_call(tool_name, arguments, call.token, call.session_id)
+    }
+
+    /// Validate access for a `call_tool` request from its token and session id alone.
+    ///
+    /// Reached through the default [`validate_call`](Self::validate_call).
     fn validate_tool_call(
         &self,
         tool_name: &str,

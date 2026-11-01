@@ -14,7 +14,9 @@ use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use super::request::CallRequest;
 use super::sanitize::{DescriptionAudit, audit_tool_at_registration};
+use crate::auth::StoredToken;
 use crate::constants::NS_CAP_VERSIONS;
 use crate::persistence::{PersistenceBackend, PersistenceError, persist};
 
@@ -46,6 +48,13 @@ pub struct ToolCallContext {
     /// a tool reaching around the framework to find out ends up inventing a second identity
     /// mechanism. Handing it over costs one `String` on calls that already clone `Meta`.
     pub session_id: String,
+    /// The caller's credential — the very value the [`AccessValidator`](super::AccessValidator)
+    /// was handed for this call, so a tool and the check that let it run never disagree on who
+    /// is asking. `None` for an anonymous caller.
+    pub token: Option<StoredToken>,
+    /// The request the call arrived on: headers, URI (query string included) and the typed
+    /// extensions the middleware or an in-process caller attached. `None` in stdio mode.
+    pub request: Option<CallRequest>,
 }
 
 type StoredHandler = Arc<

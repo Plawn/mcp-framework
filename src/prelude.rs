@@ -11,8 +11,8 @@ pub use crate::audit::{
 };
 pub use crate::auth::{AuthProvider, BasicAuthConfig, OAuthConfig, TokenMode, TokenStore};
 pub use crate::capability::{
-    AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
-    ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
+    AccessDecision, AccessValidator, CallInfo, CallRequest, CapabilityFilter, CapabilityRegistry,
+    PromptFilter, ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
 };
 #[cfg(feature = "metrics")]
 pub use crate::metrics::{

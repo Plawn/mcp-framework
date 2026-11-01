@@ -39,7 +39,7 @@ use rmcp::service::{QuitReason, RoleClient, RunningService};
 use tokio::task::JoinHandle;
 
 use crate::audit::ToolCallLogger;
-use crate::auth::{StoredToken, TokenMode, TokenStore};
+use crate::auth::{BearerToken, RequestToken, StoredToken, TokenMode, TokenStore};
 use crate::capability::AccessValidator;
 use crate::capability::{CapabilityFilter, CapabilityRegistry, DynamicHandler, HandlerContext};
 use crate::session::{SessionData, SessionStore};
@@ -63,6 +63,9 @@ const CHANNEL_BUFFER: usize = 32;
 pub struct LoopbackIdentity {
     session_id: String,
     bearer_token: Option<String>,
+    /// Values copied into every synthesized request's extensions — see
+    /// [`with_extension`](Self::with_extension).
+    extensions: http::Extensions,
 }
 
 impl LoopbackIdentity {
@@ -71,7 +74,32 @@ impl LoopbackIdentity {
         Self {
             session_id: session_id.into(),
             bearer_token: None,
+            extensions: http::Extensions::new(),
         }
+    }
+
+    /// Attach a typed value to every request this caller makes, where the HTTP auth middleware
+    /// would attach what it learned about a network caller.
+    ///
+    /// The value lands in the synthesized request's extensions, so handlers read it from
+    /// [`ToolCallContext::request`](crate::ToolCallContext::request) (`.extensions.get::<T>()`),
+    /// and the [`AccessValidator`] and [`CapabilityFilter`] from
+    /// [`CallInfo::request`](crate::CallInfo::request). It is how an in-process caller carries a
+    /// *structured* identity (a service principal, a tenant) that no header could express without
+    /// the receiving side parsing it back.
+    ///
+    /// Keyed by type, like any `http::Extensions`: a second value of the same type replaces the
+    /// first.
+    ///
+    /// The two credential types the auth middleware owns — [`RequestToken`] and [`BearerToken`] —
+    /// are refused at [`connect`](LoopbackEndpoint::connect): a `RequestToken` would take
+    /// precedence over the endpoint's token store and reach validators as a credential nothing
+    /// validated. A loopback caller presents a credential with
+    /// [`with_bearer_token`](Self::with_bearer_token), which keeps the token store the one place
+    /// it is resolved from.
+    pub fn with_extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.extensions.insert(value);
+        self
     }
 
     /// Present a bearer token, exactly as a network client would in its `Authorization` header.
@@ -90,7 +118,7 @@ impl LoopbackIdentity {
     /// Refuse an identity the framework could not carry faithfully.
     ///
     /// Checked at [`connect`](LoopbackEndpoint::connect) rather than tolerated at request time.
-    /// The two rejected shapes are the ones that would *silently* become another identity:
+    /// The rejected shapes are the ones that would *silently* become another identity:
     ///
     /// - an **empty** session id is a perfectly valid header value, so nothing downstream would
     ///   complain — [`resolve_session_id`](crate::resolve_session_id) would hand `""` to the
@@ -98,14 +126,25 @@ impl LoopbackIdentity {
     /// - a session id or token that **no header can hold** (a newline, a NUL) makes the parts
     ///   unbuildable, and a caller without parts falls back to
     ///   [`DEFAULT_SESSION_ID`](crate::constants::DEFAULT_SESSION_ID) — several broken callers
-    ///   would then merge into one shared session, and read each other's state.
+    ///   would then merge into one shared session, and read each other's state;
+    /// - a **credential extension** posed with [`with_extension`](Self::with_extension) would be
+    ///   read as a validated credential, ahead of the token store.
     ///
-    /// Both are refusals rather than repairs: an in-process caller that cannot name itself has a
+    /// All are refusals rather than repairs: an in-process caller that cannot name itself has a
     /// bug, and inventing a name for it is how the bug stops being visible.
     fn validate(&self) -> Result<(), LoopbackConnectError> {
         if self.session_id.is_empty() {
             return Err(LoopbackConnectError::InvalidIdentity(
                 "the session id is empty".to_string(),
+            ));
+        }
+        if self.extensions.get::<RequestToken>().is_some()
+            || self.extensions.get::<BearerToken>().is_some()
+        {
+            return Err(LoopbackConnectError::InvalidIdentity(
+                "a credential extension (RequestToken / BearerToken) is written only by the auth \
+                 middleware — present a credential with `with_bearer_token`"
+                    .to_string(),
             ));
         }
         self.build_parts()
@@ -121,13 +160,15 @@ impl LoopbackIdentity {
         if let Some(ref token) = self.bearer_token {
             builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
-        Ok(builder.body(())?.into_parts().0)
+        let mut parts = builder.body(())?.into_parts().0;
+        parts.extensions.extend(self.extensions.clone());
+        Ok(parts)
     }
 
     /// Rebuild the request metadata a network client would have carried.
     ///
-    /// Called once per request rather than cached because `http::request::Parts` is not `Clone`.
-    /// The cost is one small header map next to a whole tool call.
+    /// Rebuilt per request rather than cached: it is one small header map and a clone of the
+    /// posed extensions, next to a whole tool call.
     pub(crate) fn to_parts(&self) -> Option<http::request::Parts> {
         match self.build_parts() {
             Ok(parts) => Some(parts),

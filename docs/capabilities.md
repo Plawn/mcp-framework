@@ -12,6 +12,10 @@ Key types:
 - `AccessValidator` trait — three async methods with default `Allow` implementations: `validate_tool_call`, `validate_prompt_access`, `validate_resource_access`
 - `ToolCallValidator<F>` — convenience wrapper for a closure that validates only tool calls
 
+For `call_tool` the handler calls `validate_call(tool, args, &CallInfo)`, and for `tools/list` the filter's `filter_tools_for(tools, &CallInfo)`. `CallInfo { session_id, token, request }` adds the `CallRequest` (headers, URI with its query string, request extensions — `None` in stdio) to what the legacy methods receive; both default to the legacy method (`validate_tool_call` / `filter_tools`), so override the `CallInfo` variant only when the decision depends on the request (e.g. a tenant chosen by `?space=` or a header).
+
+A registry tool sees the same thing in its `ToolCallContext`: `ctx.token` is the very token the validator was handed for that call (resolved once, so a refresh between the check and the dispatch cannot split them), and `ctx.request` the same `CallRequest`.
+
 The interception point is `DynamicHandler::call_tool` / `get_prompt` / `read_resource` in `src/capability/handler.rs`, before dispatch to the registry or inner handler.
 
 ### Global claims decoder

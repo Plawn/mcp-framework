@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use rmcp::model::{Extensions, Prompt, Resource, Tool};
 
+use super::request::{CallInfo, CallRequest};
 use crate::auth::{RequestToken, StoredToken, TokenStore};
 use crate::session::resolve_session_id;
 
@@ -13,8 +14,22 @@ use crate::session::resolve_session_id;
 ///
 /// For convenience, use [`ToolFilter`], [`PromptFilter`], or [`ResourceFilter`]
 /// to wrap a closure that filters only one capability type.
+///
+/// For `tools/list`, the framework calls [`filter_tools_for`](Self::filter_tools_for), whose
+/// default delegates to [`filter_tools`](Self::filter_tools): override `filter_tools_for` when
+/// visibility depends on the request itself (a header, a query parameter, an extension).
 pub trait CapabilityFilter: Send + Sync + 'static {
+    /// Filter the list of tools visible to a call, with everything known about it — this is the
+    /// method the framework calls on `tools/list`.
+    ///
+    /// The default delegates to [`filter_tools`](Self::filter_tools) with the same token.
+    fn filter_tools_for(&self, tools: Vec<Tool>, call: &CallInfo<'_>) -> Vec<Tool> {
+        self.filter_tools(tools, call.token)
+    }
+
     /// Filter the list of tools visible to a given session.
+    ///
+    /// Reached through the default [`filter_tools_for`](Self::filter_tools_for).
     fn filter_tools(&self, tools: Vec<Tool>, token: Option<&StoredToken>) -> Vec<Tool> {
         let _ = token;
         tools
@@ -113,6 +128,14 @@ pub(crate) async fn resolve_token(
         return Some(request_token.0.clone());
     }
     token_store.get_token(resolve_session_id(extensions)).await
+}
+
+/// The request a call arrived on, copied out of the context extensions — `None` in stdio mode,
+/// where rmcp injects no request parts.
+pub(crate) fn resolve_call_request(extensions: &Extensions) -> Option<CallRequest> {
+    extensions
+        .get::<http::request::Parts>()
+        .map(CallRequest::from_parts)
 }
 
 /// Extract the set of tool names to exclude from the `?filter=` query parameter.

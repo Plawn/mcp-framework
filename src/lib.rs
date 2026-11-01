@@ -97,8 +97,8 @@ pub use audit::{
 };
 pub use auth::{AuthProvider, BasicAuthConfig, ConfigError, OAuthConfig, TokenMode, TokenStore};
 pub use capability::{
-    AccessDecision, AccessValidator, CapabilityFilter, CapabilityRegistry, PromptFilter,
-    ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
+    AccessDecision, AccessValidator, CallInfo, CallRequest, CapabilityFilter, CapabilityRegistry,
+    PromptFilter, ResourceFilter, ToolCallContext, ToolCallValidator, ToolFilter,
 };
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsCollector, MetricsConfig, MetricsSnapshot, SessionMetrics, ToolMetrics};

@@ -11,8 +11,9 @@ use crate::auth::TokenStore;
 use crate::newtypes::{SessionId, ToolName};
 use crate::session::{SessionData, SessionStore, resolve_session_id};
 
-use super::filter::{CapabilityFilter, resolve_query_filter, resolve_token};
+use super::filter::{CapabilityFilter, resolve_call_request, resolve_query_filter, resolve_token};
 use super::registry::CapabilityRegistry;
+use super::request::CallInfo;
 use super::sanitize::sanitize_tool_schemas;
 use super::validator::{AccessDecision, AccessValidator};
 use crate::transport::protocol::cap_protocol_versions;
@@ -173,6 +174,14 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
         self.enrich_extensions(&mut context.extensions);
         let token = resolve_token(&context.extensions, &self.context.token_store).await;
         let query_filter = resolve_query_filter(&context.extensions);
+        let (session_id, call_request) = if self.context.filter.is_some() {
+            (
+                resolve_session_id(&context.extensions).to_string(),
+                resolve_call_request(&context.extensions),
+            )
+        } else {
+            (String::new(), None)
+        };
         let mut inner_result = self.inner.list_tools(request, context).await?;
         let inner_count = inner_result.tools.len();
         let registry_tools = self.registry.tools().await;
@@ -188,7 +197,10 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
         let merged_count = inner_result.tools.len();
 
         if let Some(ref filter) = self.context.filter {
-            inner_result.tools = filter.filter_tools(inner_result.tools, token.as_ref());
+            // `context` was handed to the inner handler above; the parts it carried were
+            // copied out before that, only when a filter is there to read them.
+            let call = CallInfo::new(&session_id, token.as_ref(), call_request.as_ref());
+            inner_result.tools = filter.filter_tools_for(inner_result.tools, &call);
         }
 
         if !query_filter.is_empty() {
@@ -268,16 +280,18 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
     ) -> Result<CallToolResponse, McpError> {
         self.enrich_extensions(&mut context.extensions);
 
+        // The caller's credential and request, resolved once and shared by the validator and the
+        // tool: a check that let a call through on one token must not hand the tool another (a
+        // refresh can land between two `resolve_token`s). Left unresolved when neither needs it,
+        // so a call to an inner tool without a validator does not pay a token-store lookup.
+        let mut identity = None;
         if let Some(ref validator) = self.context.access_validator {
             let token = resolve_token(&context.extensions, &self.context.token_store).await;
+            let call_request = resolve_call_request(&context.extensions);
             let session_id = resolve_session_id(&context.extensions);
+            let call = CallInfo::new(session_id, token.as_ref(), call_request.as_ref());
             let decision = validator
-                .validate_tool_call(
-                    request.name.as_ref(),
-                    request.arguments.as_ref(),
-                    token.as_ref(),
-                    session_id,
-                )
+                .validate_call(request.name.as_ref(), request.arguments.as_ref(), &call)
                 .await;
             if let AccessDecision::Deny(reason) = decision {
                 return Err(McpError::invalid_request(
@@ -285,6 +299,7 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
                     None,
                 ));
             }
+            identity = Some((token, call_request));
         }
 
         let query_filter = resolve_query_filter(&context.extensions);
@@ -316,6 +331,13 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
         // Only construct ToolCallContext (which clones Meta) when the tool
         // is actually in the registry, avoiding the heap allocation on miss.
         let reg_result = if self.registry.contains_tool(&request.name).await {
+            let (token, call_request) = match identity {
+                Some(identity) => identity,
+                None => (
+                    resolve_token(&context.extensions, &self.context.token_store).await,
+                    resolve_call_request(&context.extensions),
+                ),
+            };
             let tool_ctx = crate::capability::registry::ToolCallContext {
                 peer: context.peer.clone(),
                 meta: context.meta.clone(),
@@ -323,6 +345,8 @@ impl<S: ServerHandler, T: SessionData> ServerHandler for DynamicHandler<S, T> {
                 // when a logger is configured, and a tool's behaviour must not depend on whether
                 // the application happens to be auditing.
                 session_id: resolve_session_id(&context.extensions).to_string(),
+                token,
+                request: call_request,
             };
             self.registry
                 .try_call_tool(&request.name, request.arguments.clone(), Some(tool_ctx))
